@@ -7,7 +7,7 @@ plugin_id="codex-token-usage"
 out_dir="${1:-dist}"
 mkdir -p "${out_dir}"
 
-./build.sh
+bash ./build.sh
 
 goos="$(go env GOOS)"
 goarch="$(go env GOARCH)"

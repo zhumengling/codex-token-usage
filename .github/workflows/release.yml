@@ -63,7 +63,7 @@ jobs:
 
       - name: Package
         shell: bash
-        run: ./package-release.sh dist
+        run: bash ./package-release.sh dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
