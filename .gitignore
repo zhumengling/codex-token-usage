@@ -1,0 +1,28 @@
+# Build outputs
+*.so
+*.dll
+*.dylib
+*.h
+*.zip
+*.tgz
+dist/
+outputs/
+
+# Local databases and runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets and local overrides
+.env
+model_prices.json
+*.cpa.json
+*.auth.json
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
