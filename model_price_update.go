@@ -67,6 +67,15 @@ func (m *modelPriceUpdateManager) configure(cfg pluginConfig) {
 	go m.loop(ctx, cfg)
 }
 
+func (m *modelPriceUpdateManager) stop() {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.mu.Unlock()
+}
+
 func (m *modelPriceUpdateManager) status() modelPriceUpdateState {
 	m.mu.Lock()
 	defer m.mu.Unlock()

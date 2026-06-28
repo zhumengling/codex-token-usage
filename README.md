@@ -1,17 +1,21 @@
 # CPA Token Usage
 
-CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards.
+CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-It records usage events, estimates model cost, tracks Codex 5h and 7d/month quota windows, marks invalid credentials, detects suspicious external quota consumption, and helps auto-disable accounts after 429 quota errors.
+Current version: `0.1.9`
 
 ## Features
 
-- Codex account pool dashboard with pagination, sorting, quota bars, and cost estimates.
-- 429 auto-ban support with reset-at based recovery.
+- Codex account pool dashboard with pagination, saved sorting, quota bars, 7d/month quota estimates, cost estimates, and light/dark compatible UI.
+- AI provider pages grouped by CPA endpoint name, separated from Codex OAuth account-pool pricing and quota calculations.
+- Codex 429 auto-ban support with `reset_at` based recovery.
 - 401 invalid-auth protection until the auth JSON file is replaced or removed.
-- Optional quota trigger for refreshing observed Codex quota snapshots.
-- Provider pages for non-Codex OpenAI-compatible endpoints.
-- Built-in model price fallbacks plus automatic LiteLLM model price updates.
+- Suspicious external quota consumption detection for shared or resold accounts.
+- Optional Codex quota trigger that sends a tiny real Codex request to refresh/start the 5h quota window.
+- Runtime diagnostics and local alerts are exposed in summary JSON for troubleshooting and plugin-store validation.
+- CSV / JSON export support; the dashboard exposes account export buttons and the backend can export accounts, providers, models, and recent requests.
+- Built-in price fallbacks plus automatic LiteLLM model price updates.
+- Manual Chinese / English language switch saved in the browser.
 
 ## Install Manually
 
@@ -36,19 +40,43 @@ plugins:
     codex-token-usage:
       enabled: true
       priority: 120
+
       开启定时额度触发: false
       触发间隔分钟: 10
-      触发模式: quota
+      触发模式: probe
       最大并发账号数: 1
       单账号超时秒数: 20
       单账号最小冷却分钟: 10
+
       自动更新模型价格表: true
       模型价格更新间隔小时: 6
       模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
       模型价格更新超时秒数: 20
+
+      用量保留天数: 90
+      额度触发记录保留天数: 30
+      请求明细保留天数: 30
 ```
 
-Quota trigger defaults to off. `quota` mode only queries quota state. `probe` mode can consume a small amount of tokens and should be enabled deliberately.
+English config keys are also accepted:
+
+```yaml
+quota_trigger_enabled: false
+quota_trigger_interval_minutes: 10
+quota_trigger_mode: probe
+quota_trigger_max_concurrency: 1
+quota_trigger_timeout_seconds: 20
+quota_trigger_min_account_cooldown_minutes: 10
+model_price_auto_update_enabled: true
+model_price_update_interval_hours: 6
+model_price_update_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+model_price_update_timeout_seconds: 20
+usage_retention_days: 90
+quota_trigger_retention_days: 30
+request_detail_retention_days: 30
+```
+
+Quota trigger defaults to off. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. The legacy `quota` value is accepted for compatibility and normalized to `probe`; scheduled triggers no longer only read cached quota state.
 
 ## Model Price Table
 
@@ -64,7 +92,7 @@ The downloaded file is stored at:
 /root/plugins/codex-token-usage/model_prices.json
 ```
 
-The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay small and prices can be refreshed without rebuilding the plugin.
+The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay smaller and prices can be refreshed without rebuilding the plugin.
 
 To override the location, set:
 
@@ -72,7 +100,12 @@ To override the location, set:
 CPA_MODEL_PRICE_FILE=/path/to/model_prices.json
 ```
 
-Do not put API keys, access tokens, refresh tokens, or auth JSON content in this file.
+## Data Safety
+
+- Access tokens, refresh tokens, id tokens, and API keys are not written to summary JSON, UI, alert output, or exports.
+- Exported account labels that look like API keys are masked as `sk-****abcd`.
+- Local alert data is generated inside summary/export responses only; this version does not send webhooks.
+- Auth JSON files are read only for account identity, provider classification, quota trigger access, and replacement detection. Tokens are used in memory for trigger requests and are not written to summary/export data.
 
 ## Build
 
@@ -85,9 +118,29 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.6_linux_amd64.zip
+codex-token-usage_0.1.9_linux_amd64.zip
+codex-token-usage_0.1.9_linux_arm64.zip
+codex-token-usage_0.1.9_windows_amd64.zip
+codex-token-usage_0.1.9_darwin_amd64.zip
+codex-token-usage_0.1.9_darwin_arm64.zip
 checksums.txt
 ```
+
+## Plugin Store Checklist
+
+- Build and upload all required OS / architecture zip files.
+- Include `checksums.txt`.
+- Add screenshots for the Codex account pool, AI provider overview, and a selected AI endpoint page.
+- Document default-off quota trigger behavior and real-probe token cost risk.
+- Confirm `go test ./...` passes before publishing.
+
+## Common Issues
+
+- `未注册 / 未生效`: confirm the file is under the correct plugin directory and restart CLIProxyAPI.
+- `401`: the auth JSON is invalid and will not be used until replaced or removed.
+- `429`: the account is temporarily auto-banned until the observed reset time.
+- Provider not visible: confirm the endpoint still exists in CPA config and refresh the dashboard.
+- Price missing: check `model_prices.json` status in the summary JSON and the model price update error if present.
 
 ## License
 

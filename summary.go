@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -106,7 +107,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	providerRecent, err := queryRecent(ctx, db, since, 30, "other", prices)
+	providerRecent, err := queryRecent(ctx, db, since, providerRecentLimit(limit), "other", prices)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +116,8 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 		return nil, err
 	}
 	applyAccountQuotaToAutobans(autobans, accounts)
-	return map[string]any{
+	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, invalidAuths, autobans, externalUseAlerts)
+	result := map[string]any{
 		"plugin":              pluginID,
 		"version":             pluginVersion,
 		"generated_at":        time.Now().Format(time.RFC3339),
@@ -138,7 +140,24 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 		"quota_trigger":       globalQuotaTrigger.status(),
 		"quota_trigger_runs":  triggerRuns,
 		"model_prices":        globalModelPriceUpdater.status(),
-	}, nil
+		"diagnostics":         diagnostics,
+	}
+	result["alerts"] = buildAlerts(result)
+	return result, nil
+}
+
+func providerRecentLimit(limit int) int {
+	if limit < 30 {
+		limit = 30
+	}
+	n := limit * 20
+	if n < 500 {
+		n = 500
+	}
+	if n > 2000 {
+		n = 2000
+	}
+	return n
 }
 
 func windowStart(window string) (int64, string) {
@@ -172,6 +191,11 @@ type totalsRow struct {
 	CostUSD                         float64 `json:"cost_usd"`
 	CostAvailable                   bool    `json:"cost_available"`
 	UnpricedTokens                  int64   `json:"unpriced_tokens,omitempty"`
+	AverageLatencyMs                float64 `json:"avg_latency_ms"`
+	AverageTTFTMs                   float64 `json:"avg_ttft_ms"`
+	OutputTokensPerSecond           float64 `json:"output_tokens_per_second"`
+	SlowRequests                    int64   `json:"slow_requests"`
+	SlowTTFTRequests                int64   `json:"slow_ttft_requests"`
 	SecondaryQuotaTotalEstimate     int64   `json:"secondary_quota_total_estimate"`
 	SecondaryQuotaRemainingEstimate int64   `json:"secondary_quota_remaining_estimate"`
 	SecondaryQuotaEstimatedAccounts int64   `json:"secondary_quota_estimated_accounts"`
@@ -205,6 +229,11 @@ type accountRow struct {
 	CostUSD                         float64  `json:"cost_usd"`
 	CostAvailable                   bool     `json:"cost_available"`
 	UnpricedTokens                  int64    `json:"unpriced_tokens,omitempty"`
+	AverageLatencyMs                float64  `json:"avg_latency_ms"`
+	AverageTTFTMs                   float64  `json:"avg_ttft_ms"`
+	OutputTokensPerSecond           float64  `json:"output_tokens_per_second"`
+	SlowRequests                    int64    `json:"slow_requests"`
+	SlowTTFTRequests                int64    `json:"slow_ttft_requests"`
 	LastSeen                        string   `json:"last_seen"`
 	PrimaryUsedPercent              *float64 `json:"primary_used_percent,omitempty"`
 	PrimaryResetAt                  *int64   `json:"primary_reset_at,omitempty"`
@@ -230,17 +259,19 @@ type accountRow struct {
 }
 
 type configuredAccount struct {
-	AuthIndex     string
-	AuthID        string
-	Source        string
-	Provider      string
-	Email         string
-	Name          string
-	AuthFile      string
-	AuthFileMTime int64
-	Disabled      bool
-	Expired       bool
-	PlanType      string
+	AuthIndex        string
+	AuthID           string
+	Source           string
+	Provider         string
+	Email            string
+	Name             string
+	AuthFile         string
+	AuthFileMTime    int64
+	Disabled         bool
+	Expired          bool
+	PlanType         string
+	AccessToken      string
+	ChatGPTAccountID string
 }
 
 type triggerAuthAccount struct {
@@ -286,40 +317,50 @@ type quotaTriggerAccountStatus struct {
 }
 
 type providerRow struct {
-	Provider            string  `json:"provider"`
-	Requests            int64   `json:"requests"`
-	Failed              int64   `json:"failed"`
-	RateLimited         int64   `json:"rate_limited"`
-	InputTokens         int64   `json:"input_tokens"`
-	OutputTokens        int64   `json:"output_tokens"`
-	ReasoningTokens     int64   `json:"reasoning_tokens"`
-	CachedTokens        int64   `json:"cached_tokens"`
-	CacheReadTokens     int64   `json:"cache_read_tokens"`
-	CacheCreationTokens int64   `json:"cache_creation_tokens"`
-	TotalTokens         int64   `json:"total_tokens"`
-	CostUSD             float64 `json:"cost_usd"`
-	CostAvailable       bool    `json:"cost_available"`
-	UnpricedTokens      int64   `json:"unpriced_tokens,omitempty"`
-	Accounts            int64   `json:"accounts"`
-	Models              int64   `json:"models"`
-	LastSeen            string  `json:"last_seen"`
+	Provider              string  `json:"provider"`
+	Requests              int64   `json:"requests"`
+	Failed                int64   `json:"failed"`
+	RateLimited           int64   `json:"rate_limited"`
+	InputTokens           int64   `json:"input_tokens"`
+	OutputTokens          int64   `json:"output_tokens"`
+	ReasoningTokens       int64   `json:"reasoning_tokens"`
+	CachedTokens          int64   `json:"cached_tokens"`
+	CacheReadTokens       int64   `json:"cache_read_tokens"`
+	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
+	TotalTokens           int64   `json:"total_tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	CostAvailable         bool    `json:"cost_available"`
+	UnpricedTokens        int64   `json:"unpriced_tokens,omitempty"`
+	AverageLatencyMs      float64 `json:"avg_latency_ms"`
+	AverageTTFTMs         float64 `json:"avg_ttft_ms"`
+	OutputTokensPerSecond float64 `json:"output_tokens_per_second"`
+	SlowRequests          int64   `json:"slow_requests"`
+	SlowTTFTRequests      int64   `json:"slow_ttft_requests"`
+	Accounts              int64   `json:"accounts"`
+	Models                int64   `json:"models"`
+	LastSeen              string  `json:"last_seen"`
 }
 
 type modelRow struct {
-	Model               string  `json:"model"`
-	Alias               string  `json:"alias"`
-	Provider            string  `json:"provider"`
-	Requests            int64   `json:"requests"`
-	TotalTokens         int64   `json:"total_tokens"`
-	InputTokens         int64   `json:"input_tokens"`
-	OutputTokens        int64   `json:"output_tokens"`
-	ReasoningTokens     int64   `json:"reasoning_tokens"`
-	CachedTokens        int64   `json:"cached_tokens"`
-	CacheReadTokens     int64   `json:"cache_read_tokens"`
-	CacheCreationTokens int64   `json:"cache_creation_tokens"`
-	CostUSD             float64 `json:"cost_usd"`
-	CostAvailable       bool    `json:"cost_available"`
-	UnpricedTokens      int64   `json:"unpriced_tokens,omitempty"`
+	Model                 string  `json:"model"`
+	Alias                 string  `json:"alias"`
+	Provider              string  `json:"provider"`
+	Requests              int64   `json:"requests"`
+	TotalTokens           int64   `json:"total_tokens"`
+	InputTokens           int64   `json:"input_tokens"`
+	OutputTokens          int64   `json:"output_tokens"`
+	ReasoningTokens       int64   `json:"reasoning_tokens"`
+	CachedTokens          int64   `json:"cached_tokens"`
+	CacheReadTokens       int64   `json:"cache_read_tokens"`
+	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	CostAvailable         bool    `json:"cost_available"`
+	UnpricedTokens        int64   `json:"unpriced_tokens,omitempty"`
+	AverageLatencyMs      float64 `json:"avg_latency_ms"`
+	AverageTTFTMs         float64 `json:"avg_ttft_ms"`
+	OutputTokensPerSecond float64 `json:"output_tokens_per_second"`
+	SlowRequests          int64   `json:"slow_requests"`
+	SlowTTFTRequests      int64   `json:"slow_ttft_requests"`
 }
 
 type trendPoint struct {
@@ -408,14 +449,46 @@ type externalUseAlert struct {
 }
 
 func usageScopeSQL(scope string) string {
+	return usageScopeSQLWithEntries(scope, readConfiguredProviderEntries())
+}
+
+func usageScopeSQLWithEntries(scope string, entries []providerConfigEntry) string {
+	codexAccount := `((LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%codex%')
+AND LOWER(COALESCE(NULLIF(auth_type,''), '')) NOT IN ('apikey', 'api_key', 'key')
+AND LOWER(COALESCE(NULLIF(auth_id,''), '')) NOT LIKE 'codex:apikey:%'
+AND COALESCE(NULLIF(source,''), '') NOT LIKE 'sk-%'
+AND COALESCE(NULLIF(source,''), '') NOT LIKE 'Bearer sk-%')`
+	codexAPIKey := codexAPIKeyProviderScopeSQL(entries)
 	switch strings.ToLower(strings.TrimSpace(scope)) {
 	case "codex":
-		return "(LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%codex%')"
+		return codexAccount
 	case "other":
-		return "(LOWER(COALESCE(NULLIF(provider,''), '')) <> 'codex' AND LOWER(COALESCE(NULLIF(executor_type,''), '')) NOT LIKE '%codex%')"
+		return "((NOT " + codexAccount + ") AND (NOT (LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key')) OR " + codexAPIKey + "))"
 	default:
 		return "1=1"
 	}
+}
+
+func codexAPIKeyProviderScopeSQL(entries []providerConfigEntry) string {
+	var parts []string
+	for _, entry := range entries {
+		if !strings.EqualFold(entry.Provider, "Codex") || strings.TrimSpace(entry.APIKey) == "" {
+			continue
+		}
+		key := strings.TrimSpace(entry.APIKey)
+		parts = append(parts, "source = "+sqlQuote(key))
+		parts = append(parts, "source = "+sqlQuote("Bearer "+key))
+	}
+	if len(parts) == 0 {
+		return "0=1"
+	}
+	return "(LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key') AND (" + strings.Join(parts, " OR ") + "))"
+}
+
+func throughputSQL() string {
+	duration := `max(latency_ms, ttft_ms)`
+	valid := `output_tokens > 0 AND ` + duration + ` >= 1000 AND NOT (latency_ms = ttft_ms AND output_tokens >= 1000 AND ` + duration + ` < 5000)`
+	return `COALESCE(SUM(CASE WHEN ` + valid + ` THEN output_tokens ELSE 0 END) * 1000.0 / NULLIF(SUM(CASE WHEN ` + valid + ` THEN ` + duration + ` ELSE 0 END),0),0)`
 }
 
 func queryOneTotals(ctx context.Context, db *sql.DB, since int64, scope string) (totalsRow, error) {
@@ -424,11 +497,17 @@ func queryOneTotals(ctx context.Context, db *sql.DB, since int64, scope string) 
 SELECT COUNT(*), COALESCE(SUM(failed),0), COALESCE(SUM(CASE WHEN status_code=429 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
 COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
-COALESCE(SUM(total_tokens),0)
+COALESCE(SUM(total_tokens),0),
+COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END),0),
+COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
+` + throughputSQL() + `,
+COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0)
 FROM usage_events WHERE requested_at >= ? AND ` + usageScopeSQL(scope)
 	err := db.QueryRowContext(ctx, query, since).Scan(
 		&row.Requests, &row.Failed, &row.RateLimited, &row.InputTokens, &row.OutputTokens, &row.ReasoningTokens,
 		&row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.TotalTokens,
+		&row.AverageLatencyMs, &row.AverageTTFTMs, &row.OutputTokensPerSecond, &row.SlowRequests, &row.SlowTTFTRequests,
 	)
 	return row, err
 }
@@ -440,7 +519,13 @@ MAX(auth_id), MAX(source), MAX(provider),
 COUNT(*), COALESCE(SUM(failed),0), COALESCE(SUM(CASE WHEN status_code=429 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
 COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
-COALESCE(SUM(total_tokens),0), MAX(requested_at)
+COALESCE(SUM(total_tokens),0),
+COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END),0),
+COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
+`+throughputSQL()+`,
+COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0),
+MAX(requested_at)
 FROM usage_events
 WHERE requested_at >= ? AND `+usageScopeSQL("codex")+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
 GROUP BY account_key
@@ -456,7 +541,8 @@ LIMIT ?`, since, limit)
 		var last int64
 		if err := rows.Scan(&r.AuthIndex, &r.AuthID, &r.Source, &r.Provider, &r.Requests, &r.Failed, &r.RateLimited,
 			&r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens,
-			&r.CacheCreationTokens, &r.TotalTokens, &last); err != nil {
+			&r.CacheCreationTokens, &r.TotalTokens, &r.AverageLatencyMs, &r.AverageTTFTMs, &r.OutputTokensPerSecond,
+			&r.SlowRequests, &r.SlowTTFTRequests, &last); err != nil {
 			return nil, err
 		}
 		r.LastSeen = unixTime(last)
@@ -471,6 +557,17 @@ LIMIT ?`, since, limit)
 }
 
 func readConfiguredAuthAccounts() []configuredAccount {
+	files := readConfiguredAuthFiles()
+	out := make([]configuredAccount, 0, len(files))
+	for _, file := range files {
+		if isCodexAuthProvider(file.Provider) {
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
+func readConfiguredAuthFiles() []configuredAccount {
 	authDir := configuredAuthDir()
 	if authDir == "" {
 		return nil
@@ -497,10 +594,12 @@ func readConfiguredAuthAccounts() []configuredAccount {
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			continue
 		}
-		authType := firstNonEmptyString(stringFromAny(doc["type"]), stringFromAny(doc["provider"]))
-		if authType != "" && !strings.EqualFold(authType, "codex") {
-			continue
-		}
+		authType := normalizeAuthProvider(firstNonEmptyString(
+			stringFromAny(doc["provider"]),
+			stringFromAny(doc["platform"]),
+			stringFromAny(doc["type"]),
+			stringFromAny(doc["auth_type"]),
+		), entry.Name())
 		email := firstNonEmptyString(stringFromAny(doc["email"]), stringFromAny(doc["account"]), stringFromAny(doc["username"]))
 		name := stringFromAny(doc["name"])
 		authFile := entry.Name()
@@ -517,60 +616,6 @@ func readConfiguredAuthAccounts() []configuredAccount {
 			Disabled:      boolFromAny(doc["disabled"]),
 			Expired:       boolFromAny(doc["expired"]),
 			PlanType:      firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
-		})
-	}
-	return out
-}
-
-func readTriggerAuthAccounts() []triggerAuthAccount {
-	authDir := configuredAuthDir()
-	if authDir == "" {
-		return nil
-	}
-	entries, err := os.ReadDir(authDir)
-	if err != nil {
-		return nil
-	}
-	out := make([]triggerAuthAccount, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		path := filepath.Join(authDir, entry.Name())
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var doc map[string]any
-		if err := json.Unmarshal(raw, &doc); err != nil {
-			continue
-		}
-		authType := firstNonEmptyString(stringFromAny(doc["type"]), stringFromAny(doc["provider"]))
-		if authType != "" && !strings.EqualFold(authType, "codex") {
-			continue
-		}
-		email := firstNonEmptyString(stringFromAny(doc["email"]), stringFromAny(doc["account"]), stringFromAny(doc["username"]))
-		name := stringFromAny(doc["name"])
-		authFile := entry.Name()
-		source := firstNonEmptyString(email, name, authFile)
-		out = append(out, triggerAuthAccount{
-			configuredAccount: configuredAccount{
-				AuthIndex:     authFile,
-				AuthID:        email,
-				Source:        source,
-				Provider:      firstNonEmptyString(authType, "codex"),
-				Email:         email,
-				Name:          name,
-				AuthFile:      authFile,
-				AuthFileMTime: info.ModTime().Unix(),
-				Disabled:      boolFromAny(doc["disabled"]),
-				Expired:       boolFromAny(doc["expired"]),
-				PlanType:      firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
-			},
 			AccessToken: firstNonEmptyString(
 				stringFromAny(doc["access_token"]),
 				stringFromAny(doc["accessToken"]),
@@ -582,6 +627,51 @@ func readTriggerAuthAccounts() []triggerAuthAccount {
 				stringFromAny(doc["account_id"]),
 				stringFromAny(doc["accountId"]),
 			),
+		})
+	}
+	return out
+}
+
+func normalizeAuthProvider(value, filename string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case value == "codex" || value == "openai" || value == "chatgpt":
+		return "codex"
+	case value == "anthropic" || value == "claude":
+		return "anthropic"
+	case value == "antigravity":
+		return "antigravity"
+	case value == "gemini" || value == "google":
+		return "gemini"
+	}
+	name := strings.ToLower(strings.TrimSpace(filename))
+	switch {
+	case strings.Contains(name, "anthropic") || strings.Contains(name, "claude"):
+		return "anthropic"
+	case strings.Contains(name, "antigravity"):
+		return "antigravity"
+	case strings.Contains(name, "gemini") || strings.Contains(name, "google"):
+		return "gemini"
+	default:
+		return "codex"
+	}
+}
+
+func isCodexAuthProvider(provider string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "codex")
+}
+
+func readTriggerAuthAccounts() []triggerAuthAccount {
+	files := readConfiguredAuthFiles()
+	out := make([]triggerAuthAccount, 0, len(files))
+	for _, file := range files {
+		if !isCodexAuthProvider(file.Provider) {
+			continue
+		}
+		out = append(out, triggerAuthAccount{
+			configuredAccount: file,
+			AccessToken:       file.AccessToken,
+			ChatGPTAccountID:  file.ChatGPTAccountID,
 		})
 	}
 	return out
@@ -615,52 +705,198 @@ func configuredConfigPath() string {
 }
 
 func readConfiguredProviderNames() []string {
+	entries := readConfiguredProviderEntries()
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.Name)
+	}
+	return out
+}
+
+func readConfiguredProviderEntries() []providerConfigEntry {
 	raw, err := os.ReadFile(configuredConfigPath())
 	if err != nil {
 		return nil
 	}
-	return configuredProviderNamesFromYAML(string(raw))
+	return configuredProviderEntriesFromYAML(string(raw))
 }
 
 func configuredProviderNamesFromYAML(raw string) []string {
-	var out []string
+	entries := configuredProviderEntriesFromYAML(raw)
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.Name)
+	}
+	return out
+}
+
+func configuredProviderEntriesFromYAML(raw string) []providerConfigEntry {
+	blocks := map[string]string{
+		"openai-compatibility": "OpenAI",
+		"openai-compatible":    "OpenAI",
+		"codex-api-key":        "Codex",
+		"claude-api-key":       "Claude",
+		"anthropic-api-key":    "Claude",
+		"gemini-api-key":       "Gemini",
+		"antigravity-api-key":  "Antigravity",
+		"antigravity-oauth":    "Antigravity",
+		"anthropic-oauth":      "Claude",
+	}
+	var out []providerConfigEntry
 	seen := map[string]bool{}
-	inOpenAICompatibility := false
+	add := func(provider, name, apiKey string) {
+		name = strings.TrimSpace(strings.Trim(name, `"'`))
+		key := normalizeAccountAlias(name)
+		if name != "" && !seen[key] {
+			seen[key] = true
+			out = append(out, providerConfigEntry{Name: name, Provider: provider, APIKey: strings.TrimSpace(strings.Trim(apiKey, `"'`))})
+		}
+	}
+	var current *providerConfigBlock
 	blockIndent := -1
+	itemIndent := -1
+	itemName := ""
+	itemBaseURL := ""
+	itemAPIKey := ""
+	flushItem := func() {
+		if current == nil || itemIndent < 0 {
+			return
+		}
+		add(current.DisplayName, providerConfigEntryName(current.DisplayName, itemName, itemBaseURL), itemAPIKey)
+		itemIndent = -1
+		itemName = ""
+		itemBaseURL = ""
+		itemAPIKey = ""
+	}
 	for _, line := range strings.Split(raw, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-		if !inOpenAICompatibility && strings.HasPrefix(trimmed, "openai-compatibility:") {
-			inOpenAICompatibility = true
+		if indent == 0 && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "-") {
+			flushItem()
+			current = nil
+			itemIndent = -1
 			blockIndent = indent
+			key, value := yamlKeyValue(trimmed)
+			if display, ok := blocks[key]; ok {
+				current = &providerConfigBlock{Key: key, DisplayName: display}
+				if yamlScalarHasValue(value) {
+					add(display, display, "")
+				}
+			}
 			continue
 		}
-		if inOpenAICompatibility && indent <= blockIndent && !strings.HasPrefix(trimmed, "-") {
-			inOpenAICompatibility = false
-		}
-		if !inOpenAICompatibility || indent > blockIndent+4 {
+		if current == nil {
 			continue
 		}
-		var name string
-		switch {
-		case strings.HasPrefix(trimmed, "name:"):
-			name = strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
-		case strings.HasPrefix(trimmed, "- name:"):
-			name = strings.TrimSpace(strings.TrimPrefix(trimmed, "- name:"))
-		default:
+		if indent <= blockIndent && !strings.HasPrefix(trimmed, "-") {
+			flushItem()
+			current = nil
 			continue
 		}
-		name = strings.Trim(name, `"'`)
-		key := normalizeAccountAlias(name)
-		if name != "" && !seen[key] {
-			seen[key] = true
-			out = append(out, name)
+		if strings.HasPrefix(trimmed, "- ") && indent > blockIndent && (itemIndent < 0 || indent <= itemIndent) {
+			flushItem()
+			itemIndent = indent
+			inline := strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
+			key, value := yamlKeyValue(inline)
+			switch key {
+			case "name":
+				itemName = value
+			case "base-url", "base_url":
+				itemBaseURL = value
+			case "api-key", "api_key":
+				itemAPIKey = value
+			}
+			continue
+		}
+		if itemIndent >= 0 && indent == itemIndent+2 {
+			key, value := yamlKeyValue(trimmed)
+			switch key {
+			case "name":
+				itemName = value
+			case "base-url", "base_url":
+				itemBaseURL = value
+			case "api-key", "api_key":
+				itemAPIKey = value
+			}
+		}
+		if itemIndent >= 0 && indent > itemIndent && itemAPIKey == "" {
+			key, value := yamlKeyValue(strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")))
+			if key == "api-key" || key == "api_key" {
+				itemAPIKey = value
+			}
 		}
 	}
+	flushItem()
 	return out
+}
+
+type providerConfigBlock struct {
+	Key         string
+	DisplayName string
+}
+
+type providerConfigEntry struct {
+	Name     string
+	Provider string
+	APIKey   string
+}
+
+func yamlKeyValue(line string) (string, string) {
+	key, value, ok := strings.Cut(line, ":")
+	if !ok {
+		return "", ""
+	}
+	value = strings.TrimSpace(value)
+	if i := strings.Index(value, " #"); i >= 0 {
+		value = strings.TrimSpace(value[:i])
+	}
+	return strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(strings.Trim(value, `"'`))
+}
+
+func yamlScalarHasValue(value string) bool {
+	value = strings.TrimSpace(strings.Trim(value, `"'`))
+	if value == "" {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "[]", "{}", "null", "~":
+		return false
+	default:
+		return true
+	}
+}
+
+func providerConfigEntryName(provider, name, baseURL string) string {
+	name = strings.TrimSpace(strings.Trim(name, `"'`))
+	if name != "" {
+		return name
+	}
+	host := hostFromURL(baseURL)
+	if host != "" {
+		return strings.TrimSpace(provider + " · " + host)
+	}
+	return strings.TrimSpace(provider)
+}
+
+func hostFromURL(value string) string {
+	value = strings.TrimSpace(strings.Trim(value, `"'`))
+	if value == "" {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		if parsed, err = url.Parse("https://" + strings.TrimPrefix(value, "//")); err != nil || parsed.Host == "" {
+			return ""
+		}
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		host = parsed.Host
+	}
+	return host
 }
 
 func authFileStateForRecord(rec usageRecord) (string, int64) {
@@ -1410,6 +1646,11 @@ COUNT(*), COALESCE(SUM(failed),0), COALESCE(SUM(CASE WHEN status_code=429 THEN 1
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
 COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
 COALESCE(SUM(total_tokens),0),
+COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END),0),
+COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
+` + throughputSQL() + `,
+COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0),
 COUNT(DISTINCT NULLIF(COALESCE(NULLIF(auth_index,''), NULLIF(auth_id,''), NULLIF(source,'')), '')),
 COUNT(DISTINCT NULLIF(model,'')),
 MAX(requested_at)
@@ -1430,7 +1671,8 @@ LIMIT ?`
 		if err := rows.Scan(
 			&r.Provider, &r.Requests, &r.Failed, &r.RateLimited, &r.InputTokens, &r.OutputTokens,
 			&r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens,
-			&r.TotalTokens, &r.Accounts, &r.Models, &last,
+			&r.TotalTokens, &r.AverageLatencyMs, &r.AverageTTFTMs, &r.OutputTokensPerSecond,
+			&r.SlowRequests, &r.SlowTTFTRequests, &r.Accounts, &r.Models, &last,
 		); err != nil {
 			return nil, err
 		}
@@ -1441,7 +1683,22 @@ LIMIT ?`
 }
 
 func cpaProviderSQL() string {
+	return cpaProviderSQLWithEntries(readConfiguredProviderEntries())
+}
+
+func cpaProviderSQLWithEntries(entries []providerConfigEntry) string {
 	tail := "substr(auth_id, length('openai-compatibility:') + 1)"
+	var codexAPIKeyCases strings.Builder
+	for _, entry := range entries {
+		if !strings.EqualFold(entry.Provider, "Codex") || strings.TrimSpace(entry.APIKey) == "" || strings.TrimSpace(entry.Name) == "" {
+			continue
+		}
+		codexAPIKeyCases.WriteString("WHEN lower(provider) = 'codex' AND lower(auth_type) IN ('apikey', 'api_key', 'key') AND source = ")
+		codexAPIKeyCases.WriteString(sqlQuote(entry.APIKey))
+		codexAPIKeyCases.WriteString(" THEN ")
+		codexAPIKeyCases.WriteString(sqlQuote(entry.Name))
+		codexAPIKeyCases.WriteString("\n")
+	}
 	return `CASE
 WHEN auth_id LIKE 'openai-compatibility:%:%' THEN substr(` + tail + `, 1, instr(` + tail + `, ':') - 1)
 WHEN provider LIKE 'openai-compatible-%' THEN substr(provider, length('openai-compatible-') + 1)
@@ -1449,9 +1706,14 @@ WHEN provider LIKE 'openai-compatibility-%' THEN substr(provider, length('openai
 WHEN lower(provider) IN ('openai-compatible', 'openai-compatibility') AND source <> '' AND source NOT LIKE 'sk-%' AND source NOT LIKE 'ark-%' AND source NOT LIKE 'Bearer %' THEN source
 WHEN lower(provider) IN ('anthropic', 'claude') THEN 'Claude'
 WHEN lower(provider) LIKE 'gemini%' THEN 'Gemini'
+` + codexAPIKeyCases.String() + `
 WHEN lower(provider) = 'codex' THEN 'Codex'
 ELSE COALESCE(NULLIF(provider,''), 'unknown')
 END`
+}
+
+func sqlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func mergeConfiguredProviders(rows []providerRow, names []string) []providerRow {
@@ -1481,7 +1743,12 @@ func queryModels(ctx context.Context, db *sql.DB, since int64, limit int, scope 
 	query := `
 SELECT model, alias, ` + cpaProviderSQL() + ` AS provider_key, COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(input_tokens),0),
 COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
-COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0)
+COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
+COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END),0),
+COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
+` + throughputSQL() + `,
+COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0)
 FROM usage_events
 WHERE requested_at >= ? AND ` + usageScopeSQL(scope) + `
 GROUP BY model, alias, provider_key
@@ -1498,6 +1765,7 @@ LIMIT ?`
 		if err := rows.Scan(
 			&r.Model, &r.Alias, &r.Provider, &r.Requests, &r.TotalTokens, &r.InputTokens, &r.OutputTokens,
 			&r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens,
+			&r.AverageLatencyMs, &r.AverageTTFTMs, &r.OutputTokensPerSecond, &r.SlowRequests, &r.SlowTTFTRequests,
 		); err != nil {
 			return nil, err
 		}

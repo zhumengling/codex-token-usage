@@ -76,6 +76,7 @@ LIMIT ?`
 		}
 		r.Time = unixTime(ts)
 		r.Failed = failed != 0
+		r.Source = safeExportLabel(r.Source)
 		costRow := costTokenRow{
 			Model:               r.Model,
 			Alias:               r.Alias,

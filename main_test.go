@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -14,6 +15,15 @@ import (
 	"testing"
 	"time"
 )
+
+func TestSanitizeTriggerErrorKeepsErrorText(t *testing.T) {
+	if got := sanitizeTriggerError(errors.New("context canceled")); got != "context canceled" {
+		t.Fatalf("sanitizeTriggerError(error) = %q, want context canceled", got)
+	}
+	if got := sanitizeTriggerError(map[string]any{}); got == "{}" {
+		t.Fatalf("sanitizeTriggerError(empty map) = %q, want no raw JSON object noise", got)
+	}
+}
 
 func TestCodex429AutobanFiltersSchedulerCandidate(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
@@ -254,8 +264,28 @@ func TestCodex401InvalidAuthFiltersUntilAuthFileReplaced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pickAuth after replace returned error: %v", err)
 	}
-	if !resp.Handled || resp.DelegateBuiltin != "round-robin" {
-		t.Fatalf("pickAuth after replace = %+v, want builtin delegation", resp)
+	if resp.Handled {
+		t.Fatalf("pickAuth after replace = %+v, want unhandled so CPA keeps configured scheduler", resp)
+	}
+}
+
+func TestSchedulerKeepsHostFillFirstWhenNoFilteringNeeded(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	store := &store{}
+	defer store.close()
+
+	resp, err := store.pickAuth(context.Background(), schedulerPickRequest{
+		Provider: "codex",
+		Candidates: []schedulerAuthCandidate{
+			{ID: "auth-a", Provider: "codex", Priority: 100},
+			{ID: "auth-b", Provider: "codex", Priority: 10},
+		},
+	})
+	if err != nil {
+		t.Fatalf("pickAuth returned error: %v", err)
+	}
+	if resp.Handled || resp.DelegateBuiltin != "" {
+		t.Fatalf("pickAuth = %+v, want unhandled to preserve CPA fill-first/round-robin setting", resp)
 	}
 }
 
@@ -684,8 +714,8 @@ func TestQuotaTriggerDefaultConfigIsDisabled(t *testing.T) {
 	if cfg.QuotaTriggerEnabled {
 		t.Fatalf("default quota trigger enabled = true, want false")
 	}
-	if cfg.QuotaTriggerMode != "quota" || cfg.QuotaTriggerIntervalMinutes != 10 || cfg.QuotaTriggerMinAccountCooldownMinutes != 10 {
-		t.Fatalf("default config = %+v, want quota/10m/10m", cfg)
+	if cfg.QuotaTriggerMode != "probe" || cfg.QuotaTriggerIntervalMinutes != 10 || cfg.QuotaTriggerMinAccountCooldownMinutes != 10 {
+		t.Fatalf("default config = %+v, want probe/10m/10m", cfg)
 	}
 	decoded := parsePluginConfigYAML([]byte("quota_trigger_enabled: true\nquota_trigger_mode: probe\nquota_trigger_interval_minutes: 5\n"), defaultPluginConfig())
 	decoded = normalizePluginConfig(decoded)
@@ -727,8 +757,18 @@ func TestQuotaTriggerQuotaModeUpdatesSnapshotAndCooldown(t *testing.T) {
 
 	resetAt := time.Now().Add(2 * time.Hour).Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("quota trigger method = %s, want POST model probe", r.Method)
+		}
 		if got := r.Header.Get("Authorization"); got != "Bearer secret-access-token" {
 			t.Fatalf("authorization header = %q, want bearer token", got)
+		}
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode probe body: %v", err)
+		}
+		if req["model"] != codexProbeModel || req["stream"] != false {
+			t.Fatalf("probe body = %#v, want model %s and non-stream", req, codexProbeModel)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":12.5,"reset_at":%d,"limit_window_seconds":18000},"secondary_window":{"used_percent":22.5,"reset_at":%d,"limit_window_seconds":604800,"remaining_tokens":775,"limit_tokens":1000}}}`, resetAt, resetAt)))
@@ -813,6 +853,9 @@ func TestQuotaTriggerRefreshesAndReleasesActiveAutoban(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("quota trigger method = %s, want POST model probe", r.Method)
+		}
 		if got := r.Header.Get("Authorization"); got != "Bearer secret-access-token" {
 			t.Fatalf("authorization header = %q, want bearer token", got)
 		}
@@ -963,6 +1006,9 @@ func TestQuotaTriggerFiltersBadAccountsAndRecords401429(t *testing.T) {
 
 	resetAt := time.Now().Add(time.Hour).Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("quota trigger method = %s, want POST model probe", r.Method)
+		}
 		switch r.Header.Get("Authorization") {
 		case "Bearer invalid-token":
 			w.WriteHeader(http.StatusUnauthorized)
@@ -1116,6 +1162,106 @@ func TestRecentRequestsExposeLatencyAndCacheBreakdown(t *testing.T) {
 	}
 }
 
+func TestLatencyIsClampedToTTFTForThroughput(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	store := &store{}
+	defer store.close()
+
+	ctx := context.Background()
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "latency-clamp@example.com",
+		AuthIndex:   "latency-clamp",
+		Source:      "latency-clamp@example.com",
+		Model:       "gpt-5.5",
+		Latency:     1,
+		TTFT:        1_800_000_000,
+		RequestedAt: time.Now(),
+		Detail: usageDetail{
+			OutputTokens: 900,
+			TotalTokens:  900,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	recent := data["recent"].([]recentRow)
+	if len(recent) != 1 {
+		t.Fatalf("recent = %#v, want one recent row", recent)
+	}
+	if recent[0].LatencyMs != 1800 || recent[0].TTFTMs != 1800 {
+		t.Fatalf("latency fields = %d/%d, want clamped to TTFT 1800/1800", recent[0].LatencyMs, recent[0].TTFTMs)
+	}
+	totals := data["totals"].(totalsRow)
+	if totals.OutputTokensPerSecond > 600 {
+		t.Fatalf("throughput = %.2f, want reasonable value after latency clamp", totals.OutputTokensPerSecond)
+	}
+}
+
+func TestThroughputUsesWeightedReliableSamples(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	store := &store{}
+	defer store.close()
+
+	ctx := context.Background()
+	now := time.Now()
+	records := []usageRecord{
+		{
+			Provider:    "codex",
+			AuthID:      "throughput@example.com",
+			AuthIndex:   "throughput",
+			Source:      "throughput@example.com",
+			Model:       "gpt-5.5",
+			Latency:     int64(1300 * time.Millisecond),
+			TTFT:        int64(1300 * time.Millisecond),
+			RequestedAt: now,
+			Detail: usageDetail{
+				OutputTokens: 4000,
+				TotalTokens:  4000,
+			},
+		},
+		{
+			Provider:    "codex",
+			AuthID:      "throughput@example.com",
+			AuthIndex:   "throughput",
+			Source:      "throughput@example.com",
+			Model:       "gpt-5.5",
+			Latency:     int64(20 * time.Second),
+			TTFT:        int64(1500 * time.Millisecond),
+			RequestedAt: now.Add(time.Second),
+			Detail: usageDetail{
+				OutputTokens: 1000,
+				TotalTokens:  1000,
+			},
+		},
+	}
+	for _, rec := range records {
+		if err := store.recordUsage(ctx, rec); err != nil {
+			t.Fatalf("recordUsage returned error: %v", err)
+		}
+	}
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	totals := data["totals"].(totalsRow)
+	if totals.OutputTokensPerSecond < 49 || totals.OutputTokensPerSecond > 51 {
+		t.Fatalf("throughput = %.2f, want weighted reliable throughput near 50", totals.OutputTokensPerSecond)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 {
+		t.Fatalf("accounts = %#v, want one account", accounts)
+	}
+	if accounts[0].OutputTokensPerSecond < 49 || accounts[0].OutputTokensPerSecond > 51 {
+		t.Fatalf("account throughput = %.2f, want weighted reliable throughput near 50", accounts[0].OutputTokensPerSecond)
+	}
+}
+
 func TestSummaryCalculatesOpenAICompatibleProviderCostsFromPriceFile(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	t.Setenv("CPA_AUTH_DIR", t.TempDir())
@@ -1185,6 +1331,203 @@ func TestSummaryCalculatesOpenAICompatibleProviderCostsFromPriceFile(t *testing.
 	}
 }
 
+func TestUnconfiguredCodexAPIKeyProviderDoesNotPolluteStats(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	t.Setenv("CPA_CONFIG_PATH", filepath.Join(t.TempDir(), "missing.yaml"))
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:     "codex",
+		ExecutorType: "CodexExecutor",
+		AuthType:     "apikey",
+		AuthID:       "codex:apikey:b575a2ab1607",
+		AuthIndex:    "e88eaa4c2018a1fa",
+		Source:       "sk-provider-secret",
+		Model:        "gpt-5.5",
+		Alias:        "gpt-5.5",
+		RequestedAt:  time.Now(),
+		Detail: usageDetail{
+			InputTokens:  120,
+			OutputTokens: 30,
+			TotalTokens:  150,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:     "codex",
+		ExecutorType: "CodexExecutor",
+		AuthType:     "oauth",
+		AuthID:       "real-account@example.com.cpa.json",
+		AuthIndex:    "real-account",
+		Source:       "real-account@example.com",
+		Model:        "gpt-5.5",
+		Alias:        "gpt-5.5",
+		RequestedAt:  time.Now(),
+		Detail: usageDetail{
+			InputTokens:  200,
+			OutputTokens: 50,
+			TotalTokens:  250,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 {
+		t.Fatalf("accounts = %#v, want only oauth Codex account", accounts)
+	}
+	if strings.Contains(accounts[0].Source, "sk-") || accounts[0].AuthID == "codex:apikey:b575a2ab1607" {
+		t.Fatalf("Codex account pool leaked API key provider row: %+v", accounts[0])
+	}
+	totals := data["totals"].(totalsRow)
+	if totals.TotalTokens != 250 {
+		t.Fatalf("codex totals = %d, want only oauth tokens 250", totals.TotalTokens)
+	}
+	providerTotals := data["provider_totals"].(totalsRow)
+	if providerTotals.TotalTokens != 0 {
+		t.Fatalf("provider totals = %d, want unconfigured API-key Codex provider excluded", providerTotals.TotalTokens)
+	}
+	providers := data["providers"].([]providerRow)
+	if len(providers) != 0 {
+		t.Fatalf("providers = %#v, want unconfigured API-key Codex provider hidden", providers)
+	}
+	providerRecent := data["provider_recent"].([]recentRow)
+	if len(providerRecent) != 0 {
+		t.Fatalf("provider_recent = %#v, want unconfigured API-key Codex requests hidden", providerRecent)
+	}
+}
+
+func TestCodexAPIKeyProviderUsesConfiguredEndpointName(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("CPA_CONFIG_PATH", configPath)
+	if err := os.WriteFile(configPath, []byte(`
+codex-api-key:
+  - api-key: sk-provider-secret
+    base-url: https://api.kmoon.site/v1
+    models:
+      - name: gpt-5.5
+`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:     "codex",
+		ExecutorType: "CodexExecutor",
+		AuthType:     "apikey",
+		AuthID:       "codex:apikey:b575a2ab1607",
+		AuthIndex:    "e88eaa4c2018a1fa",
+		Source:       "sk-provider-secret",
+		Model:        "gpt-5.5",
+		Alias:        "gpt-5.5",
+		RequestedAt:  time.Now(),
+		Detail: usageDetail{
+			InputTokens:  120,
+			OutputTokens: 30,
+			TotalTokens:  150,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	providerTotals := data["provider_totals"].(totalsRow)
+	if providerTotals.TotalTokens != 150 {
+		t.Fatalf("provider totals = %d, want configured Codex endpoint tokens 150", providerTotals.TotalTokens)
+	}
+	providers := data["providers"].([]providerRow)
+	if len(providers) != 1 || providers[0].Provider != "Codex · api.kmoon.site" || providers[0].TotalTokens != 150 {
+		t.Fatalf("providers = %#v, want one configured Codex endpoint row", providers)
+	}
+	providerModels := data["provider_models"].([]modelRow)
+	if len(providerModels) != 1 || providerModels[0].Provider != "Codex · api.kmoon.site" {
+		t.Fatalf("provider_models = %#v, want configured Codex endpoint name", providerModels)
+	}
+}
+
+func TestProviderRecentKeepsOlderEndpointRows(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("CPA_CONFIG_PATH", cfgPath)
+	if err := os.WriteFile(cfgPath, []byte(`
+openai-compatibility:
+  - name: 字节
+    api-key: sk-byte-secret
+codex-api-key:
+  - name: Codex · api.kmoon.site
+    api-key: sk-codex-secret
+`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	base := time.Now().Add(-time.Hour)
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "openai-compatible-字节",
+		AuthID:      "openai-compatibility:字节:test",
+		AuthType:    "api_key",
+		Source:      "ark-byte-key",
+		Model:       "deepseek-v4-pro",
+		RequestedAt: base,
+		Detail:      usageDetail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120},
+	}); err != nil {
+		t.Fatalf("record byte usage: %v", err)
+	}
+	for i := 0; i < 60; i++ {
+		if err := store.recordUsage(ctx, usageRecord{
+			Provider:    "codex",
+			AuthID:      "codex:apikey:test",
+			AuthType:    "apikey",
+			Source:      "sk-codex-secret",
+			Model:       "gpt-5.5",
+			RequestedAt: base.Add(time.Duration(i+1) * time.Minute),
+			Failed:      true,
+			Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+		}); err != nil {
+			t.Fatalf("record codex api key usage %d: %v", i, err)
+		}
+	}
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	recent := data["provider_recent"].([]recentRow)
+	var foundByte bool
+	var leakedKey bool
+	for _, row := range recent {
+		if row.Provider == "字节" {
+			foundByte = true
+		}
+		if strings.Contains(row.Source, "sk-codex-secret") {
+			leakedKey = true
+		}
+	}
+	if !foundByte {
+		t.Fatalf("provider_recent len=%d missing older 字节 row after newer Codex endpoint rows", len(recent))
+	}
+	if leakedKey {
+		t.Fatalf("provider_recent leaked raw API key: %#v", recent)
+	}
+}
+
 func TestConfiguredProviderNamesFromYAMLReadsOpenAICompatibilityNames(t *testing.T) {
 	raw := `
 openai-compatibility:
@@ -1195,9 +1538,15 @@ openai-compatibility:
     name: maas
   - name: '字节'
 claude-api-key: []
+codex-api-key:
+  - api-key: sk-codex-redacted
+    base-url: https://api.kmoon.site/v1
+    models:
+      - name: gpt-5.5
+gemini-api-key: []
 `
 	got := configuredProviderNamesFromYAML(raw)
-	want := []string{"deepseek", "maas", "字节"}
+	want := []string{"deepseek", "maas", "字节", "Codex · api.kmoon.site"}
 	if len(got) != len(want) {
 		t.Fatalf("names = %#v, want %#v", got, want)
 	}
@@ -1205,6 +1554,204 @@ claude-api-key: []
 		if got[i] != want[i] {
 			t.Fatalf("names = %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestConfiguredProviderEntriesFromYAMLReadsAllCommonProviderEndpoints(t *testing.T) {
+	raw := `
+openai-compatibility:
+  - api-key-entries:
+      - api-key: sk-random-openai-compat
+    base-url: https://compat-random.example/v1
+    name: random-compat-a
+openai-compatible:
+  - api-key-entries:
+      - api-key: sk-random-openai-compatible
+    base-url: https://compatible-random.example/v1
+    name: random-compat-b
+codex-api-key:
+  - api-key: sk-random-codex
+    base-url: https://codex-random.example/v1
+claude-api-key:
+  - api-key: sk-random-claude
+    base-url: https://claude-random.example/v1
+anthropic-api-key:
+  - api-key: sk-random-anthropic
+    base-url: https://anthropic-random.example/v1
+gemini-api-key:
+  - api-key: sk-random-gemini
+    base-url: https://gemini-random.example/v1
+antigravity-api-key:
+  - api-key: sk-random-antigravity
+    base-url: https://antigravity-random.example/v1
+anthropic-oauth:
+  - name: random-anthropic-oauth
+antigravity-oauth:
+  - name: random-antigravity-oauth
+`
+	entries := configuredProviderEntriesFromYAML(raw)
+	got := map[string]providerConfigEntry{}
+	for _, entry := range entries {
+		got[entry.Name] = entry
+	}
+	want := map[string]string{
+		"random-compat-a":                          "OpenAI",
+		"random-compat-b":                          "OpenAI",
+		"Codex · codex-random.example":             "Codex",
+		"Claude · claude-random.example":           "Claude",
+		"Claude · anthropic-random.example":        "Claude",
+		"Gemini · gemini-random.example":           "Gemini",
+		"Antigravity · antigravity-random.example": "Antigravity",
+		"random-anthropic-oauth":                   "Claude",
+		"random-antigravity-oauth":                 "Antigravity",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("entries = %#v, want %d common provider endpoints", entries, len(want))
+	}
+	for name, provider := range want {
+		entry, ok := got[name]
+		if !ok {
+			t.Fatalf("missing provider endpoint %q in %#v", name, entries)
+		}
+		if entry.Provider != provider {
+			t.Fatalf("provider for %q = %q, want %q", name, entry.Provider, provider)
+		}
+	}
+	if got["random-compat-a"].APIKey != "sk-random-openai-compat" {
+		t.Fatalf("nested openai-compatible api key was not read: %+v", got["random-compat-a"])
+	}
+	if got["Codex · codex-random.example"].APIKey != "sk-random-codex" {
+		t.Fatalf("codex api key was not read: %+v", got["Codex · codex-random.example"])
+	}
+}
+
+func TestConfiguredAuthFilesReadCodexAnthropicAndAntigravityOAuth(t *testing.T) {
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	writeAuth := func(name, raw string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(authDir, name), []byte(raw), 0600); err != nil {
+			t.Fatalf("write auth %s: %v", name, err)
+		}
+	}
+	writeAuth("codex-random.cpa.json", `{"provider":"codex","email":"codex-random@example.com","access_token":"redacted"}`)
+	writeAuth("anthropic-random.json", `{"provider":"anthropic","email":"anthropic-random@example.com","refresh_token":"redacted"}`)
+	writeAuth("antigravity-random.json", `{"platform":"antigravity","email":"antigravity-random@example.com","refresh_token":"redacted"}`)
+
+	files := readConfiguredAuthFiles()
+	if len(files) != 3 {
+		t.Fatalf("auth files = %#v, want codex/anthropic/antigravity", files)
+	}
+	providers := map[string]string{}
+	for _, file := range files {
+		providers[file.Email] = file.Provider
+	}
+	if providers["codex-random@example.com"] != "codex" || providers["anthropic-random@example.com"] != "anthropic" || providers["antigravity-random@example.com"] != "antigravity" {
+		t.Fatalf("auth file providers = %#v", providers)
+	}
+	codexAccounts := readConfiguredAuthAccounts()
+	if len(codexAccounts) != 1 || codexAccounts[0].Email != "codex-random@example.com" {
+		t.Fatalf("codex account pool auth files = %#v, want only codex OAuth file", codexAccounts)
+	}
+	triggerAccounts := readTriggerAuthAccounts()
+	if len(triggerAccounts) != 1 || triggerAccounts[0].Email != "codex-random@example.com" || triggerAccounts[0].AccessToken != "redacted" {
+		t.Fatalf("trigger auth accounts = %#v, want only Codex with access token", triggerAccounts)
+	}
+}
+
+func TestRetentionConfigParsesChineseAndEnglishFields(t *testing.T) {
+	cfg := parsePluginConfigYAML([]byte(`
+usage_retention_days: 120
+额度触发记录保留天数: 45
+请求明细保留天数: 20
+`), defaultPluginConfig())
+	cfg = normalizePluginConfig(cfg)
+	if cfg.UsageRetentionDays != 120 || cfg.QuotaTriggerRetentionDays != 45 || cfg.RequestDetailRetentionDays != 20 {
+		t.Fatalf("retention config = %+v", cfg)
+	}
+}
+
+func TestSummaryIncludesDiagnosticsAndAlerts(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "broken@example.com",
+		AuthIndex:   "broken.json",
+		Source:      "broken@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusUnauthorized, Body: "unauthorized sk-secret-should-not-leak"},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	diagnostics, ok := data["diagnostics"].(diagnosticsSummary)
+	if !ok {
+		t.Fatalf("diagnostics = %#v, want diagnosticsSummary", data["diagnostics"])
+	}
+	if diagnostics.Database.UsageEvents != 1 || diagnostics.AuthFiles.Invalid401 != 1 {
+		t.Fatalf("diagnostics = %+v, want one usage event and one invalid auth", diagnostics)
+	}
+	alerts, ok := data["alerts"].([]dashboardAlert)
+	if !ok || len(alerts) == 0 {
+		t.Fatalf("alerts = %#v, want at least one alert", data["alerts"])
+	}
+}
+
+func TestExportRecordsDoNotLeakSecrets(t *testing.T) {
+	data := map[string]any{
+		"accounts": []accountRow{{
+			AuthIndex:   "auth.json",
+			AuthID:      "acct@example.com",
+			Source:      "sk-secret-should-not-export",
+			Provider:    "codex",
+			Requests:    1,
+			TotalTokens: 42,
+			CostUSD:     0.01,
+		}},
+		"provider_recent": []recentRow{{
+			Time:        time.Now().Format(time.RFC3339),
+			Provider:    "Codex · api.example.com",
+			Source:      "sk-secret-should-not-export",
+			Model:       "test-model",
+			TotalTokens: 42,
+			CostUSD:     0.01,
+		}},
+	}
+	records, headers := exportRecords(data, "accounts")
+	body, err := recordsToCSV(headers, records)
+	if err != nil {
+		t.Fatalf("recordsToCSV returned error: %v", err)
+	}
+	if strings.Contains(string(body), "sk-secret-should-not-export") {
+		t.Fatalf("account export leaked secret: %s", body)
+	}
+	records, headers = exportRecords(data, "recent")
+	body, err = recordsToCSV(headers, records)
+	if err != nil {
+		t.Fatalf("recordsToCSV recent returned error: %v", err)
+	}
+	if strings.Contains(string(body), "sk-secret-should-not-export") {
+		t.Fatalf("recent export leaked secret: %s", body)
+	}
+}
+
+func TestMergeConfiguredProvidersReflectsCurrentConfig(t *testing.T) {
+	rows := []providerRow{{Provider: "deepseek", TotalTokens: 100}}
+	withCodex := mergeConfiguredProviders(rows, []string{"deepseek", "Codex · api.kmoon.site"})
+	if len(withCodex) != 2 || withCodex[1].Provider != "Codex · api.kmoon.site" {
+		t.Fatalf("providers with codex config = %#v", withCodex)
+	}
+	withoutCodex := mergeConfiguredProviders(rows, []string{"deepseek"})
+	if len(withoutCodex) != 1 || withoutCodex[0].Provider != "deepseek" {
+		t.Fatalf("providers after config removal = %#v, want only deepseek", withoutCodex)
 	}
 }
 
@@ -1309,8 +1856,13 @@ func readPricesFromPathForTest(t *testing.T, path string) map[string]modelPrice 
 func withCodexQuotaURLForTest(t *testing.T, url string) {
 	t.Helper()
 	old := codexQuotaURLOverrideForTest
+	oldResponses := codexResponsesURLOverrideForTest
 	codexQuotaURLOverrideForTest = url
-	t.Cleanup(func() { codexQuotaURLOverrideForTest = old })
+	codexResponsesURLOverrideForTest = url
+	t.Cleanup(func() {
+		codexQuotaURLOverrideForTest = old
+		codexResponsesURLOverrideForTest = oldResponses
+	})
 }
 
 func intToString(v int64) string {

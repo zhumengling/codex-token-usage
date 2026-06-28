@@ -37,11 +37,13 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -56,13 +58,15 @@ import (
 )
 
 const (
-	abiVersion       uint32 = 1
-	pluginID                = "codex-token-usage"
-	codexQuotaAPIURL        = "https://chatgpt.com/backend-api/wham/usage"
+	abiVersion           uint32 = 1
+	pluginID                    = "codex-token-usage"
+	codexQuotaAPIURL            = "https://chatgpt.com/backend-api/wham/usage"
+	codexResponsesAPIURL        = "https://chatgpt.com/backend-api/codex/responses/compact"
+	codexProbeModel             = "gpt-5-codex"
 )
 
 var (
-	pluginVersion    = "0.1.8"
+	pluginVersion    = "0.1.9"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -70,7 +74,9 @@ var (
 var globalStore = &store{}
 var globalQuotaTrigger = &quotaTriggerManager{}
 var globalModelPriceUpdater = &modelPriceUpdateManager{}
+var globalRetentionCleaner = &retentionCleaner{}
 var codexQuotaURLOverrideForTest string
+var codexResponsesURLOverrideForTest string
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -125,6 +131,9 @@ type pluginConfig struct {
 	ModelPriceUpdateIntervalHours         int
 	ModelPriceUpdateURL                   string
 	ModelPriceUpdateTimeoutSeconds        int
+	UsageRetentionDays                    int
+	QuotaTriggerRetentionDays             int
+	RequestDetailRetentionDays            int
 }
 
 type quotaTriggerState struct {
@@ -250,7 +259,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	plugin.abi_version = C.uint32_t(abiVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
-	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(nil)
+	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
 	_ = host
 	return 0
 }
@@ -289,6 +298,9 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	globalQuotaTrigger.stop()
+	globalModelPriceUpdater.stop()
+	globalRetentionCleaner.stop()
+	globalStore.close()
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -313,10 +325,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okJSON(managementRegistrationResponse{
 			Routes: []managementRoute{
 				{Method: "GET", Path: "/plugins/codex-token-usage/summary", Description: "Token usage summary JSON."},
+				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 			},
 			Resources: []resourceRoute{
 				{Path: "/dashboard", Menu: "Token Usage", Description: "Account token usage dashboard."},
 				{Path: "/summary", Description: "Token usage summary JSON for the dashboard."},
+				{Path: "/export", Description: "Token usage CSV/JSON export for the dashboard."},
 			},
 		})
 	case "management.handle":
@@ -353,7 +367,7 @@ func pluginConfigFields() []configField {
 	return []configField{
 		{Name: "开启定时额度触发", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
-		{Name: "触发模式", Type: "enum", Description: "quota=只查询额度；probe=探测请求。默认 quota。"},
+		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
 		{Name: "单账号超时秒数", Type: "number", Description: "单个账号触发请求超时时间，单位秒。默认 20。"},
 		{Name: "单账号最小冷却分钟", Type: "number", Description: "同一账号两次触发的最小冷却时间，单位分钟。默认 10。"},
@@ -361,6 +375,9 @@ func pluginConfigFields() []configField {
 		{Name: "模型价格更新间隔小时", Type: "number", Description: "model_prices.json 自动检查间隔，单位小时。默认 6。"},
 		{Name: "模型价格表地址", Type: "string", Description: "模型价格 JSON 下载地址。默认使用 LiteLLM 官方价格表。"},
 		{Name: "模型价格更新超时秒数", Type: "number", Description: "下载 model_prices.json 的超时时间，单位秒。默认 20。"},
+		{Name: "用量保留天数", Type: "number", Description: "usage_events 保留天数，单位天。默认 90。"},
+		{Name: "额度触发记录保留天数", Type: "number", Description: "quota_trigger_runs 保留天数，单位天。默认 30。"},
+		{Name: "请求明细保留天数", Type: "number", Description: "请求明细保留天数，当前随 usage_events 保守保留。默认 30。"},
 	}
 }
 
@@ -381,6 +398,13 @@ func handleManagement(req managementRequest) managementResponse {
 		}
 		return jsonResponse(http.StatusOK, data)
 	}
+	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/export") {
+		window := firstQuery(req.Query, "window", "24h")
+		limit := parseInt(firstQuery(req.Query, "limit", "5000"), 5000, 1, 20000)
+		kind := firstQuery(req.Query, "type", "accounts")
+		format := firstQuery(req.Query, "format", "csv")
+		return handleExport(context.Background(), window, kind, format, limit)
+	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/summary") {
 		window := firstQuery(req.Query, "window", "24h")
 		limit := parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000)
@@ -389,6 +413,13 @@ func handleManagement(req managementRequest) managementResponse {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
 		}
 		return jsonResponse(http.StatusOK, data)
+	}
+	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/export") {
+		window := firstQuery(req.Query, "window", "24h")
+		limit := parseInt(firstQuery(req.Query, "limit", "5000"), 5000, 1, 20000)
+		kind := firstQuery(req.Query, "type", "accounts")
+		format := firstQuery(req.Query, "format", "csv")
+		return handleExport(context.Background(), window, kind, format, limit)
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
 }
@@ -422,7 +453,7 @@ func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
 		QuotaTriggerEnabled:                   false,
 		QuotaTriggerIntervalMinutes:           10,
-		QuotaTriggerMode:                      "quota",
+		QuotaTriggerMode:                      "probe",
 		QuotaTriggerMaxConcurrency:            1,
 		QuotaTriggerTimeoutSeconds:            20,
 		QuotaTriggerMinAccountCooldownMinutes: 10,
@@ -430,6 +461,9 @@ func defaultPluginConfig() pluginConfig {
 		ModelPriceUpdateIntervalHours:         6,
 		ModelPriceUpdateURL:                   defaultModelPriceURL,
 		ModelPriceUpdateTimeoutSeconds:        20,
+		UsageRetentionDays:                    90,
+		QuotaTriggerRetentionDays:             30,
+		RequestDetailRetentionDays:            30,
 	}
 }
 
@@ -451,6 +485,7 @@ func configurePlugin(request []byte) error {
 	cfg = normalizePluginConfig(cfg)
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
+	globalRetentionCleaner.configure(cfg)
 	return nil
 }
 
@@ -504,6 +539,15 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	if value, ok := configValue(values, "model_price_update_timeout_seconds", "模型价格更新超时秒数"); ok {
 		cfg.ModelPriceUpdateTimeoutSeconds = parseInt(value, cfg.ModelPriceUpdateTimeoutSeconds, 3, 300)
 	}
+	if value, ok := configValue(values, "usage_retention_days", "用量保留天数"); ok {
+		cfg.UsageRetentionDays = parseInt(value, cfg.UsageRetentionDays, 7, 3650)
+	}
+	if value, ok := configValue(values, "quota_trigger_retention_days", "额度触发记录保留天数"); ok {
+		cfg.QuotaTriggerRetentionDays = parseInt(value, cfg.QuotaTriggerRetentionDays, 1, 3650)
+	}
+	if value, ok := configValue(values, "request_detail_retention_days", "请求明细保留天数"); ok {
+		cfg.RequestDetailRetentionDays = parseInt(value, cfg.RequestDetailRetentionDays, 1, 3650)
+	}
 	return cfg
 }
 
@@ -523,18 +567,21 @@ func normalizePluginConfig(cfg pluginConfig) pluginConfig {
 	cfg.QuotaTriggerMinAccountCooldownMinutes = clampInt(cfg.QuotaTriggerMinAccountCooldownMinutes, 1, 1440)
 	cfg.ModelPriceUpdateIntervalHours = clampInt(cfg.ModelPriceUpdateIntervalHours, 1, 168)
 	cfg.ModelPriceUpdateTimeoutSeconds = clampInt(cfg.ModelPriceUpdateTimeoutSeconds, 3, 300)
+	cfg.UsageRetentionDays = clampInt(cfg.UsageRetentionDays, 7, 3650)
+	cfg.QuotaTriggerRetentionDays = clampInt(cfg.QuotaTriggerRetentionDays, 1, 3650)
+	cfg.RequestDetailRetentionDays = clampInt(cfg.RequestDetailRetentionDays, 1, 3650)
 	if strings.TrimSpace(cfg.ModelPriceUpdateURL) == "" {
 		cfg.ModelPriceUpdateURL = defaultModelPriceURL
 	}
 	mode := strings.ToLower(strings.TrimSpace(cfg.QuotaTriggerMode))
 	switch mode {
-	case "探测请求", "probe模式", "probe 模式":
+	case "探测请求", "真实请求", "真实探测", "probe模式", "probe 模式":
 		mode = "probe"
-	case "只查询额度", "查询额度", "额度查询", "quota模式", "quota 模式":
-		mode = "quota"
+	case "quota", "quota mode", "只查询额度", "查询额度", "额度查询", "quota模式", "quota 模式":
+		mode = "probe"
 	}
 	if mode != "probe" {
-		mode = "quota"
+		mode = "probe"
 	}
 	cfg.QuotaTriggerMode = mode
 	return cfg
@@ -697,6 +744,7 @@ func normalizeStoredLatencyColumns(ctx context.Context, db *sql.DB) error {
 	statements := []string{
 		`UPDATE usage_events SET latency_ms = CAST((latency_ms + 999999) / 1000000 AS INTEGER) WHERE latency_ms > 10000`,
 		`UPDATE usage_events SET ttft_ms = CAST((ttft_ms + 999999) / 1000000 AS INTEGER) WHERE ttft_ms > 10000`,
+		`UPDATE usage_events SET latency_ms = ttft_ms WHERE ttft_ms > 0 AND (latency_ms <= 0 OR latency_ms < ttft_ms)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
@@ -870,7 +918,7 @@ func (m *quotaTriggerManager) runRound(ctx context.Context, cfg pluginConfig) {
 	m.state.LastFailed = failed
 	m.state.LastSkipped = skipped
 	m.state.LastCandidates = candidates
-	if err != nil {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		m.state.LastError = sanitizeTriggerError(err)
 	}
 	m.mu.Unlock()
@@ -901,11 +949,16 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if rec.Failed && status == 0 {
 		status = 599
 	}
+	latencyMs := durationToMilliseconds(rec.Latency)
+	ttftMs := durationToMilliseconds(rec.TTFT)
+	if ttftMs > 0 && (latencyMs <= 0 || latencyMs < ttftMs) {
+		latencyMs = ttftMs
+	}
 	_, err = db.ExecContext(ctx, insertSQL,
 		rec.RequestedAt.Unix(),
 		trim(rec.Provider), trim(rec.ExecutorType), trim(rec.Model), trim(rec.Alias),
 		trim(rec.APIKey), trim(rec.AuthID), trim(rec.AuthIndex), trim(rec.AuthType), trim(rec.Source),
-		trim(rec.ReasoningEffort), trim(rec.ServiceTier), durationToMilliseconds(rec.Latency), durationToMilliseconds(rec.TTFT), boolInt(rec.Failed), status,
+		trim(rec.ReasoningEffort), trim(rec.ServiceTier), latencyMs, ttftMs, boolInt(rec.Failed), status,
 		rec.Detail.InputTokens, rec.Detail.OutputTokens, rec.Detail.ReasoningTokens, rec.Detail.CachedTokens,
 		rec.Detail.CacheReadTokens, rec.Detail.CacheCreationTokens, total,
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
@@ -1090,10 +1143,6 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 			skipped++
 			continue
 		}
-		if isBanned && cfg.QuotaTriggerMode != "quota" {
-			skipped++
-			continue
-		}
 		row := accountRow{AuthIndex: account.AuthIndex, AuthID: account.AuthID, Source: account.Source, AuthFile: account.AuthFile, Email: account.Email, Name: account.Name}
 		pp, pr := queryLatestAccountWindowQuota(ctx, db, row, 0, "primary")
 		sp, sr := queryLatestAccountWindowQuota(ctx, db, row, 0, "secondary")
@@ -1111,10 +1160,137 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 }
 
 func executeQuotaTrigger(ctx context.Context, db *sql.DB, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
-	if cfg.QuotaTriggerMode == "probe" {
-		return quotaTriggerRunFromAccount(account, cfg.QuotaTriggerMode, "skipped", 0, "probe mode requires host-directed model request support; no token was consumed")
+	if cfg.QuotaTriggerMode == "quota" {
+		run := executeQuotaProbeRequest(ctx, db, account, cfg)
+		run.Mode = "quota"
+		return run
 	}
-	return executeQuotaUsageRequest(ctx, db, account, cfg)
+	return executeQuotaProbeRequest(ctx, db, account, cfg)
+}
+
+func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
+	run := quotaTriggerRunFromAccount(account, cfg.QuotaTriggerMode, "failed", 0, "")
+	started := time.Now()
+	run.StartedAt = started.Unix()
+	timeout := time.Duration(cfg.QuotaTriggerTimeoutSeconds) * time.Second
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	body, err := codexProbeRequestBody(codexProbeModel)
+	if err != nil {
+		run.Error = sanitizeTriggerError(err)
+		run.FinishedAt = time.Now().Unix()
+		return run
+	}
+	headers := map[string][]string{
+		"Authorization": {"Bearer " + account.AccessToken},
+		"Content-Type":  {"application/json"},
+		"Accept":        {"application/json"},
+		"Connection":    {"Keep-Alive"},
+		"Originator":    {"codex-tui"},
+		"User-Agent":    {"codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"},
+	}
+	if account.ChatGPTAccountID != "" {
+		headers["Chatgpt-Account-Id"] = []string{account.ChatGPTAccountID}
+	}
+	resp, respBody, err := doQuotaTriggerHTTPRequest(reqCtx, http.MethodPost, codexResponsesURL(), headers, body)
+	if err != nil {
+		run.Error = sanitizeTriggerError(err)
+		run.FinishedAt = time.Now().Unix()
+		return run
+	}
+
+	run.HTTPStatus = resp.StatusCode
+	responseHeaders := cloneHeaders(resp.Header)
+	mergeCodexQuotaPayload(responseHeaders, respBody)
+	run.PrimaryUsedPercent = headerFloat(responseHeaders, "x-codex-primary-used-percent")
+	run.PrimaryResetAt = headerInt(responseHeaders, "x-codex-primary-reset-at")
+	run.SecondaryUsedPercent = headerFloat(responseHeaders, "x-codex-secondary-used-percent")
+	run.SecondaryResetAt = headerInt(responseHeaders, "x-codex-secondary-reset-at")
+	run.PrimaryUsedTokens = headerInt(responseHeaders, "x-codex-primary-used-tokens")
+	run.PrimaryRemaining = headerInt(responseHeaders, "x-codex-primary-remaining-tokens")
+	run.PrimaryLimit = headerInt(responseHeaders, "x-codex-primary-limit-tokens")
+	run.SecondaryUsedTokens = headerInt(responseHeaders, "x-codex-secondary-used-tokens")
+	run.SecondaryRemaining = headerInt(responseHeaders, "x-codex-secondary-remaining-tokens")
+	run.SecondaryLimit = headerInt(responseHeaders, "x-codex-secondary-limit-tokens")
+	run.FinishedAt = time.Now().Unix()
+
+	rec := usageRecord{
+		Provider:        "codex",
+		ExecutorType:    "quota-trigger",
+		Model:           "quota-trigger",
+		Alias:           "quota-trigger",
+		AuthID:          account.AuthID,
+		AuthIndex:       account.AuthIndex,
+		AuthType:        "codex",
+		Source:          account.Source,
+		RequestedAt:     time.Unix(run.StartedAt, 0),
+		ResponseHeaders: responseHeaders,
+	}
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		run.Status = "success"
+	case resp.StatusCode == http.StatusUnauthorized:
+		run.Status = "failed"
+		run.Error = "401 unauthorized: credential is invalid"
+		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
+	case resp.StatusCode == http.StatusTooManyRequests:
+		run.Status = "failed"
+		run.Error = "429 rate limited"
+		rec.Failed = true
+		rec.Failure = usageFailure{StatusCode: resp.StatusCode}
+		_ = recordAutobanIfNeeded(context.Background(), db, rec, resp.StatusCode, run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt)
+	default:
+		run.Status = "failed"
+		run.Error = "http " + strconv.Itoa(resp.StatusCode)
+	}
+	return run
+}
+
+type quotaTriggerHTTPResponse struct {
+	StatusCode int                 `json:"status_code"`
+	Header     map[string][]string `json:"header"`
+	Headers    map[string][]string `json:"headers"`
+	Body       []byte              `json:"body"`
+}
+
+func codexProbeRequestBody(model string) ([]byte, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = codexProbeModel
+	}
+	return json.Marshal(map[string]any{
+		"model":             model,
+		"input":             "ping",
+		"instructions":      "Reply with OK.",
+		"max_output_tokens": 1,
+		"stream":            false,
+		"store":             false,
+	})
+}
+
+func doQuotaTriggerHTTPRequest(ctx context.Context, method, targetURL string, headers map[string][]string, body []byte) (quotaTriggerHTTPResponse, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return quotaTriggerHTTPResponse{}, nil, err
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	httpResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return quotaTriggerHTTPResponse{}, nil, err
+	}
+	defer httpResp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 2<<20))
+	return quotaTriggerHTTPResponse{
+		StatusCode: httpResp.StatusCode,
+		Header:     cloneHeaders(httpResp.Header),
+		Headers:    cloneHeaders(httpResp.Header),
+		Body:       respBody,
+	}, respBody, nil
 }
 
 func executeQuotaUsageRequest(ctx context.Context, db *sql.DB, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
@@ -1317,6 +1493,13 @@ func codexQuotaURL() string {
 	return codexQuotaAPIURL
 }
 
+func codexResponsesURL() string {
+	if codexResponsesURLOverrideForTest != "" {
+		return codexResponsesURLOverrideForTest
+	}
+	return codexResponsesAPIURL
+}
+
 func cloneHeaders(headers http.Header) map[string][]string {
 	out := make(map[string][]string, len(headers))
 	for key, values := range headers {
@@ -1470,8 +1653,17 @@ func int64FromAny(value any) int64 {
 }
 
 func sanitizeTriggerError(value any) string {
-	text := strings.TrimSpace(stringFromAny(value))
-	if text == "" {
+	text := ""
+	switch v := value.(type) {
+	case error:
+		text = v.Error()
+	case fmt.Stringer:
+		text = v.String()
+	default:
+		text = stringFromAny(value)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || text == "{}" || text == "[]" {
 		return ""
 	}
 	for _, marker := range []string{"Bearer ", "access_token", "refresh_token", "id_token"} {
@@ -1547,7 +1739,7 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 		return schedulerPickResponse{Handled: false}, err
 	}
 	if len(bans) == 0 && len(invalids) == 0 {
-		return schedulerPickResponse{DelegateBuiltin: "round-robin", Handled: true}, nil
+		return schedulerPickResponse{Handled: false}, nil
 	}
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
 	filtered := false
@@ -1567,7 +1759,7 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 		available = append(available, candidate)
 	}
 	if !filtered {
-		return schedulerPickResponse{DelegateBuiltin: "round-robin", Handled: true}, nil
+		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
 		return schedulerPickResponse{Handled: false}, nil
