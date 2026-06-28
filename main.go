@@ -56,12 +56,13 @@ import (
 )
 
 const (
-	abiVersion uint32 = 1
-	pluginID          = "codex-token-usage"
+	abiVersion       uint32 = 1
+	pluginID                = "codex-token-usage"
+	codexQuotaAPIURL        = "https://chatgpt.com/backend-api/wham/usage"
 )
 
 var (
-	pluginVersion    = "0.1.7"
+	pluginVersion    = "0.1.8"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -69,6 +70,7 @@ var (
 var globalStore = &store{}
 var globalQuotaTrigger = &quotaTriggerManager{}
 var globalModelPriceUpdater = &modelPriceUpdateManager{}
+var codexQuotaURLOverrideForTest string
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -1309,10 +1311,10 @@ WHERE lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=? OR lower(auth_f
 }
 
 func codexQuotaURL() string {
-	if value := strings.TrimSpace(os.Getenv("CPA_CODEX_QUOTA_URL")); value != "" {
-		return value
+	if codexQuotaURLOverrideForTest != "" {
+		return codexQuotaURLOverrideForTest
 	}
-	return "https://chatgpt.com/backend-api/wham/usage"
+	return codexQuotaAPIURL
 }
 
 func cloneHeaders(headers http.Header) map[string][]string {

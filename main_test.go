@@ -734,7 +734,7 @@ func TestQuotaTriggerQuotaModeUpdatesSnapshotAndCooldown(t *testing.T) {
 		_, _ = w.Write([]byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":12.5,"reset_at":%d,"limit_window_seconds":18000},"secondary_window":{"used_percent":22.5,"reset_at":%d,"limit_window_seconds":604800,"remaining_tokens":775,"limit_tokens":1000}}}`, resetAt, resetAt)))
 	}))
 	defer server.Close()
-	t.Setenv("CPA_CODEX_QUOTA_URL", server.URL)
+	withCodexQuotaURLForTest(t, server.URL)
 
 	cfg := normalizePluginConfig(pluginConfig{
 		QuotaTriggerEnabled:                   true,
@@ -820,7 +820,7 @@ func TestQuotaTriggerRefreshesAndReleasesActiveAutoban(t *testing.T) {
 		_, _ = w.Write([]byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":45,"reset_at":%d,"limit_window_seconds":18000},"secondary_window":{"used_percent":12,"reset_at":%d,"limit_window_seconds":604800}}}`, banResetAt, time.Now().Add(6*24*time.Hour).Unix())))
 	}))
 	defer server.Close()
-	t.Setenv("CPA_CODEX_QUOTA_URL", server.URL)
+	withCodexQuotaURLForTest(t, server.URL)
 
 	cfg := normalizePluginConfig(pluginConfig{
 		QuotaTriggerEnabled:                   true,
@@ -976,7 +976,7 @@ func TestQuotaTriggerFiltersBadAccountsAndRecords401429(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	t.Setenv("CPA_CODEX_QUOTA_URL", server.URL)
+	withCodexQuotaURLForTest(t, server.URL)
 
 	cfg := normalizePluginConfig(pluginConfig{
 		QuotaTriggerEnabled:                   true,
@@ -1304,6 +1304,13 @@ func readPricesFromPathForTest(t *testing.T, path string) map[string]modelPrice 
 	globalModelPriceUpdater = &modelPriceUpdateManager{}
 	t.Cleanup(func() { globalModelPriceUpdater = old })
 	return readModelPricesFromFile()
+}
+
+func withCodexQuotaURLForTest(t *testing.T, url string) {
+	t.Helper()
+	old := codexQuotaURLOverrideForTest
+	codexQuotaURLOverrideForTest = url
+	t.Cleanup(func() { codexQuotaURLOverrideForTest = old })
 }
 
 func intToString(v int64) string {
