@@ -15,7 +15,6 @@ Current version: `0.1.9`
 - Runtime diagnostics and local alerts are exposed in summary JSON for troubleshooting and plugin-store validation.
 - CSV / JSON export support; the dashboard exposes account export buttons and the backend can export accounts, providers, models, and recent requests.
 - Built-in price fallbacks plus automatic LiteLLM model price updates.
-- Manual Chinese / English language switch saved in the browser.
 
 ## Install Manually
 
