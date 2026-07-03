@@ -51,10 +51,15 @@ fi
 
 (
   cd "${out_dir}"
+  : > checksums.txt
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum ./*.zip > checksums.txt
+    for zip in *.zip; do
+      sha256sum "${zip}" >> checksums.txt
+    done
   else
-    shasum -a 256 ./*.zip > checksums.txt
+    for zip in *.zip; do
+      shasum -a 256 "${zip}" >> checksums.txt
+    done
   fi
 )
 
