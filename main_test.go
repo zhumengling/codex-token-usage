@@ -107,6 +107,106 @@ func TestDashboardLanguageSelectionPersistsAndIsNotTranslated(t *testing.T) {
 	}
 }
 
+func TestDashboardShowsAndSearchesChatGPTAccountID(t *testing.T) {
+	for _, snippet := range []string{
+		`r.chatgpt_account_id`,
+		`const accountId=firstText(r.chatgpt_account_id,'');`,
+		`const id=accountId?('id '+accountId+' · '+fileId):fileId;`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing chatgpt account id snippet %q", snippet)
+		}
+	}
+}
+
+func TestDashboardHasClickableInvalidAuthCardAndManagementModal(t *testing.T) {
+	for _, snippet := range []string{
+		`id="invalid-auth-card"`,
+		`account-summary-action invalid-auth-action`,
+		`id="invalid-auth-modal"`,
+		`id="invalid-auth-list"`,
+		`id="invalid-auth-delete-all"`,
+		`id="invalid-auth-select-page"`,
+		`id="invalid-auth-delete-selected"`,
+		`id="invalid-auth-oauth-url"`,
+		`const managementCodexAuthUrlApi='/v0/management/codex-auth-url';`,
+		`const managementAuthStatusApi='/v0/management/get-auth-status';`,
+		`let invalidAuthPage=1;`,
+		`const invalidAuthPageSize=10;`,
+		`function openInvalidAuthModal()`,
+		`function startInvalidAuthOAuth(key)`,
+		`managementCodexAuthUrlApi+'?is_webui=true'`,
+		`managementAuthStatusApi+'?state='`,
+		`function selectCurrentInvalidAuthPage()`,
+		`function deleteAllInvalidAuths()`,
+		`function deleteSelectedInvalidAuths()`,
+		`function handleInvalidAuthOAuthLinkClick(e)`,
+		`data-oauth-copy`,
+		`复制授权链接`,
+		`body:JSON.stringify({names:names})`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing invalid auth management snippet %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		`.account-summary-action`,
+		`.invalid-auth-action.has-invalid`,
+		`backdrop-filter:blur(10px) saturate(1.16)`,
+		`.invalid-auth-panel`,
+		`.invalid-auth-list`,
+		`.invalid-auth-row`,
+		`.oauth-link-row`,
+		`.oauth-copy-link`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing invalid auth management style %q", snippet)
+		}
+	}
+}
+
+func TestDashboardHasWorkspaceDeactivatedCardAndDeleteOnlyModal(t *testing.T) {
+	for _, snippet := range []string{
+		`id="workspace-deactivated-card"`,
+		`account-summary-action workspace-deactivated-action`,
+		`id="workspace-deactivated-modal"`,
+		`id="workspace-deactivated-list"`,
+		`id="workspace-deactivated-delete-all"`,
+		`id="workspace-deactivated-select-page"`,
+		`id="workspace-deactivated-delete-selected"`,
+		`let workspaceDeactivatedPage=1;`,
+		`const workspaceDeactivatedPageSize=10;`,
+		`function openWorkspaceDeactivatedModal()`,
+		`function workspaceDeactivatedRows()`,
+		`function selectCurrentWorkspaceDeactivatedPage()`,
+		`function deleteAllWorkspaceDeactivatedAuths()`,
+		`function deleteSelectedWorkspaceDeactivatedAuths()`,
+		`body:JSON.stringify({names:names})`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing workspace deactivated management snippet %q", snippet)
+		}
+	}
+	workspaceStart := strings.Index(dashboardHTML, `id="workspace-deactivated-modal"`)
+	workspaceEnd := strings.Index(dashboardHTML[workspaceStart:], `<script>`)
+	if workspaceStart < 0 || workspaceEnd < 0 {
+		t.Fatalf("dashboardHTML missing workspace modal boundary")
+	}
+	workspaceModal := dashboardHTML[workspaceStart : workspaceStart+workspaceEnd]
+	if strings.Contains(workspaceModal, "OAuth 登录") || strings.Contains(workspaceModal, "data-invalid-login") {
+		t.Fatalf("workspace deactivated modal contains OAuth login action")
+	}
+	for _, snippet := range []string{
+		`.account-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr))`,
+		`.workspace-deactivated-action.has-invalid`,
+		`.workspace-deactivated-panel`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing workspace deactivated style %q", snippet)
+		}
+	}
+}
+
 func TestDashboardAppliesLocaleAfterTranslationsAreInitialized(t *testing.T) {
 	translations := strings.Index(dashboardHTML, "const i18nEn={")
 	apply := strings.Index(dashboardHTML, "applyLocale();")
@@ -215,6 +315,90 @@ func TestCodex429AutobanFiltersSchedulerCandidate(t *testing.T) {
 	}
 	if bans[0].AuthID != "auth-banned" || bans[0].Window != "5h" {
 		t.Fatalf("ban = %+v, want auth-banned 5h", bans[0])
+	}
+}
+
+func TestCodex429AutobanFiltersSchedulerCandidateByNormalizedAlias(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	resetAt := time.Now().Add(time.Hour).Unix()
+	err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "banned@example.cpa.json",
+		AuthIndex:   "legacy-index",
+		Source:      "banned@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+		ResponseHeaders: map[string][]string{
+			"x-codex-primary-used-percent": {"100"},
+			"x-codex-primary-reset-at":     {intToString(resetAt)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	resp, err := store.pickAuth(ctx, schedulerPickRequest{
+		Provider: "codex",
+		Candidates: []schedulerAuthCandidate{
+			{
+				ID:       "other-id",
+				Provider: "codex",
+				Priority: 100,
+				Attributes: map[string]string{
+					"auth_file": "banned@example.cpa.json",
+					"email":     "banned@example.com",
+				},
+			},
+			{ID: "auth-ok", Provider: "codex", Priority: 10},
+		},
+	})
+	if err != nil {
+		t.Fatalf("pickAuth returned error: %v", err)
+	}
+	if !resp.Handled || resp.AuthID != "auth-ok" {
+		t.Fatalf("pickAuth response = %+v, want handled auth-ok", resp)
+	}
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	diagnostics := data["diagnostics"].(diagnosticsSummary)
+	if diagnostics.Scheduler.ActiveBanCount != 0 || diagnostics.Scheduler.FilteredCandidates != 1 || diagnostics.Scheduler.UnmatchedActiveBans != 0 || diagnostics.Scheduler.LastFilteredAt == "" {
+		t.Fatalf("scheduler diagnostics = %+v, want missing-file ban cleaned after one candidate was filtered", diagnostics.Scheduler)
+	}
+}
+
+func TestAccountIdentityAliasesNormalizePathsAndCPAJSON(t *testing.T) {
+	aliases := accountIdentityAliases(accountIdentity{
+		AuthID:   `C:\auth\Nested\User@Example.COM.cpa.json`,
+		AuthFile: `/var/lib/cpa/auth/User@Example.COM.cpa.json`,
+		Email:    "user@example.com",
+		Name:     "User Example",
+	})
+	want := []string{
+		`c:\auth\nested\user@example.com.cpa.json`,
+		"user@example.com.cpa.json",
+		"user@example.com.cpa",
+		"user@example.com",
+		"user example",
+	}
+	for _, value := range want {
+		found := false
+		for _, alias := range aliases {
+			if alias == value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("aliases = %#v, want %q", aliases, value)
+		}
 	}
 }
 
@@ -476,6 +660,10 @@ func TestCodex401InvalidAuthFiltersUntilAuthFileReplaced(t *testing.T) {
 	if !ok || len(invalids) != 1 {
 		t.Fatalf("invalid_auths = %#v, want one invalid auth", data["invalid_auths"])
 	}
+	bans := data["autobans"].([]autobanRow)
+	if len(bans) != 1 || bans[0].AuthID != "broken@example.com" || bans[0].Window != "401" || bans[0].LastStatusCode != http.StatusUnauthorized {
+		t.Fatalf("autobans = %#v, want 401 invalid auth to use autoban flow", bans)
+	}
 	accounts := data["accounts"].([]accountRow)
 	if len(accounts) != 1 || !accounts[0].InvalidAuth {
 		t.Fatalf("accounts = %#v, want invalid auth marked", accounts)
@@ -500,6 +688,662 @@ func TestCodex401InvalidAuthFiltersUntilAuthFileReplaced(t *testing.T) {
 	}
 	if resp.Handled {
 		t.Fatalf("pickAuth after replace = %+v, want unhandled so CPA keeps configured scheduler", resp)
+	}
+	data, err = store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary after replace returned error: %v", err)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans after replace = %#v, want 401 ban cleared", got)
+	}
+}
+
+func TestCodex402DeactivatedWorkspaceFiltersUntilAuthFileDeletedOrReplaced(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "team-deactivated.cpa.json")
+	raw, err := json.Marshal(map[string]any{
+		"email":        "team-deactivated@example.com",
+		"name":         "Team Deactivated",
+		"type":         "codex",
+		"access_token": "old-secret",
+	})
+	if err != nil {
+		t.Fatalf("marshal auth file: %v", err)
+	}
+	if err := os.WriteFile(authFile, raw, 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	oldMod := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(authFile, oldMod, oldMod); err != nil {
+		t.Fatalf("chtimes old auth file: %v", err)
+	}
+
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "team-deactivated@example.com",
+		AuthIndex:   "team-deactivated.cpa.json",
+		Source:      "team-deactivated@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure: usageFailure{
+			StatusCode: http.StatusPaymentRequired,
+			Body:       `{"detail":{"code":"deactivated_workspace"}}`,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	resp, err := store.pickAuth(ctx, schedulerPickRequest{
+		Provider: "codex",
+		Candidates: []schedulerAuthCandidate{
+			{ID: "team-deactivated@example.com", Provider: "codex", Priority: 100},
+			{ID: "healthy@example.com", Provider: "codex", Priority: 10},
+		},
+	})
+	if err != nil {
+		t.Fatalf("pickAuth returned error: %v", err)
+	}
+	if !resp.Handled || resp.AuthID != "healthy@example.com" {
+		t.Fatalf("pickAuth response = %+v, want healthy account", resp)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	workspaceRows, ok := data["workspace_deactivated_auths"].([]invalidAuthRow)
+	if !ok || len(workspaceRows) != 1 {
+		t.Fatalf("workspace_deactivated_auths = %#v, want one row", data["workspace_deactivated_auths"])
+	}
+	if workspaceRows[0].LastStatusCode != http.StatusPaymentRequired || !strings.Contains(workspaceRows[0].Reason, "deactivated_workspace") {
+		t.Fatalf("workspace row = %+v, want 402 deactivated_workspace", workspaceRows[0])
+	}
+	bans := data["autobans"].([]autobanRow)
+	if len(bans) != 1 || bans[0].AuthID != "team-deactivated@example.com" || bans[0].Window != "402" || bans[0].LastStatusCode != http.StatusPaymentRequired {
+		t.Fatalf("autobans = %#v, want 402 workspace auth to use autoban flow", bans)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 || !accounts[0].WorkspaceDeactivated {
+		t.Fatalf("accounts = %#v, want workspace deactivated marked", accounts)
+	}
+
+	newMod := time.Now().Add(time.Hour)
+	if err := os.WriteFile(authFile, []byte(`{"email":"team-deactivated@example.com","type":"codex","access_token":"new-secret"}`), 0600); err != nil {
+		t.Fatalf("replace auth file: %v", err)
+	}
+	if err := os.Chtimes(authFile, newMod, newMod); err != nil {
+		t.Fatalf("chtimes new auth file: %v", err)
+	}
+	data, err = store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary after replace returned error: %v", err)
+	}
+	if got := data["workspace_deactivated_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("workspace_deactivated_auths after replace = %#v, want cleared", got)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans after replace = %#v, want 402 ban cleared", got)
+	}
+}
+
+func TestCodex402SameEmailOnlyMarksMatchingAuthFile(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same-workspace@example.com"
+	files := []string{"same-a.cpa.json", "same-b.cpa.json", "same-c.cpa.json"}
+	for _, file := range files {
+		raw, err := json.Marshal(map[string]any{
+			"email":              email,
+			"type":               "codex",
+			"access_token":       "secret",
+			"chatgpt_account_id": strings.TrimSuffix(file, ".cpa.json"),
+		})
+		if err != nil {
+			t.Fatalf("marshal %s: %v", file, err)
+		}
+		if err := os.WriteFile(filepath.Join(authDir, file), raw, 0600); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+	}
+
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      email,
+		AuthIndex:   "same-b.cpa.json",
+		Source:      email,
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure: usageFailure{
+			StatusCode: http.StatusPaymentRequired,
+			Body:       `{"detail":{"code":"deactivated_workspace"}}`,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	workspaces := data["workspace_deactivated_auths"].([]invalidAuthRow)
+	if len(workspaces) != 1 || workspaces[0].AuthFile != "same-b.cpa.json" {
+		t.Fatalf("workspace_deactivated_auths = %#v, want only same-b.cpa.json", workspaces)
+	}
+	accounts := data["accounts"].([]accountRow)
+	marked := []string{}
+	for _, account := range accounts {
+		if account.WorkspaceDeactivated {
+			marked = append(marked, account.AuthFile)
+		}
+	}
+	if len(marked) != 1 || marked[0] != "same-b.cpa.json" {
+		t.Fatalf("workspace-deactivated accounts = %#v, want only same-b.cpa.json", marked)
+	}
+}
+
+func TestCodex402WithoutBodyRecordsWorkspaceDeactivatedForAuthFileAccount(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "ezraferreira6412@outlook.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"ezraferreira6412@outlook.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "ezraferreira6412@outlook.com.json",
+		AuthIndex:   "2da74e4c2a9372b4",
+		Source:      "ezraferreira6412@outlook.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusPaymentRequired},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	workspaces := data["workspace_deactivated_auths"].([]invalidAuthRow)
+	if len(workspaces) != 1 || workspaces[0].AuthID != "ezraferreira6412@outlook.com.json" || workspaces[0].LastStatusCode != http.StatusPaymentRequired {
+		t.Fatalf("workspace_deactivated_auths = %#v, want bodyless 402 auth file account", workspaces)
+	}
+	bans := data["autobans"].([]autobanRow)
+	if len(bans) != 1 || bans[0].Window != "402" || bans[0].AuthID != "ezraferreira6412@outlook.com.json" {
+		t.Fatalf("autobans = %#v, want 402 effective ban", bans)
+	}
+}
+
+func TestSummaryBackfillsWorkspaceDeactivatedFromHistoricalBodylessUsage402(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "ezradavidson6460@outlook.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"ezradavidson6460@outlook.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, insertSQL,
+		time.Now().Unix(),
+		"codex", "", "gpt-5.5", "",
+		"", "ezradavidson6460@outlook.com.json", "f52489c585545c97", "", "ezradavidson6460@outlook.com",
+		"", "", 0, 0, 1, http.StatusPaymentRequired,
+		0, 0, 0, 0, 0, 0, 0,
+		nil, nil, nil, nil,
+	); err != nil {
+		t.Fatalf("insert historical usage event: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	workspaces := data["workspace_deactivated_auths"].([]invalidAuthRow)
+	if len(workspaces) != 1 || workspaces[0].AuthID != "ezradavidson6460@outlook.com.json" || workspaces[0].AuthFile != "ezradavidson6460@outlook.com.json" {
+		t.Fatalf("workspace_deactivated_auths = %#v, want historical bodyless 402 backfilled", workspaces)
+	}
+	bans := data["autobans"].([]autobanRow)
+	if len(bans) != 1 || bans[0].Window != "402" || bans[0].AuthID != "ezradavidson6460@outlook.com.json" {
+		t.Fatalf("autobans = %#v, want backfilled 402 effective ban", bans)
+	}
+}
+
+func TestSummaryDoesNotBackfillHistorical402AfterLaterSuccessfulUsage(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "recovered@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"recovered@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Now().Add(-time.Minute).Unix()
+	for _, row := range []struct {
+		at     int64
+		failed int
+		status int
+	}{
+		{at: base, failed: 1, status: http.StatusPaymentRequired},
+		{at: base + 30, failed: 0, status: http.StatusOK},
+	} {
+		if _, err := db.ExecContext(ctx, insertSQL,
+			row.at,
+			"codex", "", "gpt-5.5", "",
+			"", "recovered@example.com.json", "abc123recovered", "", "recovered@example.com",
+			"", "", 0, 0, row.failed, row.status,
+			0, 0, 0, 0, 0, 0, 0,
+			nil, nil, nil, nil,
+		); err != nil {
+			t.Fatalf("insert usage event status %d: %v", row.status, err)
+		}
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["workspace_deactivated_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("workspace_deactivated_auths = %#v, want no backfill after later success", got)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want no effective 402 ban after later success", got)
+	}
+}
+
+func TestSummaryDoesNotBackfillHistorical402AfterLaterSuccessfulUsageWithDifferentAliasFields(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "recovered-alias@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"recovered-alias@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Now().Add(-time.Minute).Unix()
+	for _, row := range []struct {
+		at        int64
+		authID    string
+		authIndex string
+		source    string
+		failed    int
+		status    int
+	}{
+		{at: base, authID: "recovered-alias@example.com.json", authIndex: "abc123alias", source: "recovered-alias@example.com", failed: 1, status: http.StatusPaymentRequired},
+		{at: base + 30, source: "recovered-alias@example.com", failed: 0, status: http.StatusOK},
+	} {
+		if _, err := db.ExecContext(ctx, insertSQL,
+			row.at,
+			"codex", "", "gpt-5.5", "",
+			"", row.authID, row.authIndex, "", row.source,
+			"", "", 0, 0, row.failed, row.status,
+			0, 0, 0, 0, 0, 0, 0,
+			nil, nil, nil, nil,
+		); err != nil {
+			t.Fatalf("insert usage event status %d: %v", row.status, err)
+		}
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["workspace_deactivated_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("workspace_deactivated_auths = %#v, want no backfill after later success matched by source", got)
+	}
+}
+
+func TestSuccessfulUsageClearsActiveWorkspaceDeactivatedAuth(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "recovered-active@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"recovered-active@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	rec := usageRecord{
+		Provider:    "codex",
+		AuthID:      "recovered-active@example.com.json",
+		AuthIndex:   "abc123active",
+		Source:      "recovered-active@example.com",
+		RequestedAt: time.Now().Add(-time.Minute),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusPaymentRequired},
+	}
+	if err := store.recordUsage(ctx, rec); err != nil {
+		t.Fatalf("record 402 usage: %v", err)
+	}
+	rec.RequestedAt = time.Now()
+	rec.Failed = false
+	rec.Failure = usageFailure{}
+	if err := store.recordUsage(ctx, rec); err != nil {
+		t.Fatalf("record successful usage: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["workspace_deactivated_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("workspace_deactivated_auths = %#v, want cleared after success", got)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want cleared after success", got)
+	}
+}
+
+func TestSuccessfulUsageClearsActiveUnauthorizedAuth(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "recovered-401@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"recovered-401@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	rec := usageRecord{
+		Provider:    "codex",
+		AuthID:      "recovered-401@example.com.json",
+		AuthIndex:   "abc123401",
+		Source:      "recovered-401@example.com",
+		RequestedAt: time.Now().Add(-time.Minute),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusUnauthorized},
+	}
+	if err := store.recordUsage(ctx, rec); err != nil {
+		t.Fatalf("record 401 usage: %v", err)
+	}
+	rec.RequestedAt = time.Now()
+	rec.Failed = false
+	rec.Failure = usageFailure{}
+	if err := store.recordUsage(ctx, rec); err != nil {
+		t.Fatalf("record successful usage: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["invalid_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("invalid_auths = %#v, want cleared after success", got)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want cleared after success", got)
+	}
+}
+
+func TestSummaryClearsHistoricalActiveInvalidAuthAfterLaterSuccessfulUsage(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Now().Add(-time.Minute).Unix()
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO invalid_auths (
+  auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code
+) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+		"historical-401@example.com.json", "abc401historical", "historical-401@example.com", "codex",
+		"401 unauthorized: credential is invalid", base, http.StatusUnauthorized,
+	); err != nil {
+		t.Fatalf("insert invalid auth: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, insertSQL,
+		base+30,
+		"codex", "", "gpt-5.5", "",
+		"", "", "", "", "historical-401@example.com",
+		"", "", 0, 0, 0, http.StatusOK,
+		0, 0, 0, 0, 0, 0, 0,
+		nil, nil, nil, nil,
+	); err != nil {
+		t.Fatalf("insert successful usage: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["invalid_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("invalid_auths = %#v, want summary to clear recovered invalid auth", got)
+	}
+}
+
+func TestSummaryDoesNotBackfillHistorical429AfterLaterSuccessfulUsage(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "recovered-429@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"recovered-429@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Now().Add(-time.Minute).Unix()
+	resetAt := time.Now().Add(time.Hour).Unix()
+	for _, row := range []struct {
+		at     int64
+		failed int
+		status int
+		pp     any
+		pr     any
+	}{
+		{at: base, failed: 1, status: http.StatusTooManyRequests, pp: 100.0, pr: resetAt},
+		{at: base + 30, failed: 0, status: http.StatusOK},
+	} {
+		if _, err := db.ExecContext(ctx, insertSQL,
+			row.at,
+			"codex", "", "gpt-5.5", "",
+			"", "recovered-429@example.com.json", "abc123429", "", "recovered-429@example.com",
+			"", "", 0, 0, row.failed, row.status,
+			0, 0, 0, 0, 0, 0, 0,
+			row.pp, row.pr, nil, nil,
+		); err != nil {
+			t.Fatalf("insert usage event status %d: %v", row.status, err)
+		}
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want no 429 backfill after later success", got)
+	}
+}
+
+func TestSummaryDoesNotBackfillHistorical429AfterLaterSuccessfulUsageWithDifferentAliasFields(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "recovered-alias-429@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"recovered-alias-429@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Now().Add(-time.Minute).Unix()
+	resetAt := time.Now().Add(time.Hour).Unix()
+	for _, row := range []struct {
+		at        int64
+		authID    string
+		authIndex string
+		source    string
+		failed    int
+		status    int
+		pp        any
+		pr        any
+	}{
+		{at: base, authID: "recovered-alias-429@example.com.json", authIndex: "abc123alias429", source: "recovered-alias-429@example.com", failed: 1, status: http.StatusTooManyRequests, pp: 100.0, pr: resetAt},
+		{at: base + 30, source: "recovered-alias-429@example.com", failed: 0, status: http.StatusOK},
+	} {
+		if _, err := db.ExecContext(ctx, insertSQL,
+			row.at,
+			"codex", "", "gpt-5.5", "",
+			"", row.authID, row.authIndex, "", row.source,
+			"", "", 0, 0, row.failed, row.status,
+			0, 0, 0, 0, 0, 0, 0,
+			row.pp, row.pr, nil, nil,
+		); err != nil {
+			t.Fatalf("insert usage event status %d: %v", row.status, err)
+		}
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want no 429 backfill after later success matched by source", got)
+	}
+}
+
+func TestSummaryClearsHistoricalActive429AfterLaterSuccessfulUsage(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Now().Add(-time.Minute).Unix()
+	resetAt := time.Now().Add(time.Hour).Unix()
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO autoban_bans (
+  auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
+  last_status_code, primary_used_percent, primary_reset_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+		"historical-429@example.com.json", "abc429historical", "historical-429@example.com", "codex",
+		"5h", "primary 5h window is full", base, resetAt, http.StatusTooManyRequests, 100.0, resetAt,
+	); err != nil {
+		t.Fatalf("insert autoban: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, insertSQL,
+		base+30,
+		"codex", "", "gpt-5.5", "",
+		"", "", "", "", "historical-429@example.com",
+		"", "", 0, 0, 0, http.StatusOK,
+		0, 0, 0, 0, 0, 0, 0,
+		nil, nil, nil, nil,
+	); err != nil {
+		t.Fatalf("insert successful usage: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want summary to clear recovered 429 ban", got)
+	}
+}
+
+func TestSuccessfulUsageClearsActive429Autoban(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "recovered-active-429@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"recovered-active-429@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	resetAt := time.Now().Add(time.Hour).Unix()
+	rec := usageRecord{
+		Provider:    "codex",
+		AuthID:      "recovered-active-429@example.com.json",
+		AuthIndex:   "abc123active429",
+		Source:      "recovered-active-429@example.com",
+		RequestedAt: time.Now().Add(-time.Minute),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+		ResponseHeaders: map[string][]string{
+			"x-codex-primary-used-percent": {"100"},
+			"x-codex-primary-reset-at":     {strconv.FormatInt(resetAt, 10)},
+		},
+	}
+	if err := store.recordUsage(ctx, rec); err != nil {
+		t.Fatalf("record 429 usage: %v", err)
+	}
+	rec.RequestedAt = time.Now()
+	rec.Failed = false
+	rec.Failure = usageFailure{}
+	rec.ResponseHeaders = nil
+	if err := store.recordUsage(ctx, rec); err != nil {
+		t.Fatalf("record successful usage: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want cleared after success", got)
 	}
 }
 
@@ -530,8 +1374,8 @@ func TestSummaryHidesDeletedConfiguredCodexAccounts(t *testing.T) {
 	}
 	if err := store.recordUsage(ctx, usageRecord{
 		Provider:    "codex",
-		AuthID:      "deleted@example.com",
-		AuthIndex:   "deleted@example.com",
+		AuthID:      "deleted@example.cpa.json",
+		AuthIndex:   "deleted@example.cpa.json",
 		Source:      "deleted@example.com",
 		RequestedAt: time.Now(),
 		Failed:      true,
@@ -556,8 +1400,60 @@ func TestSummaryHidesDeletedConfiguredCodexAccounts(t *testing.T) {
 		t.Fatalf("account = %#v, want configured active@example.com", accounts[0])
 	}
 	invalids := data["invalid_auths"].([]invalidAuthRow)
-	if len(invalids) != 1 || invalids[0].AuthID != "deleted@example.com" {
-		t.Fatalf("invalid_auths = %#v, want deleted auth retained for diagnostics", invalids)
+	if len(invalids) != 0 {
+		t.Fatalf("invalid_auths = %#v, want deleted auth cleared from active diagnostics", invalids)
+	}
+}
+
+func TestSummaryClearsDeletedConfiguredAuthState(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	activeAuth := filepath.Join(authDir, "active.cpa.json")
+	if err := os.WriteFile(activeAuth, []byte(`{"email":"active@example.com","type":"codex","access_token":"active-token"}`), 0600); err != nil {
+		t.Fatalf("write active auth: %v", err)
+	}
+	resetAt := time.Now().Add(time.Hour).Unix()
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "deleted@example.cpa.json",
+		AuthIndex:   "deleted-index",
+		Source:      "deleted@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+		ResponseHeaders: map[string][]string{
+			"x-codex-primary-used-percent": {"100"},
+			"x-codex-primary-reset-at":     {intToString(resetAt)},
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage deleted 429 returned error: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "deleted401@example.cpa.json",
+		AuthIndex:   "deleted401-index",
+		Source:      "deleted401@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusUnauthorized},
+	}); err != nil {
+		t.Fatalf("recordUsage deleted 401 returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want deleted auth autoban cleared", got)
+	}
+	if got := data["invalid_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("invalid_auths = %#v, want deleted auth invalid cleared", got)
 	}
 }
 
@@ -683,6 +1579,143 @@ func TestSummaryMergesConfiguredCodexAccountsWithoutLeakingTokens(t *testing.T) 
 	}
 }
 
+func TestSummarySplitsConfiguredCodexAccountsByChatGPTAccountID(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same@example.com"
+	authFiles := []struct {
+		file      string
+		email     string
+		accountID string
+	}{
+		{file: "same-workspace-a.cpa.json", email: email, accountID: "account-id-a"},
+		{file: "same-workspace-b.cpa.json", email: email, accountID: "account-id-b"},
+		{file: "other-email-same-workspace.cpa.json", email: "other@example.com", accountID: "account-id-a"},
+	}
+	for _, authFile := range authFiles {
+		raw, err := json.Marshal(map[string]any{
+			"email":              authFile.email,
+			"type":               "codex",
+			"access_token":       "secret-access-token",
+			"chatgpt_account_id": authFile.accountID,
+		})
+		if err != nil {
+			t.Fatalf("marshal auth file %s: %v", authFile.file, err)
+		}
+		if err := os.WriteFile(filepath.Join(authDir, authFile.file), raw, 0600); err != nil {
+			t.Fatalf("write auth file %s: %v", authFile.file, err)
+		}
+	}
+
+	data, err := store.summary(ctx, "24h", 2000)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != len(authFiles) {
+		t.Fatalf("accounts len = %d, want one row per auth file: %#v", len(accounts), accounts)
+	}
+	seenFiles := map[string]string{}
+	for _, account := range accounts {
+		if !account.Configured {
+			t.Fatalf("account = %#v, want configured account", account)
+		}
+		seenFiles[account.AuthFile] = account.ChatGPTAccountID
+	}
+	for _, authFile := range authFiles {
+		if seenFiles[authFile.file] != authFile.accountID {
+			t.Fatalf("auth file %s account id = %q, want %q; seen=%#v", authFile.file, seenFiles[authFile.file], authFile.accountID, seenFiles)
+		}
+	}
+}
+
+func TestSummaryKeepsQuotaWindowsSeparateForSameEmailAuthFiles(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same@example.com"
+	resetAt := time.Now().Add(4 * time.Hour).Unix()
+	secondaryResetAt := time.Now().Add(7*24*time.Hour - time.Hour).Unix()
+	authFiles := []struct {
+		file      string
+		index     string
+		accountID string
+		tokens    int64
+		primary   string
+		secondary string
+	}{
+		{file: "same-a.cpa.json", index: "idx-a", accountID: "workspace-a", tokens: 100, primary: "10", secondary: "2"},
+		{file: "same-b.cpa.json", index: "idx-b", accountID: "workspace-b", tokens: 200, primary: "30", secondary: "5"},
+	}
+	for _, authFile := range authFiles {
+		raw, err := json.Marshal(map[string]any{
+			"email":              email,
+			"type":               "codex",
+			"access_token":       "secret-access-token",
+			"chatgpt_account_id": authFile.accountID,
+		})
+		if err != nil {
+			t.Fatalf("marshal auth file %s: %v", authFile.file, err)
+		}
+		if err := os.WriteFile(filepath.Join(authDir, authFile.file), raw, 0600); err != nil {
+			t.Fatalf("write auth file %s: %v", authFile.file, err)
+		}
+		if err := store.recordUsage(ctx, usageRecord{
+			Provider:    "codex",
+			AuthID:      authFile.file,
+			AuthIndex:   authFile.index,
+			Source:      email,
+			RequestedAt: time.Now().Add(-10 * time.Minute),
+			Detail: usageDetail{
+				TotalTokens: authFile.tokens,
+			},
+			ResponseHeaders: map[string][]string{
+				"x-codex-primary-used-percent":   {authFile.primary},
+				"x-codex-primary-reset-at":       {intToString(resetAt)},
+				"x-codex-secondary-used-percent": {authFile.secondary},
+				"x-codex-secondary-reset-at":     {intToString(secondaryResetAt)},
+			},
+		}); err != nil {
+			t.Fatalf("recordUsage %s returned error: %v", authFile.file, err)
+		}
+	}
+
+	data, err := store.summary(ctx, "24h", 2000)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	byFile := map[string]accountRow{}
+	for _, account := range accounts {
+		byFile[account.AuthFile] = account
+	}
+	for _, authFile := range authFiles {
+		account, ok := byFile[authFile.file]
+		if !ok {
+			t.Fatalf("missing account row for %s in %#v", authFile.file, accounts)
+		}
+		if account.PrimaryWindowTokens != authFile.tokens || account.SecondaryWindowTokens != authFile.tokens {
+			t.Fatalf("%s window tokens = primary %d secondary %d, want %d/%d", authFile.file, account.PrimaryWindowTokens, account.SecondaryWindowTokens, authFile.tokens, authFile.tokens)
+		}
+		wantPrimary, _ := strconv.ParseFloat(authFile.primary, 64)
+		wantSecondary, _ := strconv.ParseFloat(authFile.secondary, 64)
+		if account.PrimaryUsedPercent == nil || *account.PrimaryUsedPercent != wantPrimary || account.SecondaryUsedPercent == nil || *account.SecondaryUsedPercent != wantSecondary {
+			t.Fatalf("%s quota percent = primary %v secondary %v, want %v/%v", authFile.file, account.PrimaryUsedPercent, account.SecondaryUsedPercent, wantPrimary, wantSecondary)
+		}
+	}
+}
+
 func TestSummaryFlagsQuotaDropWithoutLocalUsage(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	t.Setenv("CPA_AUTH_DIR", t.TempDir())
@@ -782,6 +1815,174 @@ func TestSummaryEstimatesSecondaryQuotaCapacity(t *testing.T) {
 	if totals.SecondaryQuotaTotalEstimate != 1000 || totals.SecondaryQuotaRemainingEstimate != 750 || totals.SecondaryQuotaEstimatedAccounts != 1 {
 		t.Fatalf("total quota estimates = total %d remaining %d accounts %d, want 1000/750/1", totals.SecondaryQuotaTotalEstimate, totals.SecondaryQuotaRemainingEstimate, totals.SecondaryQuotaEstimatedAccounts)
 	}
+	if accounts[0].SecondaryQuotaSource != "usage" || accounts[0].SecondaryQuotaEstimateSource != "estimated" || accounts[0].QuotaSource != "estimated" {
+		t.Fatalf("quota sources = source %q estimate %q overall %q, want usage/estimated/estimated", accounts[0].SecondaryQuotaSource, accounts[0].SecondaryQuotaEstimateSource, accounts[0].QuotaSource)
+	}
+	if accounts[0].SecondaryQuotaObservedFrom != "response_header" || accounts[0].SecondaryQuotaEstimateMethod != "local_tokens_percent_estimate" || accounts[0].QuotaWindowSource != "default_7d" {
+		t.Fatalf("quota details = observed %q method %q window source %q, want response_header/local_tokens_percent_estimate/default_7d", accounts[0].SecondaryQuotaObservedFrom, accounts[0].SecondaryQuotaEstimateMethod, accounts[0].QuotaWindowSource)
+	}
+}
+
+func TestSchemaCreatesPerformanceIndexes(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	indexes := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='index'`)
+	if err != nil {
+		t.Fatalf("query indexes: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		indexes[name] = true
+	}
+	for _, name := range []string{
+		"idx_usage_events_requested_auth_id",
+		"idx_usage_events_requested_source",
+		"idx_usage_events_quota_scan",
+		"idx_quota_trigger_runs_status_finished",
+		"idx_quota_trigger_runs_auth_file_finished",
+	} {
+		if !indexes[name] {
+			t.Fatalf("missing performance index %q; indexes=%#v", name, indexes)
+		}
+	}
+}
+
+func TestSummaryPrecomputeCacheReturnsCachedData(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "cached@example.com",
+		AuthIndex:   "cached-account",
+		Source:      "cached@example.com",
+		RequestedAt: time.Now(),
+		Detail:      usageDetail{TotalTokens: 123},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+	manager := &summaryPrecomputeManager{}
+	cfg := normalizePluginConfig(defaultPluginConfig())
+	cfg.SummaryPrecomputeEnabled = true
+	cfg.SummaryPrecomputeIntervalSeconds = 60
+	if err := manager.refresh(ctx, store, cfg, []summaryCacheKey{{Window: "24h", Limit: 10}}); err != nil {
+		t.Fatalf("precompute refresh returned error: %v", err)
+	}
+	data, ok := manager.cached("24h", 10, cfg)
+	if !ok {
+		t.Fatalf("precompute cache miss after refresh")
+	}
+	cacheInfo, ok := data["precompute"].(summaryPrecomputeInfo)
+	if !ok || !cacheInfo.Hit || cacheInfo.Window != "24h" || cacheInfo.Limit != 10 {
+		t.Fatalf("precompute info = %#v, want cache hit 24h/10", data["precompute"])
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 || accounts[0].TotalTokens != 123 {
+		t.Fatalf("cached accounts = %#v, want cached usage account", accounts)
+	}
+}
+
+func TestSummaryPrecomputeForceRefreshBypassesStaleAuthFileCache(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "stale-delete@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"stale-delete@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "stale-delete@example.com.json",
+		AuthIndex:   "stale-delete@example.com.json",
+		Source:      "stale-delete@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusUnauthorized},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+	manager := &summaryPrecomputeManager{}
+	cfg := normalizePluginConfig(defaultPluginConfig())
+	cfg.SummaryPrecomputeEnabled = true
+	cfg.SummaryPrecomputeIntervalSeconds = 60
+	if err := manager.refresh(ctx, store, cfg, []summaryCacheKey{{Window: "all", Limit: 10}}); err != nil {
+		t.Fatalf("precompute refresh returned error: %v", err)
+	}
+	if err := os.Remove(authFile); err != nil {
+		t.Fatalf("remove auth file: %v", err)
+	}
+	cached, err := manager.summary(ctx, store, "all", 10)
+	if err != nil {
+		t.Fatalf("cached summary returned error: %v", err)
+	}
+	if got := cached["invalid_auths"].([]invalidAuthRow); len(got) != 1 {
+		t.Fatalf("cached invalid_auths = %#v, want stale cached row before force refresh", got)
+	}
+	fresh, err := manager.summaryFresh(ctx, store, "all", 10)
+	if err != nil {
+		t.Fatalf("fresh summary returned error: %v", err)
+	}
+	if got := fresh["invalid_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("fresh invalid_auths = %#v, want deleted auth file removed", got)
+	}
+	info, ok := fresh["precompute"].(summaryPrecomputeInfo)
+	if !ok || info.Hit || !info.Synchronous {
+		t.Fatalf("fresh precompute info = %#v, want synchronous cache bypass", fresh["precompute"])
+	}
+}
+
+func TestBulkQuotaSnapshotMatchesAuthFileAlias(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	resetAt := time.Now().Add(24 * time.Hour).Unix()
+	percent := 42.0
+	if err := recordQuotaTriggerRun(ctx, db, quotaTriggerRun{
+		AuthID:               "other",
+		AuthIndex:            "legacy",
+		Source:               "alias@example.com",
+		AuthFile:             "alias@example.cpa.json",
+		Provider:             "codex",
+		Mode:                 "quota",
+		Status:               "success",
+		StartedAt:            time.Now().Unix() - 1,
+		FinishedAt:           time.Now().Unix(),
+		SecondaryUsedPercent: &percent,
+		SecondaryResetAt:     &resetAt,
+	}); err != nil {
+		t.Fatalf("record quota trigger run: %v", err)
+	}
+	snapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, []accountRow{{
+		AuthIndex: "alias@example.cpa.json",
+		AuthFile:  "alias@example.cpa.json",
+		Email:     "alias@example.com",
+	}}, 0, "secondary")
+	got, ok := snapshots[0]
+	if !ok || !got.Percent.Valid || got.Percent.Float64 != 42 || got.Source != "trigger" {
+		t.Fatalf("bulk snapshot = %+v ok=%v, want trigger percent 42", got, ok)
+	}
 }
 
 func TestSecondaryQuotaEstimateAdjustsTriggerRemainingWithLaterUsage(t *testing.T) {
@@ -842,6 +2043,12 @@ func TestSecondaryQuotaEstimateAdjustsTriggerRemainingWithLaterUsage(t *testing.
 	if accounts[0].SecondaryQuotaTotalEstimate != 1000 || accounts[0].SecondaryQuotaRemainingEstimate != 650 {
 		t.Fatalf("secondary quota estimate = total %d remaining %d, want trigger total 1000 and adjusted remaining 650", accounts[0].SecondaryQuotaTotalEstimate, accounts[0].SecondaryQuotaRemainingEstimate)
 	}
+	if accounts[0].SecondaryQuotaSource != "trigger" || accounts[0].SecondaryQuotaEstimateSource != "trigger" || accounts[0].QuotaSource != "trigger" {
+		t.Fatalf("quota sources = source %q estimate %q overall %q, want trigger", accounts[0].SecondaryQuotaSource, accounts[0].SecondaryQuotaEstimateSource, accounts[0].QuotaSource)
+	}
+	if accounts[0].SecondaryQuotaObservedFrom != "quota_trigger" || accounts[0].SecondaryQuotaEstimateMethod != "quota_trigger_capacity" {
+		t.Fatalf("quota details = observed %q method %q, want quota_trigger/quota_trigger_capacity", accounts[0].SecondaryQuotaObservedFrom, accounts[0].SecondaryQuotaEstimateMethod)
+	}
 }
 
 func TestFreeAccountUsesMonthlyQuotaWindowIndependentOfSummaryWindow(t *testing.T) {
@@ -899,6 +2106,80 @@ func TestFreeAccountUsesMonthlyQuotaWindowIndependentOfSummaryWindow(t *testing.
 	}
 	if accounts[0].SecondaryWindowTokens != 300 || accounts[0].SecondaryQuotaTotalEstimate != 1000 || accounts[0].SecondaryQuotaRemainingEstimate != 700 {
 		t.Fatalf("monthly quota = window tokens %d total %d remaining %d, want 300/1000/700", accounts[0].SecondaryWindowTokens, accounts[0].SecondaryQuotaTotalEstimate, accounts[0].SecondaryQuotaRemainingEstimate)
+	}
+	if accounts[0].PrimaryQuotaWindow != "" || accounts[0].SecondaryQuotaWindow != "month" || accounts[0].SecondaryQuotaSource != "usage" {
+		t.Fatalf("quota windows/sources = primary %q secondary %q source %q, want no primary/month/usage", accounts[0].PrimaryQuotaWindow, accounts[0].SecondaryQuotaWindow, accounts[0].SecondaryQuotaSource)
+	}
+}
+
+func TestTeamAccountUsesMonthlyQuotaFromPrimaryWindow(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	authFile := filepath.Join(authDir, "team.cpa.json")
+	raw, err := json.Marshal(map[string]any{
+		"email":        "team@example.com",
+		"type":         "codex",
+		"plan_type":    "team",
+		"access_token": "secret-access-token",
+	})
+	if err != nil {
+		t.Fatalf("marshal auth file: %v", err)
+	}
+	if err := os.WriteFile(authFile, raw, 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	resetAt := time.Now().Add(30*24*time.Hour + 3*time.Hour).Unix()
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "team@example.com",
+		AuthIndex:   "team.cpa.json",
+		Source:      "team@example.com",
+		RequestedAt: time.Now(),
+		Detail: usageDetail{
+			InputTokens:  240,
+			OutputTokens: 60,
+			TotalTokens:  300,
+		},
+		ResponseHeaders: map[string][]string{
+			"x-codex-primary-used-percent":   {"30"},
+			"x-codex-primary-reset-at":       {intToString(resetAt)},
+			"x-codex-secondary-used-percent": {"0"},
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 {
+		t.Fatalf("accounts len = %d, want configured team account", len(accounts))
+	}
+	if accounts[0].PrimaryUsedPercent != nil || accounts[0].PrimaryResetAt != nil {
+		t.Fatalf("primary quota = pct %v reset %v, want monthly primary moved out of 5h", accounts[0].PrimaryUsedPercent, accounts[0].PrimaryResetAt)
+	}
+	if accounts[0].SecondaryQuotaWindow != "month" {
+		t.Fatalf("secondary quota window = %q, want month", accounts[0].SecondaryQuotaWindow)
+	}
+	if accounts[0].SecondaryUsedPercent == nil || *accounts[0].SecondaryUsedPercent != 30 {
+		t.Fatalf("secondary used percent = %v, want 30", accounts[0].SecondaryUsedPercent)
+	}
+	if accounts[0].SecondaryWindowTokens != 300 || accounts[0].SecondaryQuotaTotalEstimate != 1000 || accounts[0].SecondaryQuotaRemainingEstimate != 700 {
+		t.Fatalf("monthly quota = window tokens %d total %d remaining %d, want 300/1000/700", accounts[0].SecondaryWindowTokens, accounts[0].SecondaryQuotaTotalEstimate, accounts[0].SecondaryQuotaRemainingEstimate)
+	}
+	if accounts[0].PrimaryQuotaWindow != "" || accounts[0].SecondaryQuotaWindow != "month" || accounts[0].SecondaryQuotaSource != "usage" || accounts[0].SecondaryQuotaEstimateSource != "estimated" {
+		t.Fatalf("quota windows/sources = primary %q secondary %q source %q estimate %q, want monthly usage estimate", accounts[0].PrimaryQuotaWindow, accounts[0].SecondaryQuotaWindow, accounts[0].SecondaryQuotaSource, accounts[0].SecondaryQuotaEstimateSource)
+	}
+	if accounts[0].QuotaWindowSource != "reset_duration" {
+		t.Fatalf("quota window source = %q, want reset_duration for team monthly reset", accounts[0].QuotaWindowSource)
 	}
 }
 
@@ -1434,6 +2715,7 @@ func TestQuotaTriggerFiltersBadAccountsAndRecords401429(t *testing.T) {
 		expired  bool
 	}{
 		{name: "invalid.cpa.json", email: "invalid@example.com", token: "invalid-token"},
+		{name: "workspace.cpa.json", email: "workspace@example.com", token: "workspace-token"},
 		{name: "limited.cpa.json", email: "limited@example.com", token: "limited-token"},
 		{name: "disabled.cpa.json", email: "disabled@example.com", token: "disabled-token", disabled: true},
 		{name: "expired.cpa.json", email: "expired@example.com", token: "expired-token", expired: true},
@@ -1462,6 +2744,9 @@ func TestQuotaTriggerFiltersBadAccountsAndRecords401429(t *testing.T) {
 		switch r.Header.Get("Authorization") {
 		case "Bearer invalid-token":
 			w.WriteHeader(http.StatusUnauthorized)
+		case "Bearer workspace-token":
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte(`{"detail":{"code":"deactivated_workspace"}}`))
 		case "Bearer limited-token":
 			w.Header().Set("x-codex-primary-used-percent", "100")
 			w.Header().Set("x-codex-primary-reset-at", strconv.FormatInt(resetAt, 10))
@@ -1486,8 +2771,8 @@ func TestQuotaTriggerFiltersBadAccountsAndRecords401429(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runQuotaTriggerRound returned error: %v", err)
 	}
-	if success != 0 || failed != 2 || skipped != 2 || candidates != 2 {
-		t.Fatalf("round = success %d failed %d skipped %d candidates %d, want 0/2/2/2", success, failed, skipped, candidates)
+	if success != 0 || failed != 3 || skipped != 2 || candidates != 3 {
+		t.Fatalf("round = success %d failed %d skipped %d candidates %d, want 0/3/2/3", success, failed, skipped, candidates)
 	}
 	data, err := store.summary(ctx, "24h", 20)
 	if err != nil {
@@ -1497,15 +2782,33 @@ func TestQuotaTriggerFiltersBadAccountsAndRecords401429(t *testing.T) {
 	if len(invalids) != 1 || invalids[0].AuthID != "invalid@example.com" {
 		t.Fatalf("invalid_auths = %#v, want invalid@example.com", invalids)
 	}
+	workspaces := data["workspace_deactivated_auths"].([]invalidAuthRow)
+	if len(workspaces) != 1 || workspaces[0].AuthID != "workspace@example.com" || workspaces[0].LastStatusCode != http.StatusPaymentRequired {
+		t.Fatalf("workspace_deactivated_auths = %#v, want workspace@example.com 402", workspaces)
+	}
 	bans := data["autobans"].([]autobanRow)
-	if len(bans) != 1 || bans[0].AuthID != "limited@example.com" {
-		t.Fatalf("autobans = %#v, want limited@example.com", bans)
+	seenLimited := false
+	seenInvalid := false
+	seenWorkspace := false
+	for _, ban := range bans {
+		if ban.AuthID == "limited@example.com" && ban.Window == "5h" {
+			seenLimited = true
+		}
+		if ban.AuthID == "invalid@example.com" && ban.Window == "401" {
+			seenInvalid = true
+		}
+		if ban.AuthID == "workspace@example.com" && ban.Window == "402" {
+			seenWorkspace = true
+		}
+	}
+	if len(bans) != 3 || !seenLimited || !seenInvalid || !seenWorkspace {
+		t.Fatalf("autobans = %#v, want limited 429, invalid 401, and workspace 402 bans", bans)
 	}
 	rawSummary, err := json.Marshal(data)
 	if err != nil {
 		t.Fatalf("marshal summary: %v", err)
 	}
-	if strings.Contains(string(rawSummary), "invalid-token") || strings.Contains(string(rawSummary), "limited-token") {
+	if strings.Contains(string(rawSummary), "invalid-token") || strings.Contains(string(rawSummary), "limited-token") || strings.Contains(string(rawSummary), "workspace-token") {
 		t.Fatalf("summary leaked trigger token material: %s", rawSummary)
 	}
 }
@@ -1911,6 +3214,59 @@ codex-api-key:
 	}
 }
 
+func TestClaudeAPIKeyProviderUsesConfiguredEndpointName(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("CPA_CONFIG_PATH", configPath)
+	if err := os.WriteFile(configPath, []byte(`
+claude-api-key:
+  - api-key: sk-claude-secret
+    base-url: https://api.kmoon.site
+    models:
+      - name: claude-sonnet-5
+`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:     "claude",
+		ExecutorType: "ClaudeExecutor",
+		AuthType:     "apikey",
+		AuthID:       "claude:apikey:b575a2ab1607",
+		AuthIndex:    "0ae6b99ac9b81719",
+		Source:       "sk-claude-secret",
+		Model:        "claude-sonnet-5",
+		Alias:        "claude-sonnet-5",
+		RequestedAt:  time.Now(),
+		Detail: usageDetail{
+			InputTokens:         42,
+			OutputTokens:        37,
+			CacheCreationTokens: 1447,
+			CachedTokens:        1447,
+			TotalTokens:         1526,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	providers := data["providers"].([]providerRow)
+	if len(providers) != 1 || providers[0].Provider != "Claude · api.kmoon.site" || providers[0].TotalTokens != 1526 {
+		t.Fatalf("providers = %#v, want one configured Claude endpoint row", providers)
+	}
+	providerRecent := data["provider_recent"].([]recentRow)
+	if len(providerRecent) != 1 || providerRecent[0].Provider != "Claude · api.kmoon.site" {
+		t.Fatalf("provider_recent = %#v, want configured Claude endpoint name", providerRecent)
+	}
+}
+
 func TestProviderRecentKeepsOlderEndpointRows(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	t.Setenv("CPA_AUTH_DIR", t.TempDir())
@@ -2075,6 +3431,39 @@ antigravity-oauth:
 	}
 }
 
+func TestSchemaCreatesQuotaTriggerCapacityColumns(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(quota_trigger_runs)`)
+	if err != nil {
+		t.Fatalf("pragma table_info: %v", err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan table_info: %v", err)
+		}
+		columns[name] = true
+	}
+	for _, name := range []string{"primary_used_tokens", "primary_remaining_tokens", "primary_limit_tokens", "secondary_used_tokens", "secondary_remaining_tokens", "secondary_limit_tokens"} {
+		if !columns[name] {
+			t.Fatalf("quota_trigger_runs missing capacity column %q; columns=%#v", name, columns)
+		}
+	}
+}
+
 func TestConfiguredAuthFilesReadCodexAnthropicAndAntigravityOAuth(t *testing.T) {
 	authDir := t.TempDir()
 	t.Setenv("CPA_AUTH_DIR", authDir)
@@ -2123,7 +3512,11 @@ usage_retention_days: 120
 
 func TestSummaryIncludesDiagnosticsAndAlerts(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
-	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	if err := os.WriteFile(filepath.Join(authDir, "broken.json"), []byte(`{"provider":"codex","email":"broken@example.com","access_token":"redacted"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
 	ctx := context.Background()
 	store := &store{}
 	defer store.close()

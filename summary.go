@@ -4,13 +4,257 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+type summaryCacheKey struct {
+	Window string
+	Limit  int
+}
+
+type summaryPrecomputeInfo struct {
+	Enabled      bool   `json:"enabled"`
+	Hit          bool   `json:"hit"`
+	Window       string `json:"window"`
+	Limit        int    `json:"limit"`
+	CachedAt     string `json:"cached_at,omitempty"`
+	AgeSeconds   int64  `json:"age_seconds,omitempty"`
+	DurationMs   int64  `json:"duration_ms,omitempty"`
+	IntervalSecs int    `json:"interval_seconds"`
+	LastError    string `json:"last_error,omitempty"`
+	Precomputed  bool   `json:"precomputed"`
+	Synchronous  bool   `json:"synchronous"`
+}
+
+type summaryCacheEntry struct {
+	data       map[string]any
+	cachedAt   time.Time
+	durationMs int64
+	err        string
+}
+
+type summaryPrecomputeManager struct {
+	mu      sync.Mutex
+	cfg     pluginConfig
+	cancel  context.CancelFunc
+	entries map[summaryCacheKey]summaryCacheEntry
+}
+
+func (m *summaryPrecomputeManager) configure(cfg pluginConfig) {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.cfg = cfg
+	if m.entries == nil {
+		m.entries = map[summaryCacheKey]summaryCacheEntry{}
+	}
+	if !cfg.SummaryPrecomputeEnabled {
+		m.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	m.mu.Unlock()
+	go m.loop(ctx, cfg)
+}
+
+func (m *summaryPrecomputeManager) stop() {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.mu.Unlock()
+}
+
+func (m *summaryPrecomputeManager) loop(ctx context.Context, cfg pluginConfig) {
+	_ = m.refresh(ctx, globalStore, cfg, defaultSummaryPrecomputeKeys())
+	ticker := time.NewTicker(time.Duration(cfg.SummaryPrecomputeIntervalSeconds) * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = m.refresh(ctx, globalStore, cfg, defaultSummaryPrecomputeKeys())
+		}
+	}
+}
+
+func defaultSummaryPrecomputeKeys() []summaryCacheKey {
+	return []summaryCacheKey{
+		{Window: "24h", Limit: 100},
+		{Window: "24h", Limit: 500},
+		{Window: "all", Limit: 500},
+	}
+}
+
+func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cfg pluginConfig, keys []summaryCacheKey) error {
+	if !cfg.SummaryPrecomputeEnabled {
+		return nil
+	}
+	var firstErr error
+	for _, key := range keys {
+		started := time.Now()
+		data, err := store.summary(ctx, key.Window, key.Limit)
+		durationMs := time.Since(started).Milliseconds()
+		entry := summaryCacheEntry{
+			data:       data,
+			cachedAt:   time.Now(),
+			durationMs: durationMs,
+		}
+		if err != nil {
+			entry.err = sanitizeTriggerError(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		m.mu.Lock()
+		if m.entries == nil {
+			m.entries = map[summaryCacheKey]summaryCacheEntry{}
+		}
+		m.entries[normalizeSummaryCacheKey(key)] = entry
+		m.mu.Unlock()
+	}
+	return firstErr
+}
+
+func (m *summaryPrecomputeManager) summary(ctx context.Context, store *store, window string, limit int) (map[string]any, error) {
+	cfg := m.config()
+	if !cfg.SummaryPrecomputeEnabled {
+		data, err := store.summary(ctx, window, limit)
+		if err == nil {
+			data = cloneSummaryMap(data)
+			data["precompute"] = summaryPrecomputeInfo{Enabled: false, Window: window, Limit: limit}
+		}
+		return data, err
+	}
+	if data, ok := m.cached(window, limit, cfg); ok {
+		return data, nil
+	}
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
+	started := time.Now()
+	data, err := store.summary(ctx, key.Window, key.Limit)
+	durationMs := time.Since(started).Milliseconds()
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if m.entries == nil {
+		m.entries = map[summaryCacheKey]summaryCacheEntry{}
+	}
+	m.entries[key] = summaryCacheEntry{data: data, cachedAt: time.Now(), durationMs: durationMs}
+	m.mu.Unlock()
+	out := cloneSummaryMap(data)
+	out["precompute"] = summaryPrecomputeInfo{
+		Enabled:      true,
+		Hit:          false,
+		Window:       key.Window,
+		Limit:        key.Limit,
+		CachedAt:     time.Now().Format(time.RFC3339),
+		DurationMs:   durationMs,
+		IntervalSecs: cfg.SummaryPrecomputeIntervalSeconds,
+		Precomputed:  false,
+		Synchronous:  true,
+	}
+	return out, nil
+}
+
+func (m *summaryPrecomputeManager) summaryFresh(ctx context.Context, store *store, window string, limit int) (map[string]any, error) {
+	cfg := m.config()
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
+	started := time.Now()
+	data, err := store.summary(ctx, key.Window, key.Limit)
+	durationMs := time.Since(started).Milliseconds()
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if m.entries == nil {
+		m.entries = map[summaryCacheKey]summaryCacheEntry{}
+	}
+	m.entries[key] = summaryCacheEntry{data: data, cachedAt: time.Now(), durationMs: durationMs}
+	m.mu.Unlock()
+	out := cloneSummaryMap(data)
+	out["precompute"] = summaryPrecomputeInfo{
+		Enabled:      cfg.SummaryPrecomputeEnabled,
+		Hit:          false,
+		Window:       key.Window,
+		Limit:        key.Limit,
+		CachedAt:     time.Now().Format(time.RFC3339),
+		DurationMs:   durationMs,
+		IntervalSecs: cfg.SummaryPrecomputeIntervalSeconds,
+		Precomputed:  false,
+		Synchronous:  true,
+	}
+	return out, nil
+}
+
+func (m *summaryPrecomputeManager) cached(window string, limit int, cfg pluginConfig) (map[string]any, bool) {
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
+	m.mu.Lock()
+	entry, ok := m.entries[key]
+	m.mu.Unlock()
+	if !ok || entry.data == nil || entry.err != "" {
+		return nil, false
+	}
+	ttl := time.Duration(maxInt(cfg.SummaryPrecomputeIntervalSeconds*2, 10)) * time.Second
+	age := time.Since(entry.cachedAt)
+	if age > ttl {
+		return nil, false
+	}
+	out := cloneSummaryMap(entry.data)
+	out["precompute"] = summaryPrecomputeInfo{
+		Enabled:      true,
+		Hit:          true,
+		Window:       key.Window,
+		Limit:        key.Limit,
+		CachedAt:     entry.cachedAt.Format(time.RFC3339),
+		AgeSeconds:   int64(age.Seconds()),
+		DurationMs:   entry.durationMs,
+		IntervalSecs: cfg.SummaryPrecomputeIntervalSeconds,
+		LastError:    entry.err,
+		Precomputed:  true,
+	}
+	return out, true
+}
+
+func (m *summaryPrecomputeManager) config() pluginConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfg.SummaryPrecomputeIntervalSeconds <= 0 {
+		return normalizePluginConfig(defaultPluginConfig())
+	}
+	return m.cfg
+}
+
+func normalizeSummaryCacheKey(key summaryCacheKey) summaryCacheKey {
+	key.Window = strings.ToLower(strings.TrimSpace(key.Window))
+	if key.Window == "" {
+		key.Window = "24h"
+	}
+	if key.Limit <= 0 {
+		key.Limit = 50
+	}
+	return key
+}
+
+func cloneSummaryMap(data map[string]any) map[string]any {
+	out := make(map[string]any, len(data)+1)
+	for key, value := range data {
+		out[key] = value
+	}
+	return out
+}
 
 func (s *store) summary(ctx context.Context, window string, limit int) (map[string]any, error) {
 	db, path, err := s.open(ctx)
@@ -37,12 +281,19 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
 		return nil, err
 	}
+	if err := backfillWorkspaceDeactivatedAuthsFromUsage(ctx, db); err != nil {
+		return nil, err
+	}
 	if err := expireAutobans(ctx, db, now); err != nil {
 		return nil, err
 	}
 	if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
 		return nil, err
 	}
+	if err := clearRecoveredAuthStatesFromUsage(ctx, db); err != nil {
+		return nil, err
+	}
+	authDirReadable := configuredAuthDirectoryReadable()
 	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
 		return nil, err
 	}
@@ -55,7 +306,10 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	}
 	configuredAccounts := readConfiguredAuthAccounts()
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
-	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, configuredAuthDirectoryReadable())
+	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
+	if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, authDirReadable); err != nil {
+		return nil, err
+	}
 	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
 	applySecondaryQuotaEstimates(ctx, db, accounts, &totals, quotaSince)
@@ -64,6 +318,8 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 		return nil, err
 	}
 	applyInvalidAuths(accounts, invalidAuths)
+	workspaceDeactivatedAuths := filterWorkspaceDeactivatedAuths(invalidAuths)
+	unauthorizedInvalidAuths := filterUnauthorizedInvalidAuths(invalidAuths)
 	externalUseAlerts, err := queryExternalUseAlerts(ctx, db, since)
 	if err != nil {
 		return nil, err
@@ -116,35 +372,54 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	if err != nil {
 		return nil, err
 	}
+	autobans = clearAndFilterMissingAutobanRows(ctx, db, autobans, configuredAccounts, authDirReadable)
+	autobans = mergeEffectiveAutobans(autobans, invalidAuths)
 	applyAccountQuotaToAutobans(autobans, accounts)
-	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, invalidAuths, autobans, externalUseAlerts)
+	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, unauthorizedInvalidAuths, autobans, externalUseAlerts)
 	result := map[string]any{
-		"plugin":              pluginID,
-		"version":             pluginVersion,
-		"generated_at":        time.Now().Format(time.RFC3339),
-		"window":              label,
-		"since_unix":          since,
-		"db_path":             path,
-		"totals":              totals,
-		"provider_totals":     providerTotals,
-		"accounts":            accounts,
-		"providers":           providers,
-		"models":              models,
-		"provider_models":     providerModels,
-		"trend":               trend,
-		"provider_trend":      providerTrend,
-		"recent":              recent,
-		"provider_recent":     providerRecent,
-		"autobans":            autobans,
-		"invalid_auths":       invalidAuths,
-		"external_use_alerts": externalUseAlerts,
-		"quota_trigger":       globalQuotaTrigger.status(),
-		"quota_trigger_runs":  triggerRuns,
-		"model_prices":        globalModelPriceUpdater.status(),
-		"diagnostics":         diagnostics,
+		"plugin":                      pluginID,
+		"version":                     pluginVersion,
+		"generated_at":                time.Now().Format(time.RFC3339),
+		"window":                      label,
+		"since_unix":                  since,
+		"db_path":                     path,
+		"totals":                      totals,
+		"provider_totals":             providerTotals,
+		"accounts":                    accounts,
+		"providers":                   providers,
+		"models":                      models,
+		"provider_models":             providerModels,
+		"trend":                       trend,
+		"provider_trend":              providerTrend,
+		"recent":                      recent,
+		"provider_recent":             providerRecent,
+		"autobans":                    autobans,
+		"invalid_auths":               unauthorizedInvalidAuths,
+		"workspace_deactivated_auths": workspaceDeactivatedAuths,
+		"external_use_alerts":         externalUseAlerts,
+		"quota_trigger":               globalQuotaTrigger.status(),
+		"quota_trigger_runs":          triggerRuns,
+		"model_prices":                globalModelPriceUpdater.status(),
+		"diagnostics":                 diagnostics,
 	}
 	result["alerts"] = buildAlerts(result)
 	return result, nil
+}
+
+func clearAndFilterMissingAutobanRows(ctx context.Context, db *sql.DB, rows []autobanRow, configured []configuredAccount, authDirReadable bool) []autobanRow {
+	if !authDirReadable || len(configured) == 0 || len(rows) == 0 {
+		return rows
+	}
+	aliases := configuredAliasSet(configured)
+	out := rows[:0]
+	for _, row := range rows {
+		if !fileBackedAuthState(row.AuthID, row.AuthIndex, row.Source, row.AuthFile) || aliasesContainAny(aliases, row.AuthID, row.AuthIndex, row.Source, row.AuthFile) {
+			out = append(out, row)
+			continue
+		}
+		_, _ = db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, row.AuthID)
+	}
+	return out
 }
 
 func providerRecentLimit(limit int) int {
@@ -210,12 +485,16 @@ type accountRow struct {
 	Email                           string   `json:"email,omitempty"`
 	Name                            string   `json:"name,omitempty"`
 	AuthFile                        string   `json:"auth_file,omitempty"`
+	ChatGPTAccountID                string   `json:"chatgpt_account_id,omitempty"`
 	Configured                      bool     `json:"configured"`
 	Disabled                        bool     `json:"disabled,omitempty"`
 	Expired                         bool     `json:"expired,omitempty"`
 	InvalidAuth                     bool     `json:"invalid_auth,omitempty"`
 	InvalidAuthAt                   string   `json:"invalid_auth_at,omitempty"`
 	InvalidAuthReason               string   `json:"invalid_auth_reason,omitempty"`
+	WorkspaceDeactivated            bool     `json:"workspace_deactivated,omitempty"`
+	WorkspaceDeactivatedAt          string   `json:"workspace_deactivated_at,omitempty"`
+	WorkspaceDeactivatedReason      string   `json:"workspace_deactivated_reason,omitempty"`
 	PlanType                        string   `json:"plan_type,omitempty"`
 	Requests                        int64    `json:"requests"`
 	Failed                          int64    `json:"failed"`
@@ -238,13 +517,24 @@ type accountRow struct {
 	LastSeen                        string   `json:"last_seen"`
 	PrimaryUsedPercent              *float64 `json:"primary_used_percent,omitempty"`
 	PrimaryResetAt                  *int64   `json:"primary_reset_at,omitempty"`
+	PrimaryQuotaWindow              string   `json:"primary_quota_window,omitempty"`
+	PrimaryQuotaSource              string   `json:"primary_quota_source,omitempty"`
+	PrimaryQuotaObservedFrom        string   `json:"primary_quota_observed_from,omitempty"`
 	PrimaryWindowTokens             int64    `json:"primary_window_tokens"`
 	SecondaryUsedPercent            *float64 `json:"secondary_used_percent,omitempty"`
 	SecondaryResetAt                *int64   `json:"secondary_reset_at,omitempty"`
 	SecondaryWindowTokens           int64    `json:"secondary_window_tokens"`
 	SecondaryQuotaWindow            string   `json:"secondary_quota_window,omitempty"`
+	QuotaWindowSource               string   `json:"quota_window_source,omitempty"`
+	SecondaryQuotaSource            string   `json:"secondary_quota_source,omitempty"`
+	SecondaryQuotaObservedFrom      string   `json:"secondary_quota_observed_from,omitempty"`
 	SecondaryQuotaTotalEstimate     int64    `json:"secondary_quota_total_estimate"`
 	SecondaryQuotaRemainingEstimate int64    `json:"secondary_quota_remaining_estimate"`
+	SecondaryQuotaEstimateSource    string   `json:"secondary_quota_estimate_source,omitempty"`
+	SecondaryQuotaEstimateMethod    string   `json:"secondary_quota_estimate_method,omitempty"`
+	QuotaSource                     string   `json:"quota_source,omitempty"`
+	QuotaCredibility                string   `json:"quota_credibility,omitempty"`
+	QuotaEstimateNote               string   `json:"quota_estimate_note,omitempty"`
 	ExternalUseSuspected            bool     `json:"external_use_suspected,omitempty"`
 	ExternalUseCount                int      `json:"external_use_count,omitempty"`
 	ExternalUseWindow               string   `json:"external_use_window,omitempty"`
@@ -404,6 +694,7 @@ type autobanRow struct {
 	AuthIndex            string   `json:"auth_index"`
 	Source               string   `json:"source"`
 	Provider             string   `json:"provider"`
+	AuthFile             string   `json:"auth_file,omitempty"`
 	Window               string   `json:"window"`
 	Reason               string   `json:"reason"`
 	BannedAt             int64    `json:"banned_at"`
@@ -547,11 +838,6 @@ LIMIT ?`, since, limit)
 			return nil, err
 		}
 		r.LastSeen = unixTime(last)
-		pp, pr := queryLatestAccountWindowQuota(ctx, db, r, since, "primary")
-		sp, sr := queryLatestAccountWindowQuota(ctx, db, r, since, "secondary")
-		applyAccountQuotaSnapshot(&r, pp, pr, sp, sr)
-		r.PrimaryWindowTokens = queryAccountWindowTokens(ctx, db, r, pr, 5*time.Hour)
-		r.SecondaryWindowTokens = queryAccountWindowTokens(ctx, db, r, sr, 7*24*time.Hour)
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -901,22 +1187,27 @@ func hostFromURL(value string) string {
 }
 
 func authFileStateForRecord(rec usageRecord) (string, int64) {
-	for _, cfg := range readConfiguredAuthAccounts() {
+	if authFile := firstNonEmptyString(fileNameIfJSON(rec.AuthIndex), fileNameIfJSON(rec.Source), fileNameIfJSON(rec.AuthID)); authFile != "" {
+		return authFileStateForName(authFile)
+	}
+	configured := readConfiguredAuthAccounts()
+	emailCounts := configuredEmailCounts(configured)
+	for _, cfg := range configured {
 		for _, alias := range normalizeAccountAliases(rec.AuthIndex, rec.AuthID, rec.Source) {
 			if alias == "" {
 				continue
 			}
-			for _, cfgAlias := range configuredAliases(cfg) {
+			for _, cfgAlias := range configuredAccountMatchAliases(cfg, emailCounts) {
 				if alias == cfgAlias {
 					return cfg.AuthFile, cfg.AuthFileMTime
 				}
 			}
 		}
 	}
-	authFile := firstNonEmptyString(fileNameIfJSON(rec.AuthIndex), fileNameIfJSON(rec.Source), fileNameIfJSON(rec.AuthID))
-	if authFile == "" {
-		return "", 0
-	}
+	return "", 0
+}
+
+func authFileStateForName(authFile string) (string, int64) {
 	authDir := configuredAuthDir()
 	if authDir == "" {
 		return authFile, 0
@@ -991,8 +1282,9 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 		}
 	}
 	seenConfig := make(map[string]bool, len(configured))
+	emailCounts := configuredEmailCounts(configured)
 	for _, cfg := range configured {
-		canonical := normalizeAccountAlias(firstNonEmptyString(cfg.Email, cfg.AuthFile, cfg.Name))
+		canonical := configuredAccountKey(cfg)
 		if canonical != "" && seenConfig[canonical] {
 			continue
 		}
@@ -1000,7 +1292,7 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 			seenConfig[canonical] = true
 		}
 		match := -1
-		for _, alias := range configuredAliases(cfg) {
+		for _, alias := range configuredAccountMatchAliases(cfg, emailCounts) {
 			if i, ok := index[alias]; ok {
 				match = i
 				break
@@ -1016,17 +1308,18 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 			continue
 		}
 		row := accountRow{
-			AuthIndex:  cfg.AuthIndex,
-			AuthID:     cfg.AuthID,
-			Source:     cfg.Source,
-			Provider:   firstNonEmptyString(cfg.Provider, "codex"),
-			Email:      cfg.Email,
-			Name:       cfg.Name,
-			AuthFile:   cfg.AuthFile,
-			Configured: true,
-			Disabled:   cfg.Disabled,
-			Expired:    cfg.Expired,
-			PlanType:   cfg.PlanType,
+			AuthIndex:        cfg.AuthIndex,
+			AuthID:           cfg.AuthID,
+			Source:           cfg.Source,
+			Provider:         firstNonEmptyString(cfg.Provider, "codex"),
+			Email:            cfg.Email,
+			Name:             cfg.Name,
+			AuthFile:         cfg.AuthFile,
+			ChatGPTAccountID: cfg.ChatGPTAccountID,
+			Configured:       true,
+			Disabled:         cfg.Disabled,
+			Expired:          cfg.Expired,
+			PlanType:         cfg.PlanType,
 		}
 		merged = append(merged, row)
 		rowIndex := len(merged) - 1
@@ -1078,6 +1371,7 @@ func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
 	row.Email = firstNonEmptyString(row.Email, cfg.Email)
 	row.Name = firstNonEmptyString(row.Name, cfg.Name)
 	row.AuthFile = firstNonEmptyString(row.AuthFile, cfg.AuthFile)
+	row.ChatGPTAccountID = firstNonEmptyString(row.ChatGPTAccountID, cfg.ChatGPTAccountID)
 	row.Provider = firstNonEmptyString(row.Provider, cfg.Provider, "codex")
 	if row.Source == "" || looksOpaqueAccountKey(row.Source) {
 		row.Source = firstNonEmptyString(cfg.Source, row.Source)
@@ -1088,11 +1382,84 @@ func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
 }
 
 func accountAliases(row accountRow) []string {
-	return normalizeAccountAliases(row.AuthIndex, row.AuthID, row.Source, row.Email, row.Name, row.AuthFile)
+	return accountIdentityAliases(accountIdentity{
+		AuthIndex: row.AuthIndex,
+		AuthID:    row.AuthID,
+		Source:    row.Source,
+		Email:     row.Email,
+		Name:      row.Name,
+		AuthFile:  row.AuthFile,
+	})
 }
 
 func configuredAliases(cfg configuredAccount) []string {
-	return normalizeAccountAliases(cfg.AuthIndex, cfg.AuthID, cfg.Source, cfg.Email, cfg.Name, cfg.AuthFile)
+	return accountIdentityAliases(accountIdentity{
+		AuthIndex: cfg.AuthIndex,
+		AuthID:    cfg.AuthID,
+		Source:    cfg.Source,
+		Email:     cfg.Email,
+		Name:      cfg.Name,
+		AuthFile:  cfg.AuthFile,
+	})
+}
+
+func configuredEmailCounts(configured []configuredAccount) map[string]int {
+	counts := make(map[string]int, len(configured))
+	for _, cfg := range configured {
+		email := normalizeAccountAlias(cfg.Email)
+		if email != "" {
+			counts[email]++
+		}
+	}
+	return counts
+}
+
+func configuredAccountKey(cfg configuredAccount) string {
+	if alias := normalizeAccountAlias(cfg.AuthFile); alias != "" {
+		return "file:" + alias
+	}
+	if alias := normalizeAccountAlias(cfg.AuthIndex); alias != "" {
+		return "index:" + alias
+	}
+	email := normalizeAccountAlias(cfg.Email)
+	accountID := normalizeAccountAlias(cfg.ChatGPTAccountID)
+	if email != "" && accountID != "" {
+		return "email-account:" + email + "|" + accountID
+	}
+	if alias := normalizeAccountAlias(firstNonEmptyString(cfg.AuthID, cfg.Email, cfg.Name)); alias != "" {
+		return "alias:" + alias
+	}
+	return ""
+}
+
+func configuredAccountMatchAliases(cfg configuredAccount, emailCounts map[string]int) []string {
+	email := normalizeAccountAlias(cfg.Email)
+	if email == "" || emailCounts[email] <= 1 {
+		return normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex, cfg.AuthID, cfg.Source, cfg.Email, cfg.Name)
+	}
+	return normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex)
+}
+
+type accountIdentity struct {
+	AuthID    string
+	AuthIndex string
+	Source    string
+	AuthFile  string
+	Email     string
+	Name      string
+	Path      string
+}
+
+func accountIdentityAliases(identity accountIdentity) []string {
+	return normalizeAccountAliases(
+		identity.AuthID,
+		identity.AuthIndex,
+		identity.Source,
+		identity.AuthFile,
+		identity.Email,
+		identity.Name,
+		identity.Path,
+	)
 }
 
 func normalizeAccountAliases(values ...string) []string {
@@ -1108,12 +1475,24 @@ func normalizeAccountAliases(values ...string) []string {
 	}
 	for _, value := range values {
 		value = strings.TrimSpace(value)
-		add(value)
-		if strings.HasSuffix(strings.ToLower(value), ".json") {
-			add(strings.TrimSuffix(value, ".json"))
+		if value == "" {
+			continue
 		}
-		if strings.HasSuffix(strings.ToLower(value), ".cpa.json") {
-			add(strings.TrimSuffix(value, ".cpa.json"))
+		add(value)
+		base := filepath.Base(value)
+		if base != value {
+			add(base)
+		}
+		for _, candidate := range []string{value, base} {
+			lower := strings.ToLower(candidate)
+			if strings.HasSuffix(lower, ".cpa.json") {
+				add(candidate[:len(candidate)-len(".cpa.json")])
+				add(candidate[:len(candidate)-len(".json")])
+				continue
+			}
+			if strings.HasSuffix(lower, ".json") {
+				add(candidate[:len(candidate)-len(".json")])
+			}
 		}
 	}
 	return out
@@ -1136,7 +1515,25 @@ func looksOpaqueAccountKey(value string) bool {
 	return true
 }
 
-func queryLatestAccountWindowQuota(ctx context.Context, db *sql.DB, account accountRow, since int64, window string) (sql.NullFloat64, sql.NullInt64) {
+type quotaWindowSnapshot struct {
+	Percent    sql.NullFloat64
+	ResetAt    sql.NullInt64
+	Source     string
+	ObservedAt int64
+	ID         int64
+}
+
+func queryLatestAccountWindowQuota(ctx context.Context, db *sql.DB, account accountRow, since int64, window string) quotaWindowSnapshot {
+	snapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, []accountRow{account}, since, window)
+	return snapshots[0]
+}
+
+func queryLatestAccountWindowQuotaSnapshots(ctx context.Context, db *sql.DB, accounts []accountRow, since int64, window string) map[int]quotaWindowSnapshot {
+	out := make(map[int]quotaWindowSnapshot, len(accounts))
+	if len(accounts) == 0 {
+		return out
+	}
+	index := accountQuotaAliasIndex(accounts)
 	percentColumn := "primary_used_percent"
 	resetColumn := "primary_reset_at"
 	if window == "secondary" {
@@ -1144,61 +1541,167 @@ func queryLatestAccountWindowQuota(ctx context.Context, db *sql.DB, account acco
 		resetColumn = "secondary_reset_at"
 	}
 	query := `
-SELECT ` + percentColumn + `, ` + resetColumn + `
+SELECT source_type, id, observed_at, auth_index, auth_id, source, auth_file, ` + percentColumn + `, ` + resetColumn + `
 FROM (
-  SELECT id, requested_at AS observed_at, auth_index, auth_id, source, '' AS auth_file, ` + percentColumn + `, ` + resetColumn + `
+  SELECT 'usage' AS source_type, id, requested_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, '' AS auth_file, ` + percentColumn + `, ` + resetColumn + `
   FROM usage_events
   WHERE requested_at >= ?
   AND (` + trustedUsageQuotaSnapshotSQL() + `)
   AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
   UNION ALL
-  SELECT id, finished_at AS observed_at, auth_index, auth_id, source, auth_file, ` + percentColumn + `, ` + resetColumn + `
+  SELECT 'trigger' AS source_type, id, finished_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, lower(auth_file) AS auth_file, ` + percentColumn + `, ` + resetColumn + `
   FROM quota_trigger_runs
   WHERE finished_at >= ? AND status='success' AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
 ) snapshots
-WHERE (
-  (auth_index <> '' AND auth_index = ?)
-  OR (auth_id <> '' AND auth_id = ?)
-  OR (source <> '' AND source = ?)
-  OR (auth_file <> '' AND auth_file = ?)
-)
-ORDER BY observed_at DESC, id DESC
-LIMIT 1`
-	var percent sql.NullFloat64
-	var reset sql.NullInt64
-	err := db.QueryRowContext(ctx, query, since, since, account.AuthIndex, account.AuthID, account.Source, account.AuthFile).Scan(&percent, &reset)
+ORDER BY observed_at DESC, id DESC`
+	rows, err := db.QueryContext(ctx, query, since, since)
 	if err != nil {
-		return sql.NullFloat64{}, sql.NullInt64{}
+		return out
 	}
-	if reset.Valid {
-		reset.Int64 = normalizeUnixSeconds(reset.Int64)
-		if reset.Int64 <= time.Now().Unix() {
-			return sql.NullFloat64{}, sql.NullInt64{}
+	defer rows.Close()
+	now := time.Now().Unix()
+	for rows.Next() {
+		var snapshot quotaWindowSnapshot
+		var authIndex, authID, source, authFile string
+		if err := rows.Scan(&snapshot.Source, &snapshot.ID, &snapshot.ObservedAt, &authIndex, &authID, &source, &authFile, &snapshot.Percent, &snapshot.ResetAt); err != nil {
+			continue
+		}
+		if snapshot.ResetAt.Valid {
+			snapshot.ResetAt.Int64 = normalizeUnixSeconds(snapshot.ResetAt.Int64)
+			if snapshot.ResetAt.Int64 <= now {
+				continue
+			}
+		}
+		for _, alias := range normalizeAccountAliases(authIndex, authID, source, authFile) {
+			for _, accountIndex := range index[alias] {
+				if _, exists := out[accountIndex]; exists {
+					continue
+				}
+				out[accountIndex] = snapshot
+			}
 		}
 	}
-	return percent, reset
+	return out
+}
+
+func accountAliasIndex(accounts []accountRow) map[string][]int {
+	index := make(map[string][]int, len(accounts)*4)
+	for i := range accounts {
+		seen := map[string]bool{}
+		for _, alias := range accountAliases(accounts[i]) {
+			if alias == "" || seen[alias] {
+				continue
+			}
+			seen[alias] = true
+			index[alias] = append(index[alias], i)
+		}
+	}
+	return index
+}
+
+func accountQuotaAliasIndex(accounts []accountRow) map[string][]int {
+	sets := accountQuotaAliasSets(accounts)
+	index := make(map[string][]int, len(accounts)*4)
+	for i, aliases := range sets {
+		seen := map[string]bool{}
+		for _, alias := range aliases {
+			if alias == "" || seen[alias] {
+				continue
+			}
+			seen[alias] = true
+			index[alias] = append(index[alias], i)
+		}
+	}
+	return index
+}
+
+func accountQuotaAliasSets(accounts []accountRow) [][]string {
+	emailCounts := make(map[string]int, len(accounts))
+	for _, account := range accounts {
+		if email := normalizeAccountAlias(account.Email); email != "" {
+			emailCounts[email]++
+		}
+	}
+	out := make([][]string, len(accounts))
+	for i := range accounts {
+		out[i] = accountQuotaAliases(accounts[i], emailCounts)
+	}
+	return out
+}
+
+func accountQuotaAliases(account accountRow, emailCounts map[string]int) []string {
+	email := normalizeAccountAlias(account.Email)
+	if email == "" || emailCounts[email] <= 1 {
+		return accountAliases(account)
+	}
+	values := []string{account.AuthFile, account.AuthIndex, account.ChatGPTAccountID}
+	authID := normalizeAccountAlias(account.AuthID)
+	if authID != "" && authID != email && authID != normalizeAccountAlias(account.Source) && authID != normalizeAccountAlias(account.Name) {
+		values = append(values, account.AuthID)
+	}
+	return normalizeAccountAliases(values...)
 }
 
 func trustedUsageQuotaSnapshotSQL() string {
 	return "((failed=0 AND (status_code=0 OR (status_code >= 200 AND status_code < 300))) OR status_code=429)"
 }
 
-func applyAccountQuotaSnapshot(account *accountRow, pp sql.NullFloat64, pr sql.NullInt64, sp sql.NullFloat64, sr sql.NullInt64) {
-	if pp.Valid {
-		account.PrimaryUsedPercent = &pp.Float64
+func applyAccountQuotaSnapshot(account *accountRow, primary quotaWindowSnapshot, secondary quotaWindowSnapshot) {
+	if primary.Percent.Valid {
+		account.PrimaryUsedPercent = &primary.Percent.Float64
 	}
-	if pr.Valid {
-		account.PrimaryResetAt = &pr.Int64
+	if primary.ResetAt.Valid {
+		account.PrimaryResetAt = &primary.ResetAt.Int64
+		account.PrimaryQuotaWindow = "5h"
 	}
-	if sp.Valid {
-		account.SecondaryUsedPercent = &sp.Float64
+	if primary.Source != "" {
+		account.PrimaryQuotaSource = primary.Source
+		account.PrimaryQuotaObservedFrom = quotaObservedFrom(primary.Source)
 	}
-	if sr.Valid {
-		account.SecondaryResetAt = &sr.Int64
+	if secondary.Percent.Valid {
+		account.SecondaryUsedPercent = &secondary.Percent.Float64
+	}
+	if secondary.ResetAt.Valid {
+		account.SecondaryResetAt = &secondary.ResetAt.Int64
+	}
+	if secondary.Source != "" {
+		account.SecondaryQuotaSource = secondary.Source
+		account.SecondaryQuotaObservedFrom = quotaObservedFrom(secondary.Source)
 	}
 }
 
-func queryAccountWindowTokens(ctx context.Context, db *sql.DB, account accountRow, reset sql.NullInt64, duration time.Duration) int64 {
+func quotaObservedFrom(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "usage":
+		return "response_header"
+	case "trigger":
+		return "quota_trigger"
+	default:
+		return source
+	}
+}
+
+func applyAccountQuotaSource(account *accountRow) {
+	if account.SecondaryQuotaEstimateSource != "" {
+		account.QuotaSource = account.SecondaryQuotaEstimateSource
+		account.QuotaCredibility = account.SecondaryQuotaEstimateSource
+		return
+	}
+	if account.SecondaryQuotaSource != "" {
+		account.QuotaSource = account.SecondaryQuotaSource
+		account.QuotaCredibility = account.SecondaryQuotaSource
+		return
+	}
+	if account.PrimaryQuotaSource != "" {
+		account.QuotaSource = account.PrimaryQuotaSource
+		account.QuotaCredibility = account.PrimaryQuotaSource
+		return
+	}
+	account.QuotaSource = ""
+	account.QuotaCredibility = ""
+}
+
+func queryAccountWindowTokens(ctx context.Context, db *sql.DB, account accountRow, reset sql.NullInt64, duration time.Duration, aliases []string) int64 {
 	if !reset.Valid || reset.Int64 <= 0 {
 		return 0
 	}
@@ -1207,10 +1710,14 @@ func queryAccountWindowTokens(ctx context.Context, db *sql.DB, account accountRo
 		return 0
 	}
 	start := end - int64(duration.Seconds())
-	return queryAccountTokensBetween(ctx, db, account, start, end)
+	now := time.Now().Unix()
+	if start > now {
+		start = now - int64(duration.Seconds())
+	}
+	return queryAccountTokensBetween(ctx, db, account, start, end, aliases)
 }
 
-func queryAccountTokensBetween(ctx context.Context, db *sql.DB, account accountRow, start int64, end int64) int64 {
+func queryAccountTokensBetween(ctx context.Context, db *sql.DB, account accountRow, start int64, end int64, aliases []string) int64 {
 	if end <= 0 {
 		end = time.Now().Unix()
 	}
@@ -1220,17 +1727,38 @@ func queryAccountTokensBetween(ctx context.Context, db *sql.DB, account accountR
 	if end < start {
 		return 0
 	}
+	if len(aliases) == 0 {
+		aliases = accountAliases(account)
+	}
+	if len(aliases) == 0 {
+		return 0
+	}
+	placeholders := sqlPlaceholders(len(aliases))
+	args := make([]any, 0, 2+len(aliases)*3)
+	args = append(args, start, end)
+	for i := 0; i < 3; i++ {
+		for _, alias := range aliases {
+			args = append(args, alias)
+		}
+	}
 	var total int64
 	_ = db.QueryRowContext(ctx, `
 SELECT COALESCE(SUM(total_tokens),0)
 FROM usage_events
 WHERE requested_at >= ? AND requested_at <= ?
 AND (
-  (auth_index <> '' AND auth_index = ?)
-  OR (auth_id <> '' AND auth_id = ?)
-  OR (source <> '' AND source = ?)
-)`, start, end, account.AuthIndex, account.AuthID, account.Source).Scan(&total)
+  (auth_index <> '' AND lower(auth_index) IN (`+placeholders+`))
+  OR (auth_id <> '' AND lower(auth_id) IN (`+placeholders+`))
+  OR (source <> '' AND lower(source) IN (`+placeholders+`))
+)`, args...).Scan(&total)
 	return total
+}
+
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return "NULL"
+	}
+	return strings.TrimRight(strings.Repeat("?,", n), ",")
 }
 
 func secondaryQuotaDuration(account accountRow, reset sql.NullInt64) time.Duration {
@@ -1251,6 +1779,16 @@ func secondaryQuotaWindowLabel(duration time.Duration) string {
 		return "month"
 	}
 	return "7d"
+}
+
+func secondaryQuotaWindowSource(account accountRow, reset sql.NullInt64, duration time.Duration) string {
+	if isFreePlan(account.PlanType) {
+		return "plan_type"
+	}
+	if reset.Valid && duration >= 28*24*time.Hour {
+		return "reset_duration"
+	}
+	return "default_7d"
 }
 
 func isFreePlan(plan string) bool {
@@ -1460,43 +1998,135 @@ func applyInvalidAuths(accounts []accountRow, invalids []invalidAuthRow) {
 		return
 	}
 	index := make(map[string]int, len(accounts)*4)
+	strictIndex := make(map[string]int, len(accounts)*2)
 	for i := range accounts {
 		for _, alias := range accountAliases(accounts[i]) {
 			if alias != "" {
 				index[alias] = i
 			}
 		}
+		for _, alias := range normalizeAccountAliases(accounts[i].AuthFile, accounts[i].AuthIndex) {
+			if alias != "" {
+				if _, exists := strictIndex[alias]; !exists {
+					strictIndex[alias] = i
+				}
+			}
+		}
 	}
 	for _, invalid := range invalids {
+		matched := false
+		for _, alias := range normalizeAccountAliases(invalid.AuthFile, invalid.AuthIndex) {
+			i, ok := strictIndex[alias]
+			if !ok {
+				continue
+			}
+			applyInvalidAuthToAccount(&accounts[i], invalid)
+			matched = true
+			break
+		}
+		if matched {
+			continue
+		}
 		for _, alias := range normalizeAccountAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
 			i, ok := index[alias]
 			if !ok {
 				continue
 			}
-			accounts[i].InvalidAuth = true
-			accounts[i].InvalidAuthAt = invalid.InvalidatedAtText
-			accounts[i].InvalidAuthReason = invalid.Reason
+			applyInvalidAuthToAccount(&accounts[i], invalid)
 			break
 		}
 	}
 }
 
+func applyInvalidAuthToAccount(account *accountRow, invalid invalidAuthRow) {
+	if account == nil {
+		return
+	}
+	if invalidAuthIsWorkspaceDeactivated(invalid) {
+		account.WorkspaceDeactivated = true
+		account.WorkspaceDeactivatedAt = invalid.InvalidatedAtText
+		account.WorkspaceDeactivatedReason = invalid.Reason
+	} else {
+		account.InvalidAuth = true
+		account.InvalidAuthAt = invalid.InvalidatedAtText
+		account.InvalidAuthReason = invalid.Reason
+	}
+}
+
+func invalidAuthIsWorkspaceDeactivated(row invalidAuthRow) bool {
+	if row.LastStatusCode == http.StatusPaymentRequired {
+		return true
+	}
+	return strings.Contains(strings.ToLower(row.Reason), "deactivated_workspace")
+}
+
+func filterUnauthorizedInvalidAuths(rows []invalidAuthRow) []invalidAuthRow {
+	if len(rows) == 0 {
+		return rows
+	}
+	out := make([]invalidAuthRow, 0, len(rows))
+	for _, row := range rows {
+		if !invalidAuthIsWorkspaceDeactivated(row) {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func filterWorkspaceDeactivatedAuths(rows []invalidAuthRow) []invalidAuthRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]invalidAuthRow, 0, len(rows))
+	for _, row := range rows {
+		if invalidAuthIsWorkspaceDeactivated(row) {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
 func applyLatestQuotaSnapshots(ctx context.Context, db *sql.DB, accounts []accountRow, since int64) {
+	primarySnapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, accounts, since, "primary")
+	secondarySnapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, accounts, since, "secondary")
+	quotaAliases := accountQuotaAliasSets(accounts)
 	for i := range accounts {
-		pp, pr := queryLatestAccountWindowQuota(ctx, db, accounts[i], since, "primary")
-		sp, sr := queryLatestAccountWindowQuota(ctx, db, accounts[i], since, "secondary")
+		primary := primarySnapshots[i]
+		secondary := secondarySnapshots[i]
+		primary, secondary = moveMonthlyPrimaryQuotaToSecondary(accounts[i], primary, secondary)
 		accounts[i].PrimaryUsedPercent = nil
 		accounts[i].PrimaryResetAt = nil
+		accounts[i].PrimaryQuotaWindow = ""
+		accounts[i].PrimaryQuotaSource = ""
+		accounts[i].PrimaryQuotaObservedFrom = ""
 		accounts[i].SecondaryUsedPercent = nil
 		accounts[i].SecondaryResetAt = nil
+		accounts[i].SecondaryQuotaSource = ""
+		accounts[i].SecondaryQuotaObservedFrom = ""
 		accounts[i].PrimaryWindowTokens = 0
 		accounts[i].SecondaryWindowTokens = 0
-		applyAccountQuotaSnapshot(&accounts[i], pp, pr, sp, sr)
-		accounts[i].PrimaryWindowTokens = queryAccountWindowTokens(ctx, db, accounts[i], pr, 5*time.Hour)
-		secondaryDuration := secondaryQuotaDuration(accounts[i], sr)
-		accounts[i].SecondaryWindowTokens = queryAccountWindowTokens(ctx, db, accounts[i], sr, secondaryDuration)
+		applyAccountQuotaSnapshot(&accounts[i], primary, secondary)
+		accounts[i].PrimaryWindowTokens = queryAccountWindowTokens(ctx, db, accounts[i], primary.ResetAt, 5*time.Hour, quotaAliases[i])
+		secondaryDuration := secondaryQuotaDuration(accounts[i], secondary.ResetAt)
+		accounts[i].SecondaryWindowTokens = queryAccountWindowTokens(ctx, db, accounts[i], secondary.ResetAt, secondaryDuration, quotaAliases[i])
 		accounts[i].SecondaryQuotaWindow = secondaryQuotaWindowLabel(secondaryDuration)
+		accounts[i].QuotaWindowSource = secondaryQuotaWindowSource(accounts[i], secondary.ResetAt, secondaryDuration)
+		applyAccountQuotaSource(&accounts[i])
 	}
+}
+
+func moveMonthlyPrimaryQuotaToSecondary(account accountRow, primary quotaWindowSnapshot, secondary quotaWindowSnapshot) (quotaWindowSnapshot, quotaWindowSnapshot) {
+	if !primary.Percent.Valid || !primary.ResetAt.Valid || secondary.ResetAt.Valid {
+		return primary, secondary
+	}
+	resetAt := normalizeUnixSeconds(primary.ResetAt.Int64)
+	if resetAt-time.Now().Unix() <= int64(8*24*time.Hour/time.Second) {
+		return primary, secondary
+	}
+	secondary = primary
+	secondary.ResetAt = sql.NullInt64{Int64: resetAt, Valid: true}
+	primary = quotaWindowSnapshot{}
+	return primary, secondary
 }
 
 func queryRecentQuotaTriggerRuns(ctx context.Context, db *sql.DB, limit int) ([]quotaTriggerAccountStatus, error) {
@@ -1565,7 +2195,7 @@ func applyAccountQuotaToAutobans(bans []autobanRow, accounts []accountRow) {
 	}
 	for i := range bans {
 		match := -1
-		for _, alias := range normalizeAccountAliases(bans[i].AuthID, bans[i].AuthIndex, bans[i].Source) {
+		for _, alias := range normalizeAccountAliases(bans[i].AuthID, bans[i].AuthIndex, bans[i].Source, bans[i].AuthFile) {
 			if accountIndex, ok := index[alias]; ok {
 				match = accountIndex
 				break
@@ -1587,12 +2217,33 @@ func applySecondaryQuotaEstimates(ctx context.Context, db *sql.DB, accounts []ac
 		return
 	}
 	var estimatedAccounts int64
+	capacities := latestSecondaryQuotaTriggerCapacities(ctx, db, accounts, since)
+	quotaAliases := accountQuotaAliasSets(accounts)
 	for i := range accounts {
-		total, remaining := latestSecondaryQuotaTriggerCapacity(ctx, db, accounts[i], since)
-		if total <= 0 {
-			total, remaining = estimateQuotaFromUsedPercent(accounts[i].SecondaryWindowTokens, accounts[i].SecondaryUsedPercent)
+		accounts[i].SecondaryQuotaEstimateSource = ""
+		accounts[i].SecondaryQuotaEstimateMethod = ""
+		accounts[i].QuotaEstimateNote = ""
+		total, remaining := int64(0), int64(0)
+		if capacity, ok := capacities[i]; ok {
+			total, remaining = adjustedSecondaryQuotaTriggerCapacity(ctx, db, accounts[i], capacity, quotaAliases[i])
 		}
 		if total <= 0 {
+			total, remaining = estimateQuotaFromUsedPercent(accounts[i].SecondaryWindowTokens, accounts[i].SecondaryUsedPercent)
+			if total > 0 {
+				accounts[i].SecondaryQuotaEstimateSource = "estimated"
+				accounts[i].SecondaryQuotaEstimateMethod = "local_tokens_percent_estimate"
+			}
+		} else {
+			accounts[i].SecondaryQuotaEstimateSource = "trigger"
+			accounts[i].SecondaryQuotaEstimateMethod = "quota_trigger_capacity"
+		}
+		if total <= 0 {
+			if accounts[i].SecondaryUsedPercent != nil && accounts[i].SecondaryWindowTokens <= 0 {
+				accounts[i].QuotaCredibility = "insufficient_local_tokens"
+				accounts[i].SecondaryQuotaEstimateMethod = "not_enough_local_tokens"
+				accounts[i].QuotaEstimateNote = "无足够本地 token，无法估算总额"
+			}
+			applyAccountQuotaSource(&accounts[i])
 			continue
 		}
 		accounts[i].SecondaryQuotaTotalEstimate = total
@@ -1600,55 +2251,96 @@ func applySecondaryQuotaEstimates(ctx context.Context, db *sql.DB, accounts []ac
 		totals.SecondaryQuotaTotalEstimate += total
 		totals.SecondaryQuotaRemainingEstimate += remaining
 		estimatedAccounts++
+		applyAccountQuotaSource(&accounts[i])
 	}
 	totals.SecondaryQuotaEstimatedAccounts = estimatedAccounts
 }
 
+type secondaryQuotaCapacitySnapshot struct {
+	Total      int64
+	Remaining  int64
+	ResetAt    sql.NullInt64
+	FinishedAt int64
+}
+
 func latestSecondaryQuotaTriggerCapacity(ctx context.Context, db *sql.DB, account accountRow, since int64) (int64, int64) {
-	var limit, remaining sql.NullInt64
-	var reset sql.NullInt64
-	var finishedAt int64
-	err := db.QueryRowContext(ctx, `
-SELECT secondary_limit_tokens, secondary_remaining_tokens, secondary_reset_at, finished_at
+	capacities := latestSecondaryQuotaTriggerCapacities(ctx, db, []accountRow{account}, since)
+	capacity, ok := capacities[0]
+	if !ok {
+		return 0, 0
+	}
+	return adjustedSecondaryQuotaTriggerCapacity(ctx, db, account, capacity, nil)
+}
+
+func latestSecondaryQuotaTriggerCapacities(ctx context.Context, db *sql.DB, accounts []accountRow, since int64) map[int]secondaryQuotaCapacitySnapshot {
+	out := make(map[int]secondaryQuotaCapacitySnapshot, len(accounts))
+	if len(accounts) == 0 {
+		return out
+	}
+	index := accountQuotaAliasIndex(accounts)
+	rows, err := db.QueryContext(ctx, `
+SELECT auth_index, auth_id, source, auth_file, secondary_limit_tokens, secondary_remaining_tokens, secondary_reset_at, finished_at
 FROM quota_trigger_runs
 WHERE finished_at >= ?
 AND status='success'
 AND (secondary_limit_tokens IS NOT NULL OR secondary_remaining_tokens IS NOT NULL)
-AND (
-  (auth_index <> '' AND auth_index = ?)
-  OR (auth_id <> '' AND auth_id = ?)
-  OR (source <> '' AND source = ?)
-  OR (auth_file <> '' AND auth_file = ?)
-)
-ORDER BY finished_at DESC, id DESC
-LIMIT 1`, since, account.AuthIndex, account.AuthID, account.Source, account.AuthFile).Scan(&limit, &remaining, &reset, &finishedAt)
+ORDER BY finished_at DESC, id DESC`, since)
 	if err != nil {
-		return 0, 0
+		return out
 	}
-	if reset.Valid && normalizeUnixSeconds(reset.Int64) <= time.Now().Unix() {
-		return 0, 0
+	defer rows.Close()
+	now := time.Now().Unix()
+	for rows.Next() {
+		var authIndex, authID, source, authFile string
+		var limit, remaining sql.NullInt64
+		var reset sql.NullInt64
+		var finishedAt int64
+		if err := rows.Scan(&authIndex, &authID, &source, &authFile, &limit, &remaining, &reset, &finishedAt); err != nil {
+			continue
+		}
+		if reset.Valid {
+			reset.Int64 = normalizeUnixSeconds(reset.Int64)
+			if reset.Int64 <= now {
+				continue
+			}
+		}
+		if !limit.Valid || limit.Int64 <= 0 || !remaining.Valid || remaining.Int64 < 0 || remaining.Int64 > limit.Int64 {
+			continue
+		}
+		capacity := secondaryQuotaCapacitySnapshot{
+			Total:      limit.Int64,
+			Remaining:  remaining.Int64,
+			ResetAt:    reset,
+			FinishedAt: finishedAt,
+		}
+		for _, alias := range normalizeAccountAliases(authIndex, authID, source, authFile) {
+			for _, accountIndex := range index[alias] {
+				if _, exists := out[accountIndex]; exists {
+					continue
+				}
+				out[accountIndex] = capacity
+			}
+		}
 	}
-	total := int64(0)
-	remain := int64(0)
-	if limit.Valid && limit.Int64 > 0 {
-		total = limit.Int64
-	}
-	if remaining.Valid && remaining.Int64 >= 0 {
-		remain = remaining.Int64
-	}
+	return out
+}
+
+func adjustedSecondaryQuotaTriggerCapacity(ctx context.Context, db *sql.DB, account accountRow, capacity secondaryQuotaCapacitySnapshot, aliases []string) (int64, int64) {
+	total := capacity.Total
+	remain := capacity.Remaining
 	if total <= 0 || remain > total {
 		return 0, 0
 	}
-	duration := secondaryQuotaDuration(account, reset)
-	windowStart := normalizeUnixSeconds(reset.Int64) - int64(duration.Seconds())
+	duration := secondaryQuotaDuration(account, capacity.ResetAt)
+	windowStart := normalizeUnixSeconds(capacity.ResetAt.Int64) - int64(duration.Seconds())
 	if windowStart < 0 {
 		windowStart = 0
 	}
-	start := finishedAt
+	start := capacity.FinishedAt
 	if start < windowStart {
 		start = windowStart
 	}
-	if usedAfterSnapshot := queryAccountTokensBetween(ctx, db, account, start+1, time.Now().Unix()); usedAfterSnapshot > 0 {
+	if usedAfterSnapshot := queryAccountTokensBetween(ctx, db, account, start+1, time.Now().Unix(), aliases); usedAfterSnapshot > 0 {
 		remain -= usedAfterSnapshot
 		if remain < 0 {
 			remain = 0
@@ -1736,28 +2428,56 @@ func cpaProviderSQL() string {
 
 func cpaProviderSQLWithEntries(entries []providerConfigEntry) string {
 	tail := "substr(auth_id, length('openai-compatibility:') + 1)"
-	var codexAPIKeyCases strings.Builder
+	var apiKeyCases strings.Builder
 	for _, entry := range entries {
-		if !strings.EqualFold(entry.Provider, "Codex") || strings.TrimSpace(entry.APIKey) == "" || strings.TrimSpace(entry.Name) == "" {
+		provider := strings.TrimSpace(entry.Provider)
+		apiKey := strings.TrimSpace(entry.APIKey)
+		name := strings.TrimSpace(entry.Name)
+		if provider == "" || apiKey == "" || name == "" {
 			continue
 		}
-		codexAPIKeyCases.WriteString("WHEN lower(provider) = 'codex' AND lower(auth_type) IN ('apikey', 'api_key', 'key') AND source = ")
-		codexAPIKeyCases.WriteString(sqlQuote(entry.APIKey))
-		codexAPIKeyCases.WriteString(" THEN ")
-		codexAPIKeyCases.WriteString(sqlQuote(entry.Name))
-		codexAPIKeyCases.WriteString("\n")
+		if !providerSupportsAPIKeyEndpointName(provider) {
+			continue
+		}
+		apiKeyCases.WriteString("WHEN ")
+		apiKeyCases.WriteString(providerSQLPredicate(provider))
+		apiKeyCases.WriteString(" AND lower(auth_type) IN ('apikey', 'api_key', 'key') AND source = ")
+		apiKeyCases.WriteString(sqlQuote(apiKey))
+		apiKeyCases.WriteString(" THEN ")
+		apiKeyCases.WriteString(sqlQuote(name))
+		apiKeyCases.WriteString("\n")
 	}
 	return `CASE
 WHEN auth_id LIKE 'openai-compatibility:%:%' THEN substr(` + tail + `, 1, instr(` + tail + `, ':') - 1)
 WHEN provider LIKE 'openai-compatible-%' THEN substr(provider, length('openai-compatible-') + 1)
 WHEN provider LIKE 'openai-compatibility-%' THEN substr(provider, length('openai-compatibility-') + 1)
 WHEN lower(provider) IN ('openai-compatible', 'openai-compatibility') AND source <> '' AND source NOT LIKE 'sk-%' AND source NOT LIKE 'ark-%' AND source NOT LIKE 'Bearer %' THEN source
+` + apiKeyCases.String() + `
 WHEN lower(provider) IN ('anthropic', 'claude') THEN 'Claude'
 WHEN lower(provider) LIKE 'gemini%' THEN 'Gemini'
-` + codexAPIKeyCases.String() + `
 WHEN lower(provider) = 'codex' THEN 'Codex'
 ELSE COALESCE(NULLIF(provider,''), 'unknown')
 END`
+}
+
+func providerSupportsAPIKeyEndpointName(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "claude", "gemini", "antigravity":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerSQLPredicate(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		return "lower(provider) IN ('anthropic', 'claude')"
+	case "gemini":
+		return "lower(provider) LIKE 'gemini%'"
+	default:
+		return "lower(provider) = " + sqlQuote(strings.ToLower(strings.TrimSpace(provider)))
+	}
 }
 
 func sqlQuote(value string) string {

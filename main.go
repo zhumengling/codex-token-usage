@@ -66,7 +66,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.14"
+	pluginVersion    = "0.1.15"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -75,6 +75,8 @@ var globalStore = &store{}
 var globalQuotaTrigger = &quotaTriggerManager{}
 var globalModelPriceUpdater = &modelPriceUpdateManager{}
 var globalRetentionCleaner = &retentionCleaner{}
+var globalSchedulerDiagnostics = &schedulerDiagnosticsTracker{}
+var globalSummaryPrecomputer = &summaryPrecomputeManager{}
 var codexQuotaURLOverrideForTest string
 var codexResponsesURLOverrideForTest string
 
@@ -135,6 +137,8 @@ type pluginConfig struct {
 	UsageRetentionDays                    int
 	QuotaTriggerRetentionDays             int
 	RequestDetailRetentionDays            int
+	SummaryPrecomputeEnabled              bool
+	SummaryPrecomputeIntervalSeconds      int
 }
 
 type quotaTriggerState struct {
@@ -317,6 +321,7 @@ func cliproxyPluginShutdown() {
 	globalQuotaTrigger.stop()
 	globalModelPriceUpdater.stop()
 	globalRetentionCleaner.stop()
+	globalSummaryPrecomputer.stop()
 	globalStore.close()
 }
 
@@ -397,6 +402,8 @@ func pluginConfigFields() []configField {
 		{Name: "用量保留天数", Type: "number", Description: "usage_events 保留天数，单位天。默认 90。"},
 		{Name: "额度触发记录保留天数", Type: "number", Description: "quota_trigger_runs 保留天数，单位天。默认 30。"},
 		{Name: "请求明细保留天数", Type: "number", Description: "请求明细保留天数，当前随 usage_events 保守保留。默认 30。"},
+		{Name: "开启后台预计算", Type: "boolean", Description: "是否后台预热常用 summary，减少页面首次等待。默认开启。"},
+		{Name: "预计算间隔秒数", Type: "number", Description: "后台 summary 预热间隔，单位秒。默认 30。"},
 	}
 }
 
@@ -411,7 +418,14 @@ func handleManagement(req managementRequest) managementResponse {
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/summary") {
 		window := firstQuery(req.Query, "window", "24h")
 		limit := parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000)
-		data, err := globalStore.summary(context.Background(), window, limit)
+		forceRefresh := parseBoolString(firstQuery(req.Query, "refresh", "false"), false)
+		var data map[string]any
+		var err error
+		if forceRefresh {
+			data, err = globalSummaryPrecomputer.summaryFresh(context.Background(), globalStore, window, limit)
+		} else {
+			data, err = globalSummaryPrecomputer.summary(context.Background(), globalStore, window, limit)
+		}
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
 		}
@@ -467,6 +481,8 @@ func defaultPluginConfig() pluginConfig {
 		UsageRetentionDays:                    90,
 		QuotaTriggerRetentionDays:             30,
 		RequestDetailRetentionDays:            30,
+		SummaryPrecomputeEnabled:              true,
+		SummaryPrecomputeIntervalSeconds:      30,
 	}
 }
 
@@ -489,6 +505,7 @@ func configurePlugin(request []byte) error {
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
 	globalRetentionCleaner.configure(cfg)
+	globalSummaryPrecomputer.configure(cfg)
 	return nil
 }
 
@@ -551,6 +568,12 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	if value, ok := configValue(values, "request_detail_retention_days", "请求明细保留天数"); ok {
 		cfg.RequestDetailRetentionDays = parseInt(value, cfg.RequestDetailRetentionDays, 1, 3650)
 	}
+	if value, ok := configValue(values, "summary_precompute_enabled", "开启后台预计算"); ok {
+		cfg.SummaryPrecomputeEnabled = parseBoolString(value, cfg.SummaryPrecomputeEnabled)
+	}
+	if value, ok := configValue(values, "summary_precompute_interval_seconds", "预计算间隔秒数"); ok {
+		cfg.SummaryPrecomputeIntervalSeconds = parseInt(value, cfg.SummaryPrecomputeIntervalSeconds, 5, 3600)
+	}
 	return cfg
 }
 
@@ -573,6 +596,7 @@ func normalizePluginConfig(cfg pluginConfig) pluginConfig {
 	cfg.UsageRetentionDays = clampInt(cfg.UsageRetentionDays, 7, 3650)
 	cfg.QuotaTriggerRetentionDays = clampInt(cfg.QuotaTriggerRetentionDays, 1, 3650)
 	cfg.RequestDetailRetentionDays = clampInt(cfg.RequestDetailRetentionDays, 1, 3650)
+	cfg.SummaryPrecomputeIntervalSeconds = clampInt(cfg.SummaryPrecomputeIntervalSeconds, 5, 3600)
 	if strings.TrimSpace(cfg.ModelPriceUpdateURL) == "" {
 		cfg.ModelPriceUpdateURL = defaultModelPriceURL
 	}
@@ -972,14 +996,18 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
 		return err
 	}
+	if err := clearRecoveredAuthStateIfNeeded(ctx, db, rec, status); err != nil {
+		return err
+	}
 	return recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset)
 }
 
 func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, status int) error {
-	if status != http.StatusUnauthorized {
+	if !strings.EqualFold(trim(rec.Provider), "codex") {
 		return nil
 	}
-	if !strings.EqualFold(trim(rec.Provider), "codex") {
+	reason := invalidAuthReasonForRecord(rec, status)
+	if reason == "" {
 		return nil
 	}
 	authID := firstNonEmptyString(rec.AuthID, rec.AuthIndex, rec.Source)
@@ -1000,13 +1028,78 @@ ON CONFLICT(auth_id) DO UPDATE SET
   reason=excluded.reason,
   invalidated_at=excluded.invalidated_at,
   active=1,
-  last_status_code=excluded.last_status_code,
+	last_status_code=excluded.last_status_code,
   auth_file=excluded.auth_file,
   auth_file_mtime=excluded.auth_file_mtime`,
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
-		"401 unauthorized: credential is invalid", now, status, authFile, authFileMTime,
+		reason, now, status, authFile, authFileMTime,
 	)
 	return err
+}
+
+func invalidAuthReasonForRecord(rec usageRecord, status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "401 unauthorized: credential is invalid"
+	case http.StatusPaymentRequired:
+		if codexWorkspaceDeactivatedBody(rec.Failure.Body) || codexAuthRecordLooksFileBacked(rec) {
+			return "402 deactivated_workspace: team workspace is deactivated"
+		}
+	}
+	return ""
+}
+
+func codexWorkspaceDeactivatedBody(body string) bool {
+	return strings.Contains(strings.ToLower(body), "deactivated_workspace")
+}
+
+func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, status int) error {
+	if !strings.EqualFold(trim(rec.Provider), "codex") {
+		return nil
+	}
+	if rec.Failed || !successfulStatusCode(status) {
+		return nil
+	}
+	for _, alias := range normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source) {
+		if alias == "" {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `
+UPDATE invalid_auths
+SET active=0
+WHERE active=1
+AND (
+  lower(auth_id)=?
+  OR lower(auth_index)=?
+  OR lower(source)=?
+  OR lower(auth_file)=?
+)`, alias, alias, alias, alias); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, `
+UPDATE autoban_bans
+SET active=0
+WHERE active=1
+AND (
+  lower(auth_id)=?
+  OR lower(auth_index)=?
+  OR lower(source)=?
+)`, alias, alias, alias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func successfulStatusCode(status int) bool {
+	return status == 0 || (status >= 200 && status < 300)
+}
+
+func codexAuthRecordLooksFileBacked(rec usageRecord) bool {
+	if authFile, _ := authFileStateForRecord(rec); authFile != "" {
+		return true
+	}
+	return fileBackedAuthState(rec.AuthID, rec.AuthIndex, rec.Source)
 }
 
 func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, status int, primaryPct *float64, primaryReset *int64, secondaryPct *float64, secondaryReset *int64) error {
@@ -1125,6 +1218,7 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 	if err != nil {
 		return nil, 0, err
 	}
+	effectiveBans := mergeEffectiveAutobans(bans, invalids)
 	externalAlerts, err := queryExternalUseAlerts(ctx, db, time.Now().Add(-24*time.Hour).Unix())
 	if err != nil {
 		return nil, 0, err
@@ -1141,15 +1235,15 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 			skipped++
 			continue
 		}
-		isBanned := configuredMatchesAutoban(account.configuredAccount, bans)
+		isBanned := configuredMatchesAutoban(account.configuredAccount, effectiveBans)
 		if configuredMatchesInvalidAuth(account.configuredAccount, invalids) || configuredMatchesExternalAlert(account.configuredAccount, externalAlerts) {
 			skipped++
 			continue
 		}
 		row := accountRow{AuthIndex: account.AuthIndex, AuthID: account.AuthID, Source: account.Source, AuthFile: account.AuthFile, Email: account.Email, Name: account.Name}
-		pp, pr := queryLatestAccountWindowQuota(ctx, db, row, 0, "primary")
-		sp, sr := queryLatestAccountWindowQuota(ctx, db, row, 0, "secondary")
-		if !isBanned && (quotaWindowFull(pp, pr) || quotaWindowFull(sp, sr)) {
+		primary := queryLatestAccountWindowQuota(ctx, db, row, 0, "primary")
+		secondary := queryLatestAccountWindowQuota(ctx, db, row, 0, "secondary")
+		if !isBanned && (quotaWindowFull(primary.Percent, primary.ResetAt) || quotaWindowFull(secondary.Percent, secondary.ResetAt)) {
 			skipped++
 			continue
 		}
@@ -1247,9 +1341,16 @@ func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, account triggerAu
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		run.Status = "success"
+		_ = clearRecoveredAuthStateIfNeeded(context.Background(), db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusUnauthorized:
 		run.Status = "failed"
 		run.Error = "401 unauthorized: credential is invalid"
+		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
+	case resp.StatusCode == http.StatusPaymentRequired && codexWorkspaceDeactivatedBody(string(respBody)):
+		run.Status = "failed"
+		run.Error = "402 deactivated_workspace: team workspace is deactivated"
+		rec.Failed = true
+		rec.Failure = usageFailure{StatusCode: resp.StatusCode, Body: string(respBody)}
 		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		run.Status = "failed"
@@ -1403,9 +1504,16 @@ func executeQuotaUsageRequest(ctx context.Context, db *sql.DB, account triggerAu
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		run.Status = "success"
+		_ = clearRecoveredAuthStateIfNeeded(context.Background(), db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusUnauthorized:
 		run.Status = "failed"
 		run.Error = "401 unauthorized: credential is invalid"
+		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
+	case resp.StatusCode == http.StatusPaymentRequired && codexWorkspaceDeactivatedBody(string(body)):
+		run.Status = "failed"
+		run.Error = "402 deactivated_workspace: team workspace is deactivated"
+		rec.Failed = true
+		rec.Failure = usageFailure{StatusCode: resp.StatusCode, Body: string(body)}
 		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		run.Status = "failed"
@@ -1477,7 +1585,7 @@ func configuredMatchesInvalidAuth(cfg configuredAccount, invalids []invalidAuthR
 func configuredMatchesAutoban(cfg configuredAccount, bans []autobanRow) bool {
 	for _, ban := range bans {
 		for _, left := range configuredAliases(cfg) {
-			for _, right := range normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source) {
+			for _, right := range normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
 				if left != "" && left == right {
 					return true
 				}
@@ -1791,28 +1899,34 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 	if len(bans) == 0 && len(invalids) == 0 {
 		return schedulerPickResponse{Handled: false}, nil
 	}
+	effectiveBans := mergeEffectiveAutobans(bans, invalids)
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
 	filtered := false
+	banFilteredCandidates := 0
+	matchedBanIndexes := map[int]bool{}
 	for _, candidate := range req.Candidates {
 		if !strings.EqualFold(candidate.Provider, "codex") {
 			available = append(available, candidate)
 			continue
 		}
-		if candidateMatchesActiveBan(candidate, bans) {
+		if matched, indexes := candidateMatchesActiveBanIndexes(candidate, effectiveBans); matched {
 			filtered = true
-			continue
-		}
-		if candidateMatchesInvalidAuth(candidate, invalids) {
-			filtered = true
+			banFilteredCandidates++
+			for _, index := range indexes {
+				matchedBanIndexes[index] = true
+			}
 			continue
 		}
 		available = append(available, candidate)
+	}
+	if banFilteredCandidates > 0 {
+		globalSchedulerDiagnostics.record(len(effectiveBans), banFilteredCandidates, maxInt(0, len(effectiveBans)-len(matchedBanIndexes)))
 	}
 	if !filtered {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
-		return schedulerPickResponse{}, newNoAvailableCodexAuthError(bans, now)
+		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
 	}
 	chosen := available[0]
 	for _, candidate := range available[1:] {
@@ -1824,7 +1938,7 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 }
 
 func newNoAvailableCodexAuthError(bans []autobanRow, now int64) error {
-	message := "no available Codex auth candidates: all candidates are auto-banned by 429 or marked invalid"
+	message := "no available Codex auth candidates: all candidates are auto-banned by 429/401/402"
 	if resetAt := earliestActiveBanReset(bans, now); resetAt > 0 {
 		message += "; earliest autoban reset at " + unixTime(resetAt)
 	}
@@ -1871,25 +1985,30 @@ func reconcileAutobansWithQuotaSnapshots(ctx context.Context, db *sql.DB, now in
 	if err != nil {
 		return err
 	}
-	for _, ban := range bans {
-		account := accountRow{
+	accounts := make([]accountRow, len(bans))
+	for i, ban := range bans {
+		accounts[i] = accountRow{
 			AuthID:    ban.AuthID,
 			AuthIndex: ban.AuthIndex,
 			Source:    ban.Source,
 			Provider:  ban.Provider,
 		}
-		pp, pr := queryLatestAccountWindowQuota(ctx, db, account, 0, "primary")
-		sp, sr := queryLatestAccountWindowQuota(ctx, db, account, 0, "secondary")
+	}
+	primarySnapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, accounts, 0, "primary")
+	secondarySnapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, accounts, 0, "secondary")
+	for i, ban := range bans {
+		primary := primarySnapshots[i]
+		secondary := secondarySnapshots[i]
 		shouldRelease := false
 		switch strings.ToLower(strings.TrimSpace(ban.Window)) {
 		case "5h", "primary":
-			shouldRelease = quotaWindowObserved(pp, pr) && !quotaWindowFull(pp, pr)
+			shouldRelease = quotaWindowObserved(primary.Percent, primary.ResetAt) && !quotaWindowFull(primary.Percent, primary.ResetAt)
 		case "week", "7d", "secondary":
-			shouldRelease = quotaWindowObserved(sp, sr) && !quotaWindowFull(sp, sr)
+			shouldRelease = quotaWindowObserved(secondary.Percent, secondary.ResetAt) && !quotaWindowFull(secondary.Percent, secondary.ResetAt)
 		default:
-			primaryObserved := quotaWindowObserved(pp, pr)
-			secondaryObserved := quotaWindowObserved(sp, sr)
-			shouldRelease = (primaryObserved || secondaryObserved) && !quotaWindowFull(pp, pr) && !quotaWindowFull(sp, sr)
+			primaryObserved := quotaWindowObserved(primary.Percent, primary.ResetAt)
+			secondaryObserved := quotaWindowObserved(secondary.Percent, secondary.ResetAt)
+			shouldRelease = (primaryObserved || secondaryObserved) && !quotaWindowFull(primary.Percent, primary.ResetAt) && !quotaWindowFull(secondary.Percent, secondary.ResetAt)
 		}
 		if !shouldRelease {
 			continue
@@ -1901,7 +2020,7 @@ SET active=0,
   primary_reset_at=?,
   secondary_used_percent=?,
   secondary_reset_at=?
-WHERE active=1 AND auth_id=?`, nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp), nullIntPtr(sr), ban.AuthID)
+WHERE active=1 AND auth_id=?`, nullFloatPtr(primary.Percent), nullIntPtr(primary.ResetAt), nullFloatPtr(secondary.Percent), nullIntPtr(secondary.ResetAt), ban.AuthID)
 		if err != nil {
 			return err
 		}
@@ -1911,10 +2030,22 @@ WHERE active=1 AND auth_id=?`, nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp
 
 func backfillAutobansFromUsage(ctx context.Context, db *sql.DB, now int64) error {
 	rows, err := db.QueryContext(ctx, `
+WITH latest AS (
+  SELECT
+    auth_id, auth_index, source, provider, requested_at, status_code, failed,
+    primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
+    ROW_NUMBER() OVER (
+      PARTITION BY lower(COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')))
+      ORDER BY requested_at DESC, id DESC
+    ) AS rn
+  FROM usage_events
+  WHERE provider='codex'
+    AND COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')) <> ''
+)
 SELECT auth_id, auth_index, source, provider, requested_at, status_code,
 primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
-FROM usage_events
-WHERE provider='codex'
+FROM latest
+WHERE rn=1
   AND failed=1
   AND status_code=429
   AND (
@@ -1942,6 +2073,15 @@ LIMIT 1000`, now, now)
 		}
 		resetAt, window, reason := classifyStoredCodexBan(pp, pr, sp, sr, now)
 		if resetAt <= now {
+			continue
+		}
+		rec := usageRecord{
+			Provider:  provider,
+			AuthID:    authID,
+			AuthIndex: authIndex,
+			Source:    source,
+		}
+		if hasLaterSuccessfulUsage(ctx, db, rec, requestedAt) {
 			continue
 		}
 		_, err := db.ExecContext(ctx, `
@@ -1972,6 +2112,119 @@ WHERE autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at`,
 		}
 	}
 	return rows.Err()
+}
+
+func backfillWorkspaceDeactivatedAuthsFromUsage(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `
+WITH latest AS (
+  SELECT
+    auth_id, auth_index, source, provider, requested_at, status_code, failed,
+    ROW_NUMBER() OVER (
+      PARTITION BY lower(COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')))
+      ORDER BY requested_at DESC, id DESC
+    ) AS rn
+  FROM usage_events
+  WHERE provider='codex'
+    AND COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')) <> ''
+)
+SELECT auth_id, auth_index, source, provider, requested_at, status_code
+FROM latest
+WHERE rn=1 AND failed=1 AND status_code=402
+ORDER BY requested_at DESC
+LIMIT 1000`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rec usageRecord
+		var requestedAt int64
+		var status int
+		if err := rows.Scan(&rec.AuthID, &rec.AuthIndex, &rec.Source, &rec.Provider, &requestedAt, &status); err != nil {
+			return err
+		}
+		rec.RequestedAt = time.Unix(requestedAt, 0)
+		rec.Failed = true
+		rec.Failure = usageFailure{StatusCode: status}
+		if !codexAuthRecordLooksFileBacked(rec) {
+			continue
+		}
+		if authFile, authFileMTime := authFileStateForRecord(rec); authFileMTime > requestedAt && authFile != "" {
+			continue
+		}
+		if hasLaterSuccessfulUsage(ctx, db, rec, requestedAt) {
+			continue
+		}
+		if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func hasLaterSuccessfulUsage(ctx context.Context, db *sql.DB, rec usageRecord, after int64) bool {
+	for _, alias := range normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source) {
+		if alias == "" {
+			continue
+		}
+		var count int
+		err := db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM usage_events
+WHERE provider='codex'
+  AND requested_at > ?
+  AND failed=0
+  AND (status_code=0 OR (status_code >= 200 AND status_code < 300))
+  AND (
+    lower(auth_id)=?
+    OR lower(auth_index)=?
+    OR lower(source)=?
+  )`, after, alias, alias, alias).Scan(&count)
+		if err == nil && count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
+	invalids, err := queryActiveInvalidAuths(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, invalid := range invalids {
+		rec := usageRecord{
+			Provider:  firstNonEmptyString(invalid.Provider, "codex"),
+			AuthID:    invalid.AuthID,
+			AuthIndex: invalid.AuthIndex,
+			Source:    invalid.Source,
+		}
+		if !hasLaterSuccessfulUsage(ctx, db, rec, invalid.InvalidatedAt) {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+			return err
+		}
+	}
+	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	for _, ban := range bans {
+		rec := usageRecord{
+			Provider:  firstNonEmptyString(ban.Provider, "codex"),
+			AuthID:    ban.AuthID,
+			AuthIndex: ban.AuthIndex,
+			Source:    ban.Source,
+		}
+		if !hasLaterSuccessfulUsage(ctx, db, rec, ban.BannedAt) {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func classifyStoredCodexBan(pp sql.NullFloat64, pr sql.NullInt64, sp sql.NullFloat64, sr sql.NullInt64, now int64) (int64, string, string) {
@@ -2039,6 +2292,85 @@ AND (
 	return nil
 }
 
+func clearMissingConfiguredAuthState(ctx context.Context, db *sql.DB, configured []configuredAccount, authDirReadable bool) error {
+	if !authDirReadable {
+		return nil
+	}
+	aliases := configuredAliasSet(configured)
+	if err := clearMissingInvalidAuths(ctx, db, aliases); err != nil {
+		return err
+	}
+	return clearMissingAutobans(ctx, db, aliases)
+}
+
+func configuredAliasSet(configured []configuredAccount) map[string]struct{} {
+	aliases := make(map[string]struct{}, len(configured)*6)
+	for _, cfg := range configured {
+		for _, alias := range configuredAliases(cfg) {
+			if alias != "" {
+				aliases[alias] = struct{}{}
+			}
+		}
+	}
+	return aliases
+}
+
+func aliasesContainAny(aliases map[string]struct{}, values ...string) bool {
+	for _, alias := range normalizeAccountAliases(values...) {
+		if _, ok := aliases[alias]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}) error {
+	invalids, err := queryActiveInvalidAuths(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, invalid := range invalids {
+		if !fileBackedAuthState(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
+			continue
+		}
+		if aliasesContainAny(configuredAliases, invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}) error {
+	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	for _, ban := range bans {
+		if !fileBackedAuthState(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
+			continue
+		}
+		if aliasesContainAny(configuredAliases, ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fileBackedAuthState(values ...string) bool {
+	for _, value := range values {
+		if fileNameIfJSON(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func queryActiveInvalidAuths(ctx context.Context, db *sql.DB) ([]invalidAuthRow, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file, auth_file_mtime
@@ -2065,35 +2397,32 @@ LIMIT 2000`)
 }
 
 func candidateMatchesActiveBan(candidate schedulerAuthCandidate, bans []autobanRow) bool {
-	candidateID := trim(candidate.ID)
-	authIndex := firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"]))
-	source := firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"]))
-	for _, ban := range bans {
-		if candidateID != "" && candidateID == ban.AuthID {
-			return true
-		}
-		if authIndex != "" && authIndex == ban.AuthIndex {
-			return true
-		}
-		if source != "" && source == ban.Source {
-			return true
-		}
+	matched, _ := candidateMatchesActiveBanIndexes(candidate, bans)
+	return matched
+}
+
+func candidateMatchesActiveBanIndexes(candidate schedulerAuthCandidate, bans []autobanRow) (bool, []int) {
+	aliases := schedulerCandidateAliases(candidate)
+	if len(aliases) == 0 {
+		return false, nil
 	}
-	return false
+	var indexes []int
+	for i, ban := range bans {
+		for _, banAlias := range normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
+			for _, alias := range aliases {
+				if alias != "" && alias == banAlias {
+					indexes = append(indexes, i)
+					goto nextBan
+				}
+			}
+		}
+	nextBan:
+	}
+	return len(indexes) > 0, indexes
 }
 
 func candidateMatchesInvalidAuth(candidate schedulerAuthCandidate, invalids []invalidAuthRow) bool {
-	aliases := normalizeAccountAliases(
-		candidate.ID,
-		candidate.Attributes["auth_index"],
-		candidate.Attributes["source"],
-		candidate.Attributes["auth_file"],
-		candidate.Attributes["email"],
-		stringFromAny(candidate.Metadata["auth_index"]),
-		stringFromAny(candidate.Metadata["source"]),
-		stringFromAny(candidate.Metadata["auth_file"]),
-		stringFromAny(candidate.Metadata["email"]),
-	)
+	aliases := schedulerCandidateAliases(candidate)
 	if len(aliases) == 0 {
 		return false
 	}
@@ -2107,6 +2436,22 @@ func candidateMatchesInvalidAuth(candidate schedulerAuthCandidate, invalids []in
 		}
 	}
 	return false
+}
+
+func schedulerCandidateAliases(candidate schedulerAuthCandidate) []string {
+	return accountIdentityAliases(accountIdentity{
+		AuthID:    candidate.ID,
+		AuthIndex: firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"])),
+		Source:    firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"])),
+		AuthFile:  firstNonEmptyString(candidate.Attributes["auth_file"], stringFromAny(candidate.Metadata["auth_file"])),
+		Email:     firstNonEmptyString(candidate.Attributes["email"], stringFromAny(candidate.Metadata["email"])),
+		Path: firstNonEmptyString(
+			candidate.Attributes["path"],
+			candidate.Attributes["file"],
+			stringFromAny(candidate.Metadata["path"]),
+			stringFromAny(candidate.Metadata["file"]),
+		),
+	})
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {

@@ -43,6 +43,40 @@ type authDiagnostics struct {
 	QuotaTriggerAvailable int `json:"quota_trigger_available"`
 }
 
+type schedulerDiagnostics struct {
+	ActiveBanCount      int    `json:"active_ban_count"`
+	FilteredCandidates  int    `json:"filtered_candidates"`
+	UnmatchedActiveBans int    `json:"unmatched_active_bans"`
+	LastFilteredAt      string `json:"last_filtered_at,omitempty"`
+}
+
+type schedulerDiagnosticsTracker struct {
+	mu    sync.Mutex
+	state schedulerDiagnostics
+}
+
+func (t *schedulerDiagnosticsTracker) record(activeBans int, filteredCandidates int, unmatchedActiveBans int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.state.ActiveBanCount = activeBans
+	t.state.FilteredCandidates = filteredCandidates
+	t.state.UnmatchedActiveBans = unmatchedActiveBans
+	if filteredCandidates > 0 {
+		t.state.LastFilteredAt = time.Now().Format(time.RFC3339)
+	}
+}
+
+func (t *schedulerDiagnosticsTracker) status(activeBans int) schedulerDiagnostics {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := t.state
+	out.ActiveBanCount = activeBans
+	if activeBans == 0 {
+		out.UnmatchedActiveBans = 0
+	}
+	return out
+}
+
 type providerDiagnostics struct {
 	Configured              int      `json:"configured"`
 	Observed                int      `json:"observed"`
@@ -72,6 +106,7 @@ type modelPriceDiagnostics struct {
 type diagnosticsSummary struct {
 	Database     databaseDiagnostics   `json:"database"`
 	AuthFiles    authDiagnostics       `json:"auth_files"`
+	Scheduler    schedulerDiagnostics  `json:"scheduler"`
 	Providers    providerDiagnostics   `json:"providers"`
 	ModelPrices  modelPriceDiagnostics `json:"model_prices"`
 	QuotaTrigger quotaTriggerState     `json:"quota_trigger"`
@@ -209,6 +244,7 @@ func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts [
 	return diagnosticsSummary{
 		Database:     queryDatabaseDiagnostics(ctx, db, dbPath),
 		AuthFiles:    buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
+		Scheduler:    globalSchedulerDiagnostics.status(len(autobans)),
 		Providers:    buildProviderDiagnostics(providers),
 		ModelPrices:  buildModelPriceDiagnostics(priceState),
 		QuotaTrigger: globalQuotaTrigger.status(),
@@ -264,7 +300,7 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 	out := authDiagnostics{
 		Files:                len(files),
 		Invalid401:           len(invalidAuths),
-		Autoban429:           len(autobans),
+		Autoban429:           count429Autobans(autobans),
 		ExternalUseSuspected: len(externalAlerts),
 	}
 	for _, file := range files {
@@ -291,6 +327,17 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 		}
 	}
 	return out
+}
+
+func count429Autobans(autobans []autobanRow) int {
+	count := 0
+	for _, ban := range autobans {
+		if strings.EqualFold(strings.TrimSpace(ban.Window), "401") || ban.LastStatusCode == http.StatusUnauthorized {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func buildProviderDiagnostics(providers []providerRow) providerDiagnostics {
@@ -395,6 +442,9 @@ func buildAlerts(data map[string]any) []dashboardAlert {
 	}
 	if rows, ok := data["autobans"].([]autobanRow); ok {
 		for _, row := range rows {
+			if strings.EqualFold(strings.TrimSpace(row.Window), "401") || row.LastStatusCode == http.StatusUnauthorized {
+				continue
+			}
 			alerts = append(alerts, dashboardAlert{ID: "autoban:" + firstNonEmptyString(row.AuthID, row.AuthIndex, row.Source), Severity: "warning", Type: "429", Scope: "account", Target: firstNonEmptyString(row.Source, row.AuthID, row.AuthIndex), Message: "账号 429 自动禁用中", Detail: "恢复时间 " + row.ResetAtText, CreatedAt: row.BannedAtText, Active: row.Active})
 		}
 	}
@@ -441,7 +491,7 @@ func alertSeverityRank(value string) int {
 }
 
 func handleExport(ctx context.Context, window, kind, format string, limit int) managementResponse {
-	data, err := globalStore.summary(ctx, window, limit)
+	data, err := globalSummaryPrecomputer.summary(ctx, globalStore, window, limit)
 	if err != nil {
 		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
 	}

@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_events_requested_at ON usage_events(requested_at);
 CREATE INDEX IF NOT EXISTS idx_usage_events_auth ON usage_events(auth_index, auth_id, requested_at);
 CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model, alias, requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_requested_auth_id ON usage_events(requested_at, auth_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_requested_source ON usage_events(requested_at, source);
+CREATE INDEX IF NOT EXISTS idx_usage_events_quota_scan ON usage_events(requested_at, failed, status_code);
 CREATE TABLE IF NOT EXISTS autoban_bans (
   auth_id TEXT PRIMARY KEY,
   auth_index TEXT NOT NULL DEFAULT '',
@@ -90,10 +93,18 @@ CREATE TABLE IF NOT EXISTS quota_trigger_runs (
   primary_used_percent REAL,
   primary_reset_at INTEGER,
   secondary_used_percent REAL,
-  secondary_reset_at INTEGER
+  secondary_reset_at INTEGER,
+  primary_used_tokens INTEGER,
+  primary_remaining_tokens INTEGER,
+  primary_limit_tokens INTEGER,
+  secondary_used_tokens INTEGER,
+  secondary_remaining_tokens INTEGER,
+  secondary_limit_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_account ON quota_trigger_runs(auth_index, auth_id, source, auth_file, finished_at);
 CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_finished_at ON quota_trigger_runs(finished_at);
+CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_status_finished ON quota_trigger_runs(status, finished_at);
+CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_auth_file_finished ON quota_trigger_runs(auth_file, finished_at);
 `
 
 const insertSQL = `

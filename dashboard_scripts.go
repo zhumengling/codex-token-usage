@@ -5,11 +5,18 @@ const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
 const managementAuthFilesApi='/v0/management/auth-files';
 const managementAuthFieldsApi='/v0/management/auth-files/fields';
+const managementCodexAuthUrlApi='/v0/management/codex-auth-url';
+const managementAuthStatusApi='/v0/management/get-auth-status';
 const keyEl=document.getElementById('key');
 const languageEl=document.getElementById('language');
 const batchProxyModal=document.getElementById('batch-proxy-modal');
 const batchProxyUrlEl=document.getElementById('batch-proxy-url');
 const batchProxyStatusEl=document.getElementById('batch-proxy-status');
+const invalidAuthModal=document.getElementById('invalid-auth-modal');
+const invalidAuthStatusEl=document.getElementById('invalid-auth-status');
+const invalidAuthOAuthUrlEl=document.getElementById('invalid-auth-oauth-url');
+const workspaceDeactivatedModal=document.getElementById('workspace-deactivated-modal');
+const workspaceDeactivatedStatusEl=document.getElementById('workspace-deactivated-status');
 const cpaStoragePrefix='enc::v1::';
 const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
@@ -17,6 +24,16 @@ let accountPage=1;
 let accountPageSize=25;
 let autobanPage=1;
 let autobanPageSize=10;
+let invalidAuthPage=1;
+const invalidAuthPageSize=10;
+let invalidAuthSelected=new Set();
+let invalidAuthOAuthTimer=null;
+let invalidAuthOAuthKey='';
+let workspaceDeactivatedPage=1;
+const workspaceDeactivatedPageSize=10;
+let workspaceDeactivatedSelected=new Set();
+let invalidAuthDeleting=false;
+let workspaceDeactivatedDeleting=false;
 let activePage='codex';
 let selectedProviders=[];
 let providerSelectionSaved=false;
@@ -26,6 +43,8 @@ const saved=managementKey(); if(saved) keyEl.value=saved;
 selectedProviders=loadSelectedProviders();
 initLanguageControl();
 initBatchProxyControl();
+initInvalidAuthControl();
+initWorkspaceDeactivatedControl();
 initUIPreferences();
 applyHostTheme();
 observeHostTheme();
@@ -121,12 +140,56 @@ function initBatchProxyControl(){
   batchProxyModal.addEventListener('click',e=>{if(e.target===batchProxyModal)closeBatchProxyModal()});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!batchProxyModal.hidden)closeBatchProxyModal()});
 }
+function initInvalidAuthControl(){
+  document.getElementById('invalid-auth-card').onclick=openInvalidAuthModal;
+  document.getElementById('invalid-auth-close').onclick=closeInvalidAuthModal;
+  document.getElementById('invalid-auth-close-bottom').onclick=closeInvalidAuthModal;
+  document.getElementById('invalid-auth-refresh').onclick=async()=>{setInvalidAuthStatus('正在刷新 401 账号...','');await load(true);renderInvalidAuthModal()};
+  document.getElementById('invalid-auth-delete-all').onclick=deleteAllInvalidAuths;
+  document.getElementById('invalid-auth-select-page').onclick=selectCurrentInvalidAuthPage;
+  document.getElementById('invalid-auth-delete-selected').onclick=deleteSelectedInvalidAuths;
+  document.getElementById('invalid-auth-prev').onclick=()=>{invalidAuthPage=Math.max(1,invalidAuthPage-1);renderInvalidAuthModal()};
+  document.getElementById('invalid-auth-next').onclick=()=>{invalidAuthPage=invalidAuthPage+1;renderInvalidAuthModal()};
+  document.getElementById('invalid-auth-list').addEventListener('click',handleInvalidAuthListClick);
+  invalidAuthOAuthUrlEl.addEventListener('click',handleInvalidAuthOAuthLinkClick);
+  invalidAuthModal.addEventListener('click',e=>{if(e.target===invalidAuthModal)closeInvalidAuthModal()});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!invalidAuthModal.hidden)closeInvalidAuthModal()});
+}
+function initWorkspaceDeactivatedControl(){
+  document.getElementById('workspace-deactivated-card').onclick=openWorkspaceDeactivatedModal;
+  document.getElementById('workspace-deactivated-close').onclick=closeWorkspaceDeactivatedModal;
+  document.getElementById('workspace-deactivated-close-bottom').onclick=closeWorkspaceDeactivatedModal;
+  document.getElementById('workspace-deactivated-refresh').onclick=async()=>{setWorkspaceDeactivatedStatus('正在刷新 402 账号...','');await load(true);renderWorkspaceDeactivatedModal()};
+  document.getElementById('workspace-deactivated-delete-all').onclick=deleteAllWorkspaceDeactivatedAuths;
+  document.getElementById('workspace-deactivated-select-page').onclick=selectCurrentWorkspaceDeactivatedPage;
+  document.getElementById('workspace-deactivated-delete-selected').onclick=deleteSelectedWorkspaceDeactivatedAuths;
+  document.getElementById('workspace-deactivated-prev').onclick=()=>{workspaceDeactivatedPage=Math.max(1,workspaceDeactivatedPage-1);renderWorkspaceDeactivatedModal()};
+  document.getElementById('workspace-deactivated-next').onclick=()=>{workspaceDeactivatedPage=workspaceDeactivatedPage+1;renderWorkspaceDeactivatedModal()};
+  document.getElementById('workspace-deactivated-list').addEventListener('click',handleWorkspaceDeactivatedListClick);
+  workspaceDeactivatedModal.addEventListener('click',e=>{if(e.target===workspaceDeactivatedModal)closeWorkspaceDeactivatedModal()});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!workspaceDeactivatedModal.hidden)closeWorkspaceDeactivatedModal()});
+}
 function openBatchProxyModal(){
   setBatchProxyStatus('等待输入代理地址。','');
   batchProxyModal.hidden=false;
   setTimeout(()=>batchProxyUrlEl.focus(),0);
 }
 function closeBatchProxyModal(){batchProxyModal.hidden=true}
+function openInvalidAuthModal(){
+  invalidAuthPage=1;
+  invalidAuthOAuthUrlEl.hidden=true;
+  renderInvalidAuthModal();
+  invalidAuthModal.hidden=false;
+  setTimeout(()=>document.getElementById('invalid-auth-delete-selected').focus(),0);
+}
+function closeInvalidAuthModal(){invalidAuthModal.hidden=true}
+function openWorkspaceDeactivatedModal(){
+  workspaceDeactivatedPage=1;
+  renderWorkspaceDeactivatedModal();
+  workspaceDeactivatedModal.hidden=false;
+  setTimeout(()=>document.getElementById('workspace-deactivated-delete-selected').focus(),0);
+}
+function closeWorkspaceDeactivatedModal(){workspaceDeactivatedModal.hidden=true}
 function batchProxyKey(){
   const key=managementKey();
   if(key){keyEl.value=key;safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key)}
@@ -139,6 +202,10 @@ function showFallbackKeyInput(){
 function missingBatchProxyKey(){
   showFallbackKeyInput();
   setBatchProxyStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');
+}
+function missingInvalidAuthKey(){
+  showFallbackKeyInput();
+  setInvalidAuthStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');
 }
 function managementKey(){
   const typed=firstText(keyEl.value);
@@ -220,6 +287,471 @@ function setBatchProxyStatus(text,tone){
   batchProxyStatusEl.classList.remove('ok','warn','bad');
   if(tone)batchProxyStatusEl.classList.add(tone);
 }
+function setInvalidAuthStatus(text,tone){
+  invalidAuthStatusEl.textContent=tr(text);
+  invalidAuthStatusEl.classList.remove('ok','warn','bad');
+  if(tone)invalidAuthStatusEl.classList.add(tone);
+}
+function setWorkspaceDeactivatedStatus(text,tone){
+  workspaceDeactivatedStatusEl.textContent=tr(text);
+  workspaceDeactivatedStatusEl.classList.remove('ok','warn','bad');
+  if(tone)workspaceDeactivatedStatusEl.classList.add(tone);
+}
+function setAuthDeleteProgress(el,text,tone,percent){
+  const pct=Math.max(0,Math.min(100,Number(percent)||0));
+  el.classList.remove('ok','warn','bad');
+  if(tone)el.classList.add(tone);
+  el.innerHTML='<div class="modal-progress-status"><span>'+esc(tr(text))+'</span><b>'+pct+'%</b></div><div class="modal-progress" aria-hidden="true"><span style="width:'+pct+'%"></span></div>';
+}
+function setAuthDeleteButtonsDisabled(prefix,disabled){
+  ['delete-all','delete-selected','select-page','refresh','prev','next','close','close-bottom'].forEach(suffix=>{
+    const el=document.getElementById(prefix+'-'+suffix);
+    if(el)el.disabled=disabled;
+  });
+}
+function setAuthDeleteBusy(prefix,busy){
+  if(prefix==='invalid-auth')invalidAuthDeleting=busy;
+  if(prefix==='workspace-deactivated')workspaceDeactivatedDeleting=busy;
+  setAuthDeleteButtonsDisabled(prefix,busy);
+  document.querySelectorAll('#'+prefix+'-list button,#'+prefix+'-list input').forEach(el=>{el.disabled=busy});
+}
+function invalidAuthRows(){
+  const accounts=(lastData&&lastData.accounts)||[];
+  const invalids=(lastData&&lastData.invalid_auths)||[];
+  const out=[];
+  const seen=new Set();
+  const add=(row,account)=>{
+    const merged=Object.assign({},row||{},account||{});
+    merged.invalid_auth=true;
+    merged.invalid_auth_at=firstText(row&&row.invalidated_at_text,row&&row.invalid_auth_at,account&&account.invalid_auth_at);
+    merged.invalid_auth_reason=firstText(row&&row.reason,row&&row.invalid_auth_reason,account&&account.invalid_auth_reason,'401 unauthorized');
+    merged.auth_file=firstText(row&&row.auth_file,account&&account.auth_file,row&&row.auth_id,row&&row.auth_index);
+    const key=invalidAuthKey(merged);
+    if(seen.has(key))return;
+    seen.add(key);
+    out.push(merged);
+  };
+  invalids.forEach(row=>{
+    const account=accounts.find(acc=>sameAuthIdentity(row,acc));
+    add(row,account);
+  });
+  accounts.filter(r=>r.invalid_auth).forEach(row=>add(row,row));
+  out.sort((a,b)=>Date.parse(firstText(b.invalid_auth_at,b.invalidated_at_text,0))-Date.parse(firstText(a.invalid_auth_at,a.invalidated_at_text,0)));
+  return out;
+}
+function workspaceDeactivatedRows(){
+  const accounts=(lastData&&lastData.accounts)||[];
+  const rows=(lastData&&lastData.workspace_deactivated_auths)||[];
+  const out=[];
+  const seen=new Set();
+  const add=(row,account)=>{
+    const merged=Object.assign({},row||{},account||{});
+    merged.workspace_deactivated=true;
+    merged.workspace_deactivated_at=firstText(row&&row.invalidated_at_text,row&&row.workspace_deactivated_at,account&&account.workspace_deactivated_at);
+    merged.workspace_deactivated_reason=firstText(row&&row.reason,row&&row.workspace_deactivated_reason,account&&account.workspace_deactivated_reason,'402 deactivated_workspace');
+    merged.auth_file=firstText(row&&row.auth_file,account&&account.auth_file,row&&row.auth_id,row&&row.auth_index);
+    const key=workspaceDeactivatedKey(merged);
+    if(seen.has(key))return;
+    seen.add(key);
+    out.push(merged);
+  };
+  rows.forEach(row=>{
+    const account=accounts.find(acc=>sameAuthIdentity(row,acc));
+    add(row,account);
+  });
+  accounts.filter(r=>r.workspace_deactivated).forEach(row=>add(row,row));
+  out.sort((a,b)=>Date.parse(firstText(b.workspace_deactivated_at,b.invalidated_at_text,0))-Date.parse(firstText(a.workspace_deactivated_at,a.invalidated_at_text,0)));
+  return out;
+}
+function sameAuthIdentity(a,b){
+  const aliases=new Set(accountAliases(a));
+  return accountAliases(b).some(v=>aliases.has(v));
+}
+function accountAliases(r){
+  return [r&&r.auth_id,r&&r.auth_index,r&&r.source,r&&r.email,r&&r.name,r&&r.auth_file].flatMap(authAliasVariants).filter(Boolean);
+}
+function authAliasVariants(value){
+  value=String(value||'').trim().toLowerCase();
+  if(!value)return [];
+  const slash=value.split(/[\\/]/).pop();
+  const out=[value,slash];
+  for(const v of [value,slash]){
+    if(v.endsWith('.json'))out.push(v.slice(0,-5));
+    if(v.endsWith('.cpa.json'))out.push(v.slice(0,-9),v.slice(0,-4));
+  }
+  return [...new Set(out)];
+}
+function invalidAuthKey(r){return firstText(r.auth_file,r.auth_id,r.auth_index,r.source,r.email,r.name,'invalid-auth')}
+function invalidAuthFileName(r){return fileNameOnly(firstText(r.auth_file,r.auth_id,r.auth_index))}
+function workspaceDeactivatedKey(r){return firstText(r.auth_file,r.auth_id,r.auth_index,r.source,r.email,r.name,'workspace-deactivated')}
+function workspaceDeactivatedFileName(r){return fileNameOnly(firstText(r.auth_file,r.auth_id,r.auth_index))}
+function fileNameOnly(value){value=String(value||'').trim();if(!value)return '';return value.split(/[\\/]/).pop()}
+function fileNameSet(names){return new Set((names||[]).map(fileNameOnly).filter(Boolean))}
+function removeAuthFilesFromCurrentData(names){
+  if(!lastData)return;
+  const removed=fileNameSet(names);
+  if(!removed.size)return;
+  const keep=row=>!removed.has(fileNameOnly(firstText(row&&row.auth_file,row&&row.auth_id,row&&row.auth_index)));
+  if(Array.isArray(lastData.invalid_auths))lastData.invalid_auths=lastData.invalid_auths.filter(keep);
+  if(Array.isArray(lastData.workspace_deactivated_auths))lastData.workspace_deactivated_auths=lastData.workspace_deactivated_auths.filter(keep);
+  if(Array.isArray(lastData.autobans))lastData.autobans=lastData.autobans.filter(keep);
+  if(Array.isArray(lastData.accounts)){
+    lastData.accounts=lastData.accounts.filter(row=>keep(row)).map(row=>{
+      const next=Object.assign({},row);
+      if(removed.has(fileNameOnly(next.auth_file))){
+        next.invalid_auth=false;
+        next.workspace_deactivated=false;
+      }
+      return next;
+    });
+  }
+}
+function normalizeEmail(value){return String(value||'').trim().toLowerCase()}
+function pagedInvalidAuthRows(){
+  const rows=invalidAuthRows();
+  const pages=Math.max(1,Math.ceil(rows.length/invalidAuthPageSize));
+  invalidAuthPage=Math.max(1,Math.min(invalidAuthPage,pages));
+  const start=(invalidAuthPage-1)*invalidAuthPageSize;
+  return {rows,pages,start,pageRows:rows.slice(start,start+invalidAuthPageSize)};
+}
+function renderInvalidAuthModal(){
+  const page=pagedInvalidAuthRows();
+  const rows=page.rows;
+  const rowKeys=new Set(rows.map(invalidAuthKey));
+  invalidAuthSelected=new Set([...invalidAuthSelected].filter(k=>rowKeys.has(k)));
+  document.getElementById('invalid-auth-summary').textContent='已选 '+invalidAuthSelected.size+' / 共 '+rows.length+' 个';
+  document.getElementById('invalid-auth-page-label').textContent=invalidAuthPage+' / '+page.pages;
+  document.getElementById('invalid-auth-prev').disabled=invalidAuthPage<=1;
+  document.getElementById('invalid-auth-next').disabled=invalidAuthPage>=page.pages;
+  document.getElementById('invalid-auth-select-page').disabled=rows.length===0;
+  document.getElementById('invalid-auth-delete-all').disabled=rows.length===0;
+  document.getElementById('invalid-auth-delete-selected').disabled=invalidAuthSelected.size===0;
+  if(invalidAuthDeleting)setAuthDeleteButtonsDisabled('invalid-auth',true);
+  if(!rows.length){
+    document.getElementById('invalid-auth-list').innerHTML='<div class="invalid-auth-empty">'+tr('当前没有 401 失效账号。')+'</div>';
+    setInvalidAuthStatus('当前没有 401 失效账号。','ok');
+    return;
+  }
+  document.getElementById('invalid-auth-list').innerHTML=page.pageRows.map(r=>{
+    const key=invalidAuthKey(r);
+    const file=invalidAuthFileName(r);
+    const checked=invalidAuthSelected.has(key)?' checked':'';
+    const loginBusy=invalidAuthOAuthKey===key?' busy':'';
+    const disabled=file&&!invalidAuthDeleting?'':' disabled';
+    return '<div class="invalid-auth-row'+loginBusy+'" data-key="'+esc(key)+'">'+
+      '<label class="invalid-auth-check"><input type="checkbox" data-invalid-check="'+esc(key)+'"'+checked+(invalidAuthDeleting?' disabled':'')+'></label>'+
+      '<div class="invalid-auth-main"><b title="'+esc(accountName(r))+'">'+esc(accountName(r))+'</b><span title="'+esc(file||'-')+'">'+esc(file||'非文件型记录')+'</span></div>'+
+      '<div class="invalid-auth-meta"><span>'+esc(firstText(r.auth_index,'-'))+'</span><span>'+esc(firstText(r.invalid_auth_at,'-'))+'</span></div>'+
+      '<div class="invalid-auth-reason" title="'+esc(r.invalid_auth_reason||'401 unauthorized')+'">'+esc(r.invalid_auth_reason||'401 unauthorized')+'</div>'+
+      '<button class="ghost" type="button" data-invalid-login="'+esc(key)+'">OAuth 登录</button>'+
+      '<button class="ghost danger-ghost" type="button" data-invalid-delete="'+esc(key)+'"'+disabled+'>删除</button>'+
+    '</div>';
+  }).join('');
+}
+function pagedWorkspaceDeactivatedRows(){
+  const rows=workspaceDeactivatedRows();
+  const pages=Math.max(1,Math.ceil(rows.length/workspaceDeactivatedPageSize));
+  workspaceDeactivatedPage=Math.max(1,Math.min(workspaceDeactivatedPage,pages));
+  const start=(workspaceDeactivatedPage-1)*workspaceDeactivatedPageSize;
+  return {rows,pages,start,pageRows:rows.slice(start,start+workspaceDeactivatedPageSize)};
+}
+function renderWorkspaceDeactivatedModal(){
+  const page=pagedWorkspaceDeactivatedRows();
+  const rows=page.rows;
+  const rowKeys=new Set(rows.map(workspaceDeactivatedKey));
+  workspaceDeactivatedSelected=new Set([...workspaceDeactivatedSelected].filter(k=>rowKeys.has(k)));
+  document.getElementById('workspace-deactivated-summary').textContent='已选 '+workspaceDeactivatedSelected.size+' / 共 '+rows.length+' 个';
+  document.getElementById('workspace-deactivated-page-label').textContent=workspaceDeactivatedPage+' / '+page.pages;
+  document.getElementById('workspace-deactivated-prev').disabled=workspaceDeactivatedPage<=1;
+  document.getElementById('workspace-deactivated-next').disabled=workspaceDeactivatedPage>=page.pages;
+  document.getElementById('workspace-deactivated-select-page').disabled=rows.length===0;
+  document.getElementById('workspace-deactivated-delete-all').disabled=rows.length===0;
+  document.getElementById('workspace-deactivated-delete-selected').disabled=workspaceDeactivatedSelected.size===0;
+  if(workspaceDeactivatedDeleting)setAuthDeleteButtonsDisabled('workspace-deactivated',true);
+  if(!rows.length){
+    document.getElementById('workspace-deactivated-list').innerHTML='<div class="invalid-auth-empty">'+tr('当前没有 402 工作区失效账号。')+'</div>';
+    setWorkspaceDeactivatedStatus('当前没有 402 工作区失效账号。','ok');
+    return;
+  }
+  document.getElementById('workspace-deactivated-list').innerHTML=page.pageRows.map(r=>{
+    const key=workspaceDeactivatedKey(r);
+    const file=workspaceDeactivatedFileName(r);
+    const checked=workspaceDeactivatedSelected.has(key)?' checked':'';
+    const disabled=file&&!workspaceDeactivatedDeleting?'':' disabled';
+    return '<div class="invalid-auth-row workspace-deactivated-row" data-key="'+esc(key)+'">'+
+      '<label class="invalid-auth-check"><input type="checkbox" data-workspace-check="'+esc(key)+'"'+checked+(workspaceDeactivatedDeleting?' disabled':'')+'></label>'+
+      '<div class="invalid-auth-main"><b title="'+esc(accountName(r))+'">'+esc(accountName(r))+'</b><span title="'+esc(file||'-')+'">'+esc(file||'非文件型记录')+'</span></div>'+
+      '<div class="invalid-auth-meta"><span>'+esc(firstText(r.auth_index,'-'))+'</span><span>'+esc(firstText(r.workspace_deactivated_at,'-'))+'</span></div>'+
+      '<div class="invalid-auth-reason" title="'+esc(r.workspace_deactivated_reason||'402 deactivated_workspace')+'">'+esc(r.workspace_deactivated_reason||'402 deactivated_workspace')+'</div>'+
+      '<button class="ghost danger-ghost" type="button" data-workspace-delete="'+esc(key)+'"'+disabled+'>删除</button>'+
+    '</div>';
+  }).join('');
+}
+function handleInvalidAuthListClick(e){
+  const check=e.target.closest('[data-invalid-check]');
+  if(check){
+    const key=check.dataset.invalidCheck;
+    if(check.checked)invalidAuthSelected.add(key);else invalidAuthSelected.delete(key);
+    renderInvalidAuthModal();
+    return;
+  }
+  const login=e.target.closest('[data-invalid-login]');
+  if(login){startInvalidAuthOAuth(login.dataset.invalidLogin);return}
+  const del=e.target.closest('[data-invalid-delete]');
+  if(del){invalidAuthSelected=new Set([del.dataset.invalidDelete]);deleteSelectedInvalidAuths();return}
+  const row=e.target.closest('.invalid-auth-row[data-key]');
+  if(row){
+    const key=row.dataset.key;
+    if(invalidAuthSelected.has(key))invalidAuthSelected.delete(key);else invalidAuthSelected.add(key);
+    renderInvalidAuthModal();
+  }
+}
+function handleWorkspaceDeactivatedListClick(e){
+  const check=e.target.closest('[data-workspace-check]');
+  if(check){
+    const key=check.dataset.workspaceCheck;
+    if(check.checked)workspaceDeactivatedSelected.add(key);else workspaceDeactivatedSelected.delete(key);
+    renderWorkspaceDeactivatedModal();
+    return;
+  }
+  const del=e.target.closest('[data-workspace-delete]');
+  if(del){workspaceDeactivatedSelected=new Set([del.dataset.workspaceDelete]);deleteSelectedWorkspaceDeactivatedAuths();return}
+  const row=e.target.closest('.workspace-deactivated-row[data-key]');
+  if(row){
+    const key=row.dataset.key;
+    if(workspaceDeactivatedSelected.has(key))workspaceDeactivatedSelected.delete(key);else workspaceDeactivatedSelected.add(key);
+    renderWorkspaceDeactivatedModal();
+  }
+}
+function selectedInvalidAuthRows(){
+  const selected=invalidAuthSelected;
+  return invalidAuthRows().filter(r=>selected.has(invalidAuthKey(r)));
+}
+function selectedWorkspaceDeactivatedRows(){
+  const selected=workspaceDeactivatedSelected;
+  return workspaceDeactivatedRows().filter(r=>selected.has(workspaceDeactivatedKey(r)));
+}
+function selectCurrentInvalidAuthPage(){
+  const page=pagedInvalidAuthRows();
+  page.pageRows.forEach(r=>invalidAuthSelected.add(invalidAuthKey(r)));
+  renderInvalidAuthModal();
+  setInvalidAuthStatus('已全选当前页 401 账号。','ok');
+}
+function selectCurrentWorkspaceDeactivatedPage(){
+  const page=pagedWorkspaceDeactivatedRows();
+  page.pageRows.forEach(r=>workspaceDeactivatedSelected.add(workspaceDeactivatedKey(r)));
+  renderWorkspaceDeactivatedModal();
+  setWorkspaceDeactivatedStatus('已全选当前页 402 账号。','ok');
+}
+function deleteAllInvalidAuths(){
+  deleteInvalidAuthRows(invalidAuthRows(),'确认删除所有 401 认证文件？','正在删除所有 401 认证文件...');
+}
+function deleteAllWorkspaceDeactivatedAuths(){
+  deleteWorkspaceDeactivatedRows(workspaceDeactivatedRows(),'确认删除所有 402 认证文件？','正在删除所有 402 认证文件...');
+}
+async function deleteSelectedInvalidAuths(){
+  return deleteInvalidAuthRows(selectedInvalidAuthRows(),'确认删除选中的 401 认证文件？','正在删除选中的 401 认证文件...');
+}
+async function deleteSelectedWorkspaceDeactivatedAuths(){
+  return deleteWorkspaceDeactivatedRows(selectedWorkspaceDeactivatedRows(),'确认删除选中的 402 认证文件？','正在删除选中的 402 认证文件...');
+}
+async function deleteInvalidAuthRows(rows,confirmText,runningText){
+  const names=[...new Set(rows.map(invalidAuthFileName).filter(Boolean))];
+  if(!names.length){setInvalidAuthStatus('没有可删除的认证文件。','warn');return}
+  const key=managementKey();
+  if(!key){missingInvalidAuthKey();return}
+  if(!confirm(tr(confirmText))){return}
+  setAuthDeleteBusy('invalid-auth',true);
+  setAuthDeleteProgress(invalidAuthStatusEl,runningText,'',18);
+  try{
+    const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
+    const body=await readResponseBody(res);
+    if(!res.ok&&res.status!==207){
+      if(res.status===401)rejectManagementKey(key);
+      throw new Error('HTTP '+res.status+' '+body);
+    }
+    setAuthDeleteProgress(invalidAuthStatusEl,'删除成功，正在刷新统计...','ok',72);
+    invalidAuthSelected.clear();
+    removeAuthFilesFromCurrentData(names);
+    renderInvalidAuthModal();
+    await load(true);
+    setAuthDeleteBusy('invalid-auth',false);
+    renderInvalidAuthModal();
+    setInvalidAuthStatus('删除成功，统计已刷新。','ok');
+  }catch(e){
+    setAuthDeleteBusy('invalid-auth',false);
+    renderInvalidAuthModal();
+    setInvalidAuthStatus('删除失败：'+e.message,'bad');
+  }finally{
+    if(invalidAuthDeleting)setAuthDeleteBusy('invalid-auth',false);
+  }
+}
+async function deleteWorkspaceDeactivatedRows(rows,confirmText,runningText){
+  const names=[...new Set(rows.map(workspaceDeactivatedFileName).filter(Boolean))];
+  if(!names.length){setWorkspaceDeactivatedStatus('没有可删除的认证文件。','warn');return}
+  const key=managementKey();
+  if(!key){showFallbackKeyInput();setWorkspaceDeactivatedStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');return}
+  if(!confirm(tr(confirmText))){return}
+  setAuthDeleteBusy('workspace-deactivated',true);
+  setAuthDeleteProgress(workspaceDeactivatedStatusEl,runningText,'',18);
+  try{
+    const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
+    const body=await readResponseBody(res);
+    if(!res.ok&&res.status!==207){
+      if(res.status===401)rejectManagementKey(key);
+      throw new Error('HTTP '+res.status+' '+body);
+    }
+    setAuthDeleteProgress(workspaceDeactivatedStatusEl,'删除成功，正在刷新统计...','ok',72);
+    workspaceDeactivatedSelected.clear();
+    removeAuthFilesFromCurrentData(names);
+    renderWorkspaceDeactivatedModal();
+    await load(true);
+    setAuthDeleteBusy('workspace-deactivated',false);
+    renderWorkspaceDeactivatedModal();
+    setWorkspaceDeactivatedStatus('删除成功，统计已刷新。','ok');
+  }catch(e){
+    setAuthDeleteBusy('workspace-deactivated',false);
+    renderWorkspaceDeactivatedModal();
+    setWorkspaceDeactivatedStatus('删除失败：'+e.message,'bad');
+  }finally{
+    if(workspaceDeactivatedDeleting)setAuthDeleteBusy('workspace-deactivated',false);
+  }
+}
+async function handleInvalidAuthOAuthLinkClick(e){
+  const copy=e.target.closest('[data-oauth-copy]');
+  if(!copy)return;
+  e.preventDefault();
+  const url=copy.dataset.oauthCopy||'';
+  if(!url)return;
+  try{
+    await copyText(url);
+    setInvalidAuthStatus('授权链接已复制。','ok');
+  }catch(err){
+    setInvalidAuthStatus('复制失败，请右键复制链接。','warn');
+  }
+}
+async function copyText(text){
+  if(navigator.clipboard&&window.isSecureContext){
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta=document.createElement('textarea');
+  ta.value=text;
+  ta.style.position='fixed';
+  ta.style.left='-9999px';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  const ok=document.execCommand('copy');
+  document.body.removeChild(ta);
+  if(!ok)throw new Error('copy failed');
+}
+function shortOAuthUrl(url){
+  try{
+    const u=new URL(url);
+    return u.hostname+u.pathname;
+  }catch(e){
+    return 'Codex OAuth 链接';
+  }
+}
+async function startInvalidAuthOAuth(key){
+  const row=invalidAuthRows().find(r=>invalidAuthKey(r)===key);
+  if(!row){setInvalidAuthStatus('未找到这个 401 账号。','warn');return}
+  const management=managementKey();
+  if(!management){missingInvalidAuthKey();return}
+  const oldFile=invalidAuthFileName(row);
+  const oldEmail=normalizeEmail(firstText(row.email,row.source));
+  const startedAt=Date.now();
+  invalidAuthOAuthKey=key;
+  invalidAuthOAuthUrlEl.hidden=true;
+  renderInvalidAuthModal();
+  try{
+    const before=await fetchAuthFilesForBatch(management);
+    setInvalidAuthStatus('正在启动 Codex OAuth 登录...','');
+    const res=await fetch(managementCodexAuthUrlApi+'?is_webui=true',{headers:{Authorization:'Bearer '+management,Accept:'application/json'}});
+    const body=await readResponseBody(res);
+    if(!res.ok){
+      if(res.status===401)rejectManagementKey(management);
+      throw new Error('HTTP '+res.status+' '+body);
+    }
+    const payload=parseJSONBody(body);
+    if(!payload.url||!payload.state)throw new Error('OAuth 启动响应缺少 url 或 state');
+    invalidAuthOAuthUrlEl.hidden=false;
+    invalidAuthOAuthUrlEl.innerHTML='<div class="oauth-link-row"><span>'+tr('授权链接：')+'</span><a class="oauth-open-link" href="'+esc(payload.url)+'" target="_blank" rel="noopener noreferrer">'+esc(tr('打开登录页'))+'</a><button class="ghost oauth-copy-link" type="button" data-oauth-copy="'+esc(payload.url)+'" title="'+esc(payload.url)+'">'+esc(tr('复制授权链接'))+'</button><code title="'+esc(payload.url)+'">'+esc(shortOAuthUrl(payload.url))+'</code></div>';
+    window.open(payload.url,'_blank','noopener,noreferrer');
+    setInvalidAuthStatus('已打开 Codex OAuth，等待登录完成...','');
+    pollInvalidAuthOAuth(management,payload.state,row,before,startedAt,oldFile,oldEmail);
+  }catch(e){
+    invalidAuthOAuthKey='';
+    renderInvalidAuthModal();
+    setInvalidAuthStatus('OAuth 启动失败：'+e.message,'bad');
+  }
+}
+function pollInvalidAuthOAuth(management,state,row,before,startedAt,oldFile,oldEmail){
+  if(invalidAuthOAuthTimer)clearInterval(invalidAuthOAuthTimer);
+  const deadline=Date.now()+5*60*1000;
+  invalidAuthOAuthTimer=setInterval(async()=>{
+    try{
+      if(Date.now()>deadline)throw new Error('OAuth 等待超时');
+      const res=await fetch(managementAuthStatusApi+'?state='+encodeURIComponent(state),{headers:{Authorization:'Bearer '+management,Accept:'application/json'}});
+      const body=await readResponseBody(res);
+      if(!res.ok){
+        if(res.status===401)rejectManagementKey(management);
+        throw new Error('HTTP '+res.status+' '+body);
+      }
+      const data=parseJSONBody(body);
+      if(data.status==='wait')return;
+      clearInterval(invalidAuthOAuthTimer); invalidAuthOAuthTimer=null; invalidAuthOAuthKey='';
+      if(data.status==='error')throw new Error(data.error||'OAuth 失败');
+      await handleInvalidAuthOAuthSuccess(management,row,before,startedAt,oldFile,oldEmail);
+    }catch(e){
+      if(invalidAuthOAuthTimer){clearInterval(invalidAuthOAuthTimer);invalidAuthOAuthTimer=null}
+      invalidAuthOAuthKey='';
+      renderInvalidAuthModal();
+      setInvalidAuthStatus('OAuth 登录失败：'+e.message,'bad');
+    }
+  },3000);
+}
+async function handleInvalidAuthOAuthSuccess(management,row,before,startedAt,oldFile,oldEmail){
+  const after=await fetchAuthFilesForBatch(management);
+  const match=findNewAuthForEmail(before,after,oldEmail,oldFile,startedAt);
+  await load();
+  renderInvalidAuthModal();
+  if(match&&fileNameOnly(match.name)===oldFile){
+    setInvalidAuthStatus('OAuth 成功：同名认证文件已更新，401 状态会随刷新解除。','ok');
+    return;
+  }
+  if(match&&oldFile){
+    const ok=confirm(tr('已找到相同邮箱的新认证文件，是否删除旧的 401 文件？')+'\\n'+oldFile+' -> '+fileNameOnly(match.name));
+    if(ok){
+      invalidAuthSelected=new Set([invalidAuthKey(row)]);
+      await deleteSelectedInvalidAuths();
+      return;
+    }
+    setInvalidAuthStatus('OAuth 成功：已找到同邮箱新文件，旧文件未删除。','ok');
+    return;
+  }
+  setInvalidAuthStatus('OAuth 成功，但没有找到相同邮箱的新文件；不会删除旧认证文件。','warn');
+}
+function findNewAuthForEmail(before,after,email,oldFile,startedAt){
+  if(!email)return null;
+  const beforeMap=new Map((before||[]).map(f=>[fileNameOnly(f.name),authFileTimestamp(f)]));
+  const candidates=(after||[]).filter(f=>normalizeEmail(f.email)===email);
+  return candidates.find(f=>{
+    const name=fileNameOnly(f.name);
+    const ts=authFileTimestamp(f);
+    return name===oldFile || !beforeMap.has(name) || ts>=startedAt-5000 || ts>(beforeMap.get(name)||0);
+  })||null;
+}
+function authFileTimestamp(f){
+  const value=firstText(f&&f.modified,f&&f.modtime,f&&f.created_at,f&&f.updated_at,0);
+  const n=Number(value);
+  if(Number.isFinite(n)&&n>0)return n>1e12?n:n*1000;
+  const parsed=Date.parse(value);
+  return Number.isFinite(parsed)?parsed:0;
+}
+function parseJSONBody(body){try{return JSON.parse(body||'{}')}catch(e){return {}}}
+async function readResponseBody(res){const text=await res.text();return text}
 function codexAuthFiles(files){
   return (files||[]).filter(f=>{
     if(f.runtime_only)return false;
@@ -501,6 +1033,7 @@ const i18nEn={
   '按 7d/月总额度':'By 7d/month total quota',
   '按平均耗时':'By avg latency',
   '按 401 失效':'By 401 invalid',
+  '按 402 工作区':'By 402 workspace',
   '按外部消耗':'By external use',
   '按触发状态':'By trigger status',
   '按额度已用':'By quota used',
@@ -517,6 +1050,23 @@ const i18nEn={
   '费用合计':'Total cost',
   '风险账号':'Risk accounts',
   '401 失效':'401 invalid',
+  '402 工作区':'402 workspace',
+  '点击管理':'Manage',
+  '点击处理':'Resolve',
+  '无 401':'No 401',
+  '无 402':'No 402',
+  '管理 401 失效账号':'Manage 401 invalid accounts',
+  '管理 402 工作区失效账号':'Manage 402 deactivated workspace accounts',
+  '关闭 401 管理':'Close 401 manager',
+  '关闭 402 管理':'Close 402 manager',
+  '删除所有 401 账号':'Delete all 401 accounts',
+  '删除所有 402 账号':'Delete all 402 accounts',
+  '已选 0 / 共 0 个':'Selected 0 / 0',
+  '等待选择 401 账号。':'Waiting for 401 account selection.',
+  '等待选择 402 账号。':'Waiting for 402 account selection.',
+  '全选当前页':'Select current page',
+  '删除选中':'Delete selected',
+  '管理 401 失效账号':'Manage 401 invalid accounts',
   '疑似外部消耗':'Suspected external use',
   '触发异常':'Trigger issues',
   '额度最高':'Highest quota use',
@@ -530,8 +1080,9 @@ const i18nEn={
   '7d/月窗口 / 额度预估':'7d/month window / quota estimate',
   '最近':'Recent',
   '状态':'Status',
-  '429 自动禁用状态':'429 auto-ban status',
-  'Codex reset_at 自动恢复':'Auto recovers at Codex reset_at',
+  '自动禁用状态':'Auto-ban status',
+  '429 按 reset_at 恢复，401 重新登录后解除':'429 recovers at reset_at; 401 clears after re-login',
+  '429 按 reset_at 恢复，401/402 处理认证文件后解除':'429 recovers at reset_at; 401/402 clear after credential handling',
   '显示 0 / 0 个自动禁用账号':'Showing 0 / 0 auto-banned accounts',
   '自动禁用每页数量':'Auto-bans per page',
   '上一页自动禁用账号':'Previous auto-ban page',
@@ -564,7 +1115,49 @@ const i18nEn={
   '暂无其他 AI Provider':'No other AI providers',
   '暂无趋势数据':'No trend data',
   '没有匹配的账号。':'No matching accounts.',
-  '当前没有被 429 自动禁用的 Codex 账号':'No Codex accounts are currently auto-banned by 429.',
+  '当前没有被自动禁用的 Codex 账号':'No Codex accounts are currently auto-banned.',
+  '当前没有 401 失效账号。':'No 401 invalid accounts.',
+  '当前没有 402 工作区失效账号。':'No 402 deactivated workspace accounts.',
+  '正在刷新 401 账号...':'Refreshing 401 accounts...',
+  '正在刷新 402 账号...':'Refreshing 402 accounts...',
+  '请在页面顶部填写 CPA 管理密钥后重试。':'Enter the CPA management key at the top and retry.',
+  '没有可删除的认证文件。':'No credential files can be deleted.',
+  '已全选当前页 401 账号。':'Selected the current page of 401 accounts.',
+  '已全选当前页 402 账号。':'Selected the current page of 402 accounts.',
+  '确认删除选中的 401 认证文件？':'Delete the selected 401 credential files?',
+  '确认删除所有 401 认证文件？':'Delete all 401 credential files?',
+  '正在删除选中的 401 认证文件...':'Deleting selected 401 credential files...',
+  '正在删除所有 401 认证文件...':'Deleting all 401 credential files...',
+  '确认删除选中的 402 认证文件？':'Delete the selected 402 credential files?',
+  '确认删除所有 402 认证文件？':'Delete all 402 credential files?',
+  '正在删除选中的 402 认证文件...':'Deleting selected 402 credential files...',
+  '正在删除所有 402 认证文件...':'Deleting all 402 credential files...',
+  '删除完成，正在刷新统计...':'Delete complete, refreshing stats...',
+  '删除成功，正在刷新统计...':'Deleted successfully, refreshing stats...',
+  '删除成功，统计已刷新。':'Deleted successfully. Stats refreshed.',
+  '删除失败：':'Delete failed: ',
+  '未找到这个 401 账号。':'This 401 account was not found.',
+  '正在启动 Codex OAuth 登录...':'Starting Codex OAuth login...',
+  'OAuth 启动响应缺少 url 或 state':'OAuth start response is missing url or state',
+  '授权链接：':'Authorization link:',
+  '已打开 Codex OAuth，等待登录完成...':'Codex OAuth opened, waiting for login...',
+  'OAuth 启动失败：':'OAuth start failed: ',
+  'OAuth 等待超时':'OAuth wait timed out',
+  'OAuth 失败':'OAuth failed',
+  'OAuth 登录失败：':'OAuth login failed: ',
+  '打开登录页':'Open login page',
+  '复制授权链接':'Copy auth link',
+  '授权链接已复制。':'Authorization link copied.',
+  '复制失败，请右键复制链接。':'Copy failed; right-click the link to copy it.',
+  'OAuth 成功：同名认证文件已更新，401 状态会随刷新解除。':'OAuth succeeded: the same credential file was updated, and the 401 state will clear after refresh.',
+  '已找到相同邮箱的新认证文件，是否删除旧的 401 文件？':'A new credential file with the same email was found. Delete the old 401 file?',
+  'OAuth 成功：已找到同邮箱新文件，旧文件未删除。':'OAuth succeeded: same-email new file found; old file was not deleted.',
+  'OAuth 成功，但没有找到相同邮箱的新文件；不会删除旧认证文件。':'OAuth succeeded, but no new file with the same email was found; the old credential file will not be deleted.',
+  '非文件型记录':'Non-file record',
+  '删除或替换认证文件后解除':'Clears after deleting or replacing the credential file',
+  '需处理':'Needs action',
+  'Team 工作区失效，删除或替换 json 后解除':'Team workspace deactivated; delete or replace the JSON to clear',
+  '当前没有工作区失效':'No workspace deactivation',
   '暂无模型数据':'No model data',
   '暂无 Provider 数据':'No provider data',
   '暂无请求记录':'No request records',
@@ -753,6 +1346,11 @@ function health(v){v=Number(v||0); return v>=90?'danger':v>=70?'warn':'ok'}
 function successRate(r){return ratio((r.requests||0)-(r.failed||0),r.requests||0)}
 function resetText(ts){if(!ts)return '未捕获重置时间'; const n=Number(ts); const ms=n>1e12?n:n*1000; const d=new Date(ms); return isNaN(d.getTime())?'未捕获重置时间':'重置 '+d.toLocaleString()}
 function duration(sec){sec=Math.max(0,Number(sec||0)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60); return d?d+'天 '+h+'小时':h?h+'小时 '+m+'分':m+'分'}
+function isInvalidAuthBan(r){return String(r&&r.window||'').toLowerCase()==='401'||Number(r&&r.last_status_code)===401}
+function isWorkspaceDeactivatedBan(r){return String(r&&r.window||'').toLowerCase()==='402'||Number(r&&r.last_status_code)===402}
+function isPermanentAuthBan(r){return isInvalidAuthBan(r)||isWorkspaceDeactivatedBan(r)}
+function autobanResetText(r){return isWorkspaceDeactivatedBan(r)?'删除或替换认证文件后解除':isInvalidAuthBan(r)?'重新登录后解除':(r.reset_at_text||'-')}
+function autobanRemainingText(r){return isPermanentAuthBan(r)?'需处理':duration(r.seconds_remaining)}
 function fmtLatencyMs(ms){ms=Number(ms||0); if(!ms)return '—'; if(ms>=1000)return (ms/1000).toFixed(1)+'s'; return Math.round(ms)+'ms'}
 function latencyTone(ms){ms=Number(ms||0); return ms>=12000?'slow':ms>0?'fast':''}
 function reliableThroughputSample(r){const latency=Number(r.latency_ms||0),ttft=Number(r.ttft_ms||0),ms=Math.max(latency,ttft),out=Number(r.output_tokens||0); return out>0&&ms>=1000&&!(latency===ttft&&out>=1000&&ms<5000)}
@@ -774,21 +1372,21 @@ function perfCell(r){
 }
 function tierText(v){v=String(v||'').trim(); if(!v)return ''; const lower=v.toLowerCase(); if(lower==='default'||lower==='standard')return ''; if(lower==='priority')return '优先'; if(lower==='flex')return '弹性'; return v}
 function requestStatusText(r){const code=Number(r.status_code||0)||((r.failed||false)?599:200); return (r.failed?('失败 '+code):('HTTP '+code))}
-async function load(){
+async function load(forceRefresh=false){
   if(loading)return;
   loading=true;
   const key=managementKey(); if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
   const win=document.getElementById('window').value;
   const st=document.getElementById('status'); st.textContent=tr('加载中...');
   try{
-    lastData=await fetchSummary(win,key);
+    lastData=await fetchSummary(win,key,forceRefresh);
     renderAll();
     st.textContent=tr('窗口：')+lastData.window+' · '+tr('数据库：')+lastData.db_path+' · '+tr('更新时间：')+lastData.generated_at+' · '+tr('管理接口');
   }catch(e){st.textContent=tr('失败')+': '+tr(e.message)}
   finally{loading=false}
 }
-async function fetchSummary(win,key){
-  const url='?window='+encodeURIComponent(win)+'&limit=2000';
+async function fetchSummary(win,key,forceRefresh=false){
+  const url='?window='+encodeURIComponent(win)+'&limit=2000'+(forceRefresh?'&refresh=1':'');
   if(!key){showFallbackKeyInput();throw new Error('请填写备用 CPA 管理密钥后刷新。')}
   keyEl.classList.remove('on');
   const res=await fetch(managementApi+url,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
@@ -955,8 +1553,8 @@ function bindTrendTooltip(svg,points,cfg){
 }
 function renderAccounts(){
   const data=lastData||{}; const total=(data.totals||{}).total_tokens||0; const q=(document.getElementById('account-filter').value||'').toLowerCase(); const sort=document.getElementById('account-sort').value;
-  let rows=(data.accounts||[]).filter(r=>(r.auth_index+' '+r.auth_id+' '+r.source+' '+r.provider+' '+r.email+' '+r.name+' '+r.auth_file+' '+r.plan_type+' '+r.invalid_auth_reason+' '+r.external_use_reason+' '+r.quota_trigger_status+' '+r.quota_trigger_error).toLowerCase().includes(q));
-  rows.sort((a,b)=>sort==='cost'?(b.cost_usd||0)-(a.cost_usd||0):sort==='quotaRemain'?quotaRemainingSortValue(a)-quotaRemainingSortValue(b):sort==='quotaTotal'?quotaTotalSortValue(b)-quotaTotalSortValue(a):sort==='latency'?(b.avg_latency_ms||0)-(a.avg_latency_ms||0):sort==='invalid'?(Number(!!b.invalid_auth)-Number(!!a.invalid_auth))||Date.parse(b.invalid_auth_at||0)-Date.parse(a.invalid_auth_at||0):sort==='external'?(Number(!!b.external_use_suspected)-Number(!!a.external_use_suspected))||((b.external_use_delta_percent||0)-(a.external_use_delta_percent||0)):sort==='trigger'?triggerSortScore(b)-triggerSortScore(a):sort==='quota'?maxQuota(b)-maxQuota(a):sort==='cache'?cacheRate(b)-cacheRate(a):sort==='429'?(b.rate_limited||0)-(a.rate_limited||0):sort==='success'?successRate(a)-successRate(b):sort==='recent'?Date.parse(b.last_seen||0)-Date.parse(a.last_seen||0):(b.total_tokens||0)-(a.total_tokens||0));
+  let rows=(data.accounts||[]).filter(r=>(r.auth_index+' '+r.auth_id+' '+r.source+' '+r.provider+' '+r.email+' '+r.name+' '+r.auth_file+' '+r.chatgpt_account_id+' '+r.plan_type+' '+r.invalid_auth_reason+' '+r.workspace_deactivated_reason+' '+r.external_use_reason+' '+r.quota_trigger_status+' '+r.quota_trigger_error).toLowerCase().includes(q));
+  rows.sort((a,b)=>sort==='cost'?(b.cost_usd||0)-(a.cost_usd||0):sort==='quotaRemain'?quotaRemainingSortValue(a)-quotaRemainingSortValue(b):sort==='quotaTotal'?quotaTotalSortValue(b)-quotaTotalSortValue(a):sort==='latency'?(b.avg_latency_ms||0)-(a.avg_latency_ms||0):sort==='invalid'?(Number(!!b.invalid_auth)-Number(!!a.invalid_auth))||Date.parse(b.invalid_auth_at||0)-Date.parse(a.invalid_auth_at||0):sort==='workspace'?(Number(!!b.workspace_deactivated)-Number(!!a.workspace_deactivated))||Date.parse(b.workspace_deactivated_at||0)-Date.parse(a.workspace_deactivated_at||0):sort==='external'?(Number(!!b.external_use_suspected)-Number(!!a.external_use_suspected))||((b.external_use_delta_percent||0)-(a.external_use_delta_percent||0)):sort==='trigger'?triggerSortScore(b)-triggerSortScore(a):sort==='quota'?maxQuota(b)-maxQuota(a):sort==='cache'?cacheRate(b)-cacheRate(a):sort==='429'?(b.rate_limited||0)-(a.rate_limited||0):sort==='success'?successRate(a)-successRate(b):sort==='recent'?Date.parse(b.last_seen||0)-Date.parse(a.last_seen||0):(b.total_tokens||0)-(a.total_tokens||0));
   const allCount=(data.accounts||[]).length;
   const pages=Math.max(1,Math.ceil(rows.length/accountPageSize));
   accountPage=Math.max(1,Math.min(accountPage,pages));
@@ -964,8 +1562,9 @@ function renderAccounts(){
   const pageRows=rows.slice(start,start+accountPageSize);
   const externalCount=rows.filter(r=>r.external_use_suspected).length;
   const invalidCount=rows.filter(r=>r.invalid_auth).length;
+  const workspaceDeactivatedCount=rows.filter(r=>r.workspace_deactivated).length;
   const triggerFailed=rows.filter(r=>r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped').length;
-  const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.external_use_suspected||r.disabled||r.expired||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;
+  const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.workspace_deactivated||r.external_use_suspected||r.disabled||r.expired||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;
   const quotaHot=[...rows].sort((a,b)=>maxQuota(b)-maxQuota(a))[0];
   const lowCache=[...rows].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0];
   document.getElementById('account-scope').textContent='显示 '+(rows.length?start+1:0)+'-'+Math.min(start+pageRows.length,rows.length)+' / '+rows.length+'，已加载 '+allCount+' 个账号';
@@ -973,6 +1572,15 @@ function renderAccounts(){
   document.getElementById('account-cost-total').textContent=money(rows.reduce((sum,r)=>sum+Number(r.cost_usd||0),0));
   document.getElementById('account-risk').textContent=fmt(riskCount);
   document.getElementById('account-invalid-auth').textContent=fmt(invalidCount);
+  const invalidCard=document.getElementById('invalid-auth-card');
+  invalidCard.classList.toggle('has-invalid',invalidCount>0);
+  invalidCard.title=invalidCount?('点击管理 '+invalidCount+' 个 401 失效账号'):'当前没有 401 失效账号，点击查看';
+  document.getElementById('account-invalid-auth-hint').textContent=invalidCount?tr('点击处理'):tr('无 401');
+  document.getElementById('account-workspace-deactivated').textContent=fmt(workspaceDeactivatedCount);
+  const workspaceCard=document.getElementById('workspace-deactivated-card');
+  workspaceCard.classList.toggle('has-invalid',workspaceDeactivatedCount>0);
+  workspaceCard.title=workspaceDeactivatedCount?('点击管理 '+workspaceDeactivatedCount+' 个 402 工作区失效账号'):'当前没有 402 工作区失效账号，点击查看';
+  document.getElementById('account-workspace-deactivated-hint').textContent=workspaceDeactivatedCount?tr('点击处理'):tr('无 402');
   document.getElementById('account-external-use').textContent=fmt(externalCount);
   document.getElementById('account-trigger-failed').textContent=fmt(triggerFailed);
   document.getElementById('account-quota-hot').textContent=quotaHot?accountName(quotaHot)+' · '+pct(maxQuota(quotaHot)):'-';
@@ -993,6 +1601,7 @@ function triggerSortScore(r){return triggerRisk(r)?3:(r.quota_trigger_status==='
 function accountStatus(r){
   const ban=findBan(r);
   if(r.invalid_auth)return '<span class="status-pill danger" title="'+esc(r.invalid_auth_reason||'401 unauthorized')+'">401 失效</span>';
+  if(r.workspace_deactivated)return '<span class="status-pill danger" title="'+esc(r.workspace_deactivated_reason||'402 deactivated_workspace')+'">402 工作区</span>';
   if(ban)return '<span class="status-pill danger">自动禁用</span>';
   if(r.external_use_suspected)return '<span class="status-pill danger" title="'+esc(r.external_use_reason||'quota 上升但本地无明显使用')+'">疑似外部消耗</span>';
   if(triggerRisk(r))return '<span class="status-pill warn" title="'+esc(r.quota_trigger_error||'quota trigger failed')+'">触发异常</span>';
@@ -1024,12 +1633,15 @@ function accountIdentityCell(r){
   if(r.plan_type)badges.push('<span class="pill">'+esc(r.plan_type)+'</span>');
   if(r.configured)badges.push('<span class="pill">已配置</span>');
   if(r.invalid_auth)badges.push('<span class="pill danger" title="'+esc(r.invalid_auth_at||'')+'">401 失效</span>');
+  if(r.workspace_deactivated)badges.push('<span class="pill danger" title="'+esc(r.workspace_deactivated_at||'')+'">402 工作区</span>');
   if(r.external_use_suspected)badges.push('<span class="pill danger" title="'+esc(r.external_use_reason||'')+'">外部消耗 '+pct(r.external_use_delta_percent)+'</span>');
   if(r.quota_trigger_status)badges.push(triggerBadge(r));
   if(r.disabled)badges.push('<span class="pill">disabled</span>');
   if(r.expired)badges.push('<span class="pill">expired</span>');
-  const id=firstText(r.auth_file,r.auth_index,r.auth_id,'-');
-  return '<span class="account-name" title="'+esc(name)+'">'+esc(name)+'</span><div class="account-meta">'+badges.join('')+'<span class="account-id">'+esc(id)+'</span></div>';
+  const accountId=firstText(r.chatgpt_account_id,'');
+  const fileId=firstText(r.auth_file,r.auth_index,r.auth_id,'-');
+  const id=accountId?('id '+accountId+' · '+fileId):fileId;
+  return '<span class="account-name" title="'+esc(name)+'">'+esc(name)+'</span><div class="account-meta">'+badges.join('')+'<span class="account-id" title="'+esc(id)+'">'+esc(id)+'</span></div>';
 }
 function triggerBadge(r){
   const status=r.quota_trigger_status||'';
@@ -1065,13 +1677,14 @@ function renderProviders(rows,total){
 function costCell(r){return r.cost_available||Number(r.cost_usd||0)>0?'<span class="'+(r.cost_available?'ok':'muted')+'">'+money(r.cost_usd)+'</span>':'<span class="muted">缺价格</span>'}
 function renderInsights(data){
   const accounts=[...(data.accounts||[])]; const t=data.totals||{}; const total=t.total_tokens||0; const bans=data.autobans||[];
-  const top=accounts[0]; const quota=[...accounts].sort((a,b)=>maxQuota(b)-maxQuota(a))[0]; const lowCache=[...accounts].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0]; const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0]; const external=[...accounts].filter(r=>r.external_use_suspected).sort((a,b)=>(b.external_use_delta_percent||0)-(a.external_use_delta_percent||0))[0]; const invalid=[...accounts].filter(r=>r.invalid_auth)[0];
+  const top=accounts[0]; const quota=[...accounts].sort((a,b)=>maxQuota(b)-maxQuota(a))[0]; const lowCache=[...accounts].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0]; const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0]; const external=[...accounts].filter(r=>r.external_use_suspected).sort((a,b)=>(b.external_use_delta_percent||0)-(a.external_use_delta_percent||0))[0]; const invalid=[...accounts].filter(r=>r.invalid_auth)[0]; const workspace=[...accounts].filter(r=>r.workspace_deactivated)[0];
   const qt=data.quota_trigger||{}; const triggerLine=qt.enabled?('最近 '+fmt(qt.last_success||0)+' 成功 / '+fmt(qt.last_failed||0)+' 失败 / '+fmt(qt.last_skipped||0)+' 跳过'):'默认关闭';
   const items=[
     ['Token 集中度',top?accountName(top):'-',top?'Top 占 '+pct(ratio(top.total_tokens,total)):'暂无账号',ratio(top?.total_tokens||0,total)>50?'tone-orange':''],
     ['额度触发',qt.enabled?((qt.mode||'probe')+' · '+(qt.interval_minutes||10)+'m'):'已关闭',triggerLine,qt.last_failed?'tone-orange':qt.enabled?'tone-green':''],
-    ['自动禁用',fmt(bans.length)+' 个账号',bans.length?'等待 reset_at 自动放回':'当前没有 429 ban',bans.length?'tone-red':'tone-green'],
+    ['自动禁用',fmt(bans.length)+' 个账号',bans.length?'429 等待 reset_at，401/402 需处理认证文件':'当前没有自动禁用',bans.length?'tone-red':'tone-green'],
     ['401 失效',invalid?accountName(invalid):'0 个账号',invalid?'已停止使用，替换或删除 json 后解除':'当前没有失效 json',invalid?'tone-red':'tone-green'],
+    ['402 工作区',workspace?accountName(workspace):'0 个账号',workspace?'Team 工作区失效，删除或替换 json 后解除':'当前没有工作区失效',workspace?'tone-orange':'tone-green'],
     ['外部消耗',external?accountName(external):'0 个账号',external?external.external_use_window+' +'+pct(external.external_use_delta_percent)+' · 本地 '+compact(external.external_use_local_tokens)+' tok':'未发现一号多卖迹象',external?'tone-red':'tone-green'],
     ['额度最高',quota?accountName(quota):'-',quota?'5h '+pct(quota.primary_used_percent)+' · '+quotaWindowLabel(quota)+' '+pct(quota.secondary_used_percent):'暂无额度快照',maxQuota(quota||{})>=90?'tone-red':maxQuota(quota||{})>=70?'tone-orange':''],
     ['缓存最低',lowCache?accountName(lowCache):'-',lowCache?'缓存率 '+pct(cacheRate(lowCache))+' · 输入 '+compact(lowCache.input_tokens):'暂无输入 Token',lowCache&&cacheRate(lowCache)<30?'tone-orange':'']
@@ -1101,8 +1714,8 @@ function renderAutobans(rows){
   document.getElementById('autoban-next').disabled=autobanPage>=pages;
   document.getElementById('autobans').innerHTML=pageRows.map(r=>'<tr>'+
     td(esc(r.source||r.auth_id||'-'))+td(esc(r.auth_index||'-'))+td(esc(r.window||'-'))+td(esc(r.reason||'-'))+
-    td(esc(r.banned_at_text||'-'))+td(esc(r.reset_at_text||'-'))+td(duration(r.seconds_remaining),'num')+
-    td(pct(r.primary_used_percent),'num')+td(pct(r.secondary_used_percent),'num')+'</tr>').join('') || '<tr><td colspan="9" class="muted">当前没有被 429 自动禁用的 Codex 账号</td></tr>';
+    td(esc(r.banned_at_text||'-'))+td(esc(autobanResetText(r)))+td(esc(autobanRemainingText(r)),'num')+
+    td(pct(r.primary_used_percent),'num')+td(pct(r.secondary_used_percent),'num')+'</tr>').join('') || '<tr><td colspan="9" class="muted">当前没有被自动禁用的 Codex 账号</td></tr>';
 }
 function renderModels(target,rows){
   document.getElementById(target).innerHTML=rows.map(r=>'<tr>'+td(esc(r.model))+td(esc(r.alias))+td(esc(r.provider))+td(fmt(r.requests),'num')+td(compact(r.total_tokens),'num')+td(costCell(r),'num')+td(perfCell(r),'num')+td(compact(r.input_tokens),'num')+td(compact(r.output_tokens),'num')+td(compact(cacheTokens(r)),'num')+td(pct(cacheRate(r)),'num')+'</tr>').join('') || '<tr><td colspan="11" class="muted">暂无模型数据</td></tr>';

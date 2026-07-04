@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -150,6 +151,56 @@ ORDER BY reset_at DESC`, now)
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func mergeEffectiveAutobans(bans []autobanRow, invalids []invalidAuthRow) []autobanRow {
+	if len(invalids) == 0 {
+		return bans
+	}
+	out := make([]autobanRow, 0, len(bans)+len(invalids))
+	out = append(out, bans...)
+	for _, invalid := range invalids {
+		if !invalid.Active {
+			continue
+		}
+		out = append(out, invalidAuthAsAutoban(invalid))
+	}
+	return out
+}
+
+func invalidAuthAsAutoban(invalid invalidAuthRow) autobanRow {
+	status := invalid.LastStatusCode
+	if status == 0 {
+		status = http.StatusUnauthorized
+	}
+	reason := strings.TrimSpace(invalid.Reason)
+	if reason == "" {
+		reason = "401 unauthorized: credential is invalid"
+	}
+	window := "401"
+	resetText := "重新登录后解除"
+	if invalidAuthIsWorkspaceDeactivated(invalid) {
+		window = "402"
+		resetText = "删除或替换认证文件后解除"
+		if reason == "" {
+			reason = "402 deactivated_workspace: team workspace is deactivated"
+		}
+	}
+	return autobanRow{
+		AuthID:           invalid.AuthID,
+		AuthIndex:        invalid.AuthIndex,
+		Source:           invalid.Source,
+		Provider:         firstNonEmptyString(invalid.Provider, "codex"),
+		AuthFile:         invalid.AuthFile,
+		Window:           window,
+		Reason:           reason,
+		BannedAt:         invalid.InvalidatedAt,
+		BannedAtText:     invalid.InvalidatedAtText,
+		ResetAtText:      resetText,
+		SecondsRemaining: -1,
+		Active:           true,
+		LastStatusCode:   status,
+	}
 }
 
 func headerFloat(headers map[string][]string, key string) *float64 {
