@@ -44,7 +44,7 @@ type summaryCacheEntry struct {
 
 type summaryPrecomputeManager struct {
 	mu         sync.Mutex
-	refreshMu sync.Mutex
+	refreshMu  sync.Mutex
 	cfg        pluginConfig
 	cancel     context.CancelFunc
 	entries    map[summaryCacheKey]summaryCacheEntry
@@ -548,6 +548,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
+	invalidAuths = filterMissingInvalidAuthRows(invalidAuths, configuredAccounts, authDirReadable)
 	applyInvalidAuths(accounts, invalidAuths)
 	workspaceDeactivatedAuths := filterWorkspaceDeactivatedAuths(invalidAuths)
 	unauthorizedInvalidAuths := filterUnauthorizedInvalidAuths(invalidAuths)
@@ -646,7 +647,37 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 }
 
 func filterMissingAutobanRows(rows []autobanRow, configured []configuredAccount, authDirReadable bool) []autobanRow {
-	if !authDirReadable || len(configured) == 0 || len(rows) == 0 {
+	if !authDirReadable || len(rows) == 0 {
+		return rows
+	}
+	aliases := configuredAliasSet(configured)
+	strictAliases := configuredStrictAliasSet(configured)
+	out := rows[:0]
+	for _, row := range rows {
+		cleanupAliases := fileBackedCleanupAliases(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
+		if len(cleanupAliases) > 0 {
+			if aliasesContainAny(strictAliases, cleanupAliases...) {
+				out = append(out, row)
+			}
+			continue
+		}
+		rowStrictAliases := strictAuthStateAliasesForValues(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
+		if len(rowStrictAliases) > 0 {
+			if aliasesContainAny(strictAliases, rowStrictAliases...) {
+				out = append(out, row)
+			}
+			continue
+		}
+		if !fileBackedAuthState(row.AuthID, row.AuthIndex, row.Source, row.AuthFile) || aliasesContainAny(aliases, row.AuthID, row.AuthIndex, row.Source, row.AuthFile) {
+			out = append(out, row)
+			continue
+		}
+	}
+	return out
+}
+
+func filterMissingInvalidAuthRows(rows []invalidAuthRow, configured []configuredAccount, authDirReadable bool) []invalidAuthRow {
+	if !authDirReadable || len(rows) == 0 {
 		return rows
 	}
 	aliases := configuredAliasSet(configured)

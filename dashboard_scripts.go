@@ -769,7 +769,7 @@ async function deleteInvalidAuthRows(rows,confirmText,runningText){
   try{
     const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
     const body=await readResponseBody(res);
-    if(!res.ok&&res.status!==207){
+    if(!res.ok&&res.status!==207&&!authFileDeleteAlreadyApplied(res,body)){
       if(res.status===401)rejectManagementKey(key);
       throw new Error('HTTP '+res.status+' '+body);
     }
@@ -800,7 +800,7 @@ async function deleteWorkspaceDeactivatedRows(rows,confirmText,runningText){
   try{
     const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
     const body=await readResponseBody(res);
-    if(!res.ok&&res.status!==207){
+    if(!res.ok&&res.status!==207&&!authFileDeleteAlreadyApplied(res,body)){
       if(res.status===401)rejectManagementKey(key);
       throw new Error('HTTP '+res.status+' '+body);
     }
@@ -989,6 +989,10 @@ function authFileTimestamp(f){
 }
 function parseJSONBody(body){try{return JSON.parse(body||'{}')}catch(e){return {}}}
 async function readResponseBody(res){const text=await res.text();return text}
+function authFileDeleteAlreadyApplied(res,body){
+  const text=String(body||'').toLowerCase();
+  return !!res&&res.status===404&&(text.includes('auth file not found')||text.includes('auth_file_not_found'));
+}
 function codexAuthFiles(files){
   return (files||[]).filter(f=>{
     if(f.runtime_only)return false;

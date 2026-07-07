@@ -67,7 +67,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.18"
+	pluginVersion    = "0.1.19"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -1700,7 +1700,7 @@ ON CONFLICT(auth_id) DO UPDATE SET
 }
 
 type autobanReleaseRequest struct {
-	Scope string                `json:"scope"`
+	Scope string               `json:"scope"`
 	Items []autobanReleaseItem `json:"items"`
 }
 
@@ -1712,9 +1712,9 @@ type autobanReleaseItem struct {
 }
 
 type autobanReleaseResult struct {
-	Released int                     `json:"released"`
-	Skipped  int                     `json:"skipped"`
-	NotFound int                     `json:"not_found"`
+	Released int                    `json:"released"`
+	Skipped  int                    `json:"skipped"`
+	NotFound int                    `json:"not_found"`
 	Items    []autobanReleaseDetail `json:"items,omitempty"`
 }
 
@@ -2763,13 +2763,22 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if len(available) == 0 {
 		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
 	}
-	chosen := available[0]
-	for _, candidate := range available[1:] {
+	chosen := chooseFillFirstSchedulerCandidate(available)
+	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+}
+
+func chooseFillFirstSchedulerCandidate(candidates []schedulerAuthCandidate) schedulerAuthCandidate {
+	chosen := candidates[0]
+	for _, candidate := range candidates[1:] {
 		if candidate.Priority > chosen.Priority {
+			chosen = candidate
+			continue
+		}
+		if candidate.Priority == chosen.Priority && candidate.ID < chosen.ID {
 			chosen = candidate
 		}
 	}
-	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+	return chosen
 }
 
 func newNoAvailableCodexAuthError(bans []autobanRow, now int64) error {
