@@ -67,7 +67,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.17"
+	pluginVersion    = "0.1.18"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -356,6 +356,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Routes: []managementRoute{
 				{Method: "GET", Path: "/plugins/codex-token-usage/summary", Description: "Token usage summary JSON."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
+				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
 			},
 			Resources: []resourceRoute{
 				{Path: "/dashboard", Menu: "Token Usage", Description: "Account token usage dashboard."},
@@ -451,6 +452,26 @@ func handleManagement(req managementRequest) managementResponse {
 		kind := firstQuery(req.Query, "type", "accounts")
 		format := firstQuery(req.Query, "format", "csv")
 		return handleExportWithFilters(context.Background(), window, kind, format, limit, req.Query)
+	}
+	if req.Path == "/v0/management/plugins/"+pluginID+"/autobans/release" {
+		if !strings.EqualFold(req.Method, http.MethodPost) {
+			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		}
+		var body autobanReleaseRequest
+		if len(req.Body) > 0 {
+			if err := json.Unmarshal(req.Body, &body); err != nil {
+				return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
+			}
+		}
+		db, _, err := globalStore.open(context.Background())
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "release_failed", "message": err.Error()})
+		}
+		result, err := releaseAutobans(context.Background(), db, body)
+		if err != nil {
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
+		}
+		return jsonResponse(http.StatusOK, result)
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
 }
@@ -768,6 +789,9 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 	if err := ensureQuotaTriggerRunColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := ensureAutobanBanColumns(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -881,6 +905,14 @@ func sqliteIntegrityOK(problems []string) bool {
 	return len(problems) == 1 && strings.EqualFold(strings.TrimSpace(problems[0]), "ok")
 }
 
+func singleFileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
 func (s *store) repairDBHandle() (*sql.DB, bool, error) {
 	s.mu.Lock()
 	db := s.db
@@ -903,10 +935,13 @@ type dbHealthState struct {
 	Status               string `json:"status"`
 	LastCheckAt          string `json:"last_check_at,omitempty"`
 	LastRepairAt         string `json:"last_repair_at,omitempty"`
+	LastCheckpointAt     string `json:"last_checkpoint_at,omitempty"`
 	LastDurationMs       int64  `json:"last_duration_ms"`
 	LastError            string `json:"last_error,omitempty"`
 	LastQuickCheckResult string `json:"last_quick_check_result,omitempty"`
+	WALBytes             int64  `json:"wal_bytes,omitempty"`
 	RepairCount          int64  `json:"repair_count"`
+	CheckpointCount      int64  `json:"checkpoint_count"`
 }
 
 type dbHealthMonitor struct {
@@ -964,7 +999,9 @@ func (m *dbHealthMonitor) run(ctx context.Context) {
 	status := "ok"
 	var errText string
 	var quickResult string
+	var walBytes int64
 	repaired := false
+	checkpointed := false
 	db, closeAfter, err := globalStore.repairDBHandle()
 	if err != nil {
 		status = "error"
@@ -999,6 +1036,19 @@ func (m *dbHealthMonitor) run(ctx context.Context) {
 				}
 			}
 		}
+		if path, pathErr := usageDBPath(); pathErr == nil {
+			walBytes = singleFileSize(path + "-wal")
+			if walBytes > envInt64("CPA_DB_WAL_CHECKPOINT_BYTES", 256*1024*1024) {
+				if _, checkpointErr := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); checkpointErr != nil {
+					if errText == "" {
+						errText = sanitizeTriggerError(checkpointErr)
+					}
+				} else {
+					checkpointed = true
+					walBytes = singleFileSize(path + "-wal")
+				}
+			}
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1007,10 +1057,15 @@ func (m *dbHealthMonitor) run(ctx context.Context) {
 	m.state.LastQuickCheckResult = quickResult
 	m.state.LastError = errText
 	m.state.Status = status
+	m.state.WALBytes = walBytes
 	if repaired && errText == "" {
 		m.state.Status = "repaired"
 		m.state.LastRepairAt = time.Now().Format(time.RFC3339)
 		m.state.RepairCount++
+	}
+	if checkpointed {
+		m.state.LastCheckpointAt = time.Now().Format(time.RFC3339)
+		m.state.CheckpointCount++
 	}
 }
 
@@ -1237,6 +1292,45 @@ func ensureUsageEventColumns(ctx context.Context, db *sql.DB) error {
 			continue
 		}
 		if _, err := db.ExecContext(ctx, `ALTER TABLE usage_events ADD COLUMN `+column.name+` `+column.def); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureAutobanBanColumns(ctx context.Context, db *sql.DB) error {
+	columns := []struct {
+		name string
+		def  string
+	}{
+		{"released_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"release_reason", "TEXT NOT NULL DEFAULT ''"},
+	}
+	existing := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(autoban_bans)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, column := range columns {
+		if existing[column.name] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE autoban_bans ADD COLUMN `+column.name+` `+column.def); err != nil {
 			return err
 		}
 	}
@@ -1580,8 +1674,9 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
-  last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+  last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
+  released_at, release_reason
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, '')
 ON CONFLICT(auth_id) DO UPDATE SET
   auth_index=excluded.auth_index,
   source=excluded.source,
@@ -1595,11 +1690,258 @@ ON CONFLICT(auth_id) DO UPDATE SET
   primary_used_percent=excluded.primary_used_percent,
   primary_reset_at=excluded.primary_reset_at,
   secondary_used_percent=excluded.secondary_used_percent,
-  secondary_reset_at=excluded.secondary_reset_at`,
+  secondary_reset_at=excluded.secondary_reset_at,
+  released_at=0,
+  release_reason=''`,
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
 	)
 	return err
+}
+
+type autobanReleaseRequest struct {
+	Scope string                `json:"scope"`
+	Items []autobanReleaseItem `json:"items"`
+}
+
+type autobanReleaseItem struct {
+	AuthID    string `json:"auth_id"`
+	AuthIndex string `json:"auth_index"`
+	Source    string `json:"source"`
+	AuthFile  string `json:"auth_file"`
+}
+
+type autobanReleaseResult struct {
+	Released int                     `json:"released"`
+	Skipped  int                     `json:"skipped"`
+	NotFound int                     `json:"not_found"`
+	Items    []autobanReleaseDetail `json:"items,omitempty"`
+}
+
+type autobanReleaseDetail struct {
+	AuthID    string `json:"auth_id,omitempty"`
+	AuthIndex string `json:"auth_index,omitempty"`
+	Source    string `json:"source,omitempty"`
+	AuthFile  string `json:"auth_file,omitempty"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+func releaseAutobans(ctx context.Context, db *sql.DB, req autobanReleaseRequest) (autobanReleaseResult, error) {
+	scope := strings.ToLower(strings.TrimSpace(req.Scope))
+	if scope == "" {
+		scope = "selected"
+	}
+	now := time.Now().Unix()
+	switch scope {
+	case "all429":
+		return releaseAll429Autobans(ctx, db, now)
+	case "selected":
+		return releaseSelectedAutobans(ctx, db, req.Items, now)
+	default:
+		return autobanReleaseResult{}, fmt.Errorf("unsupported release scope %q", req.Scope)
+	}
+}
+
+func releaseAll429Autobans(ctx context.Context, db *sql.DB, now int64) (autobanReleaseResult, error) {
+	rows, err := queryActiveAutobanReleaseRows(ctx, db)
+	if err != nil {
+		return autobanReleaseResult{}, err
+	}
+	var result autobanReleaseResult
+	for _, row := range rows {
+		detail := autobanReleaseDetail{
+			AuthID:    row.AuthID,
+			AuthIndex: row.AuthIndex,
+			Source:    row.Source,
+			AuthFile:  row.AuthFile,
+		}
+		if !isReleasable429Autoban(row) {
+			result.Skipped++
+			detail.Status = "skipped"
+			detail.Reason = "not_429"
+			result.Items = append(result.Items, detail)
+			continue
+		}
+		ok, err := markAutobanReleased(ctx, db, row.AuthID, now)
+		if err != nil {
+			return result, err
+		}
+		if ok {
+			result.Released++
+			detail.Status = "released"
+		} else {
+			result.NotFound++
+			detail.Status = "not_found"
+		}
+		result.Items = append(result.Items, detail)
+	}
+	return result, nil
+}
+
+func releaseSelectedAutobans(ctx context.Context, db *sql.DB, items []autobanReleaseItem, now int64) (autobanReleaseResult, error) {
+	rows, err := queryActiveAutobanReleaseRows(ctx, db)
+	if err != nil {
+		return autobanReleaseResult{}, err
+	}
+	var result autobanReleaseResult
+	released := make(map[string]bool, len(items))
+	for _, item := range items {
+		detail := autobanReleaseDetail{
+			AuthID:    strings.TrimSpace(item.AuthID),
+			AuthIndex: strings.TrimSpace(item.AuthIndex),
+			Source:    strings.TrimSpace(item.Source),
+			AuthFile:  strings.TrimSpace(item.AuthFile),
+		}
+		match := -1
+		for i, row := range rows {
+			if released[row.AuthID] {
+				continue
+			}
+			if autobanReleaseItemMatchesRow(item, row) {
+				match = i
+				break
+			}
+		}
+		if match < 0 {
+			result.NotFound++
+			detail.Status = "not_found"
+			result.Items = append(result.Items, detail)
+			continue
+		}
+		row := rows[match]
+		detail.AuthID = row.AuthID
+		detail.AuthIndex = row.AuthIndex
+		detail.Source = row.Source
+		detail.AuthFile = row.AuthFile
+		if !isReleasable429Autoban(row) {
+			result.Skipped++
+			detail.Status = "skipped"
+			detail.Reason = "not_429"
+			result.Items = append(result.Items, detail)
+			continue
+		}
+		ok, err := markAutobanReleased(ctx, db, row.AuthID, now)
+		if err != nil {
+			return result, err
+		}
+		if ok {
+			released[row.AuthID] = true
+			result.Released++
+			detail.Status = "released"
+		} else {
+			result.NotFound++
+			detail.Status = "not_found"
+		}
+		result.Items = append(result.Items, detail)
+	}
+	return result, nil
+}
+
+func queryActiveAutobanReleaseRows(ctx context.Context, db *sql.DB) ([]autobanRow, error) {
+	if err := normalizeStoredResetColumns(ctx, db); err != nil {
+		return nil, err
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code,
+primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
+FROM autoban_bans
+WHERE active=1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []autobanRow
+	for rows.Next() {
+		var row autobanRow
+		var active int
+		var pp, sp sql.NullFloat64
+		var pr, sr sql.NullInt64
+		if err := rows.Scan(
+			&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.Window, &row.Reason,
+			&row.BannedAt, &row.ResetAt, &active, &row.LastStatusCode, &pp, &pr, &sp, &sr,
+		); err != nil {
+			return nil, err
+		}
+		row.Active = active != 0
+		for _, value := range []string{row.AuthID, row.AuthIndex, row.Source} {
+			if file := fileNameIfJSON(value); file != "" {
+				row.AuthFile = file
+				break
+			}
+		}
+		if pp.Valid {
+			row.PrimaryUsedPercent = &pp.Float64
+		}
+		if pr.Valid {
+			row.PrimaryResetAt = &pr.Int64
+		}
+		if sp.Valid {
+			row.SecondaryUsedPercent = &sp.Float64
+		}
+		if sr.Valid {
+			row.SecondaryResetAt = &sr.Int64
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func isReleasable429Autoban(row autobanRow) bool {
+	window := strings.ToLower(strings.TrimSpace(row.Window))
+	status := row.LastStatusCode
+	if status == http.StatusUnauthorized || status == http.StatusPaymentRequired || status == http.StatusForbidden {
+		return false
+	}
+	switch window {
+	case "401", "402", "403":
+		return false
+	}
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	switch window {
+	case "429", "5h", "primary", "7d", "week", "secondary":
+		return true
+	}
+	return false
+}
+
+func autobanReleaseItemMatchesRow(item autobanReleaseItem, row autobanRow) bool {
+	itemAliases := authStateMatchAliases(item.AuthID, item.AuthIndex, item.Source, item.AuthFile)
+	rowAliases := authStateMatchAliases(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
+	if strict := strictAuthStateAliasesForValues(item.AuthID, item.AuthIndex, item.Source, item.AuthFile); len(strict) > 0 {
+		itemAliases = strict
+	}
+	if strict := strictAuthStateAliasesForValues(row.AuthID, row.AuthIndex, row.Source, row.AuthFile); len(strict) > 0 {
+		rowAliases = strict
+	}
+	if len(itemAliases) == 0 || len(rowAliases) == 0 {
+		return false
+	}
+	for _, left := range itemAliases {
+		for _, right := range rowAliases {
+			if left != "" && left == right {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func markAutobanReleased(ctx context.Context, db *sql.DB, authID string, now int64) (bool, error) {
+	res, err := db.ExecContext(ctx, `
+UPDATE autoban_bans
+SET active=0, released_at=?, release_reason='manual'
+WHERE active=1 AND auth_id=?`, now, strings.TrimSpace(authID))
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 func (s *store) runQuotaTriggerRound(ctx context.Context, cfg pluginConfig) (int, int, int, int, error) {
@@ -2580,8 +2922,9 @@ LIMIT 1000`, now, now)
 		_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
-  last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+  last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
+  released_at, release_reason
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, '')
 ON CONFLICT(auth_id) DO UPDATE SET
   auth_index=excluded.auth_index,
   source=excluded.source,
@@ -2590,13 +2933,19 @@ ON CONFLICT(auth_id) DO UPDATE SET
   reason=excluded.reason,
   banned_at=excluded.banned_at,
   reset_at=excluded.reset_at,
-  active=CASE WHEN excluded.reset_at > ? THEN 1 ELSE autoban_bans.active END,
+  active=CASE
+    WHEN excluded.reset_at > ? AND (COALESCE(autoban_bans.released_at,0)=0 OR excluded.banned_at > COALESCE(autoban_bans.released_at,0)) THEN 1
+    ELSE autoban_bans.active
+  END,
   last_status_code=excluded.last_status_code,
   primary_used_percent=excluded.primary_used_percent,
   primary_reset_at=excluded.primary_reset_at,
   secondary_used_percent=excluded.secondary_used_percent,
-  secondary_reset_at=excluded.secondary_reset_at
-WHERE autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at`,
+  secondary_reset_at=excluded.secondary_reset_at,
+  released_at=CASE WHEN excluded.banned_at > COALESCE(autoban_bans.released_at,0) THEN 0 ELSE autoban_bans.released_at END,
+  release_reason=CASE WHEN excluded.banned_at > COALESCE(autoban_bans.released_at,0) THEN '' ELSE autoban_bans.release_reason END
+WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
+  AND (COALESCE(autoban_bans.released_at,0)=0 OR excluded.banned_at > COALESCE(autoban_bans.released_at,0) OR autoban_bans.active=1)`,
 			key, authIndex, source, provider, window, reason, requestedAt, resetAt, status,
 			nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp), nullIntPtr(sr), now,
 		)

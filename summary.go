@@ -32,6 +32,7 @@ type summaryPrecomputeInfo struct {
 	LastError    string `json:"last_error,omitempty"`
 	Precomputed  bool   `json:"precomputed"`
 	Synchronous  bool   `json:"synchronous"`
+	Stale        bool   `json:"stale,omitempty"`
 }
 
 type summaryCacheEntry struct {
@@ -43,6 +44,7 @@ type summaryCacheEntry struct {
 
 type summaryPrecomputeManager struct {
 	mu         sync.Mutex
+	refreshMu sync.Mutex
 	cfg        pluginConfig
 	cancel     context.CancelFunc
 	entries    map[summaryCacheKey]summaryCacheEntry
@@ -97,9 +99,11 @@ func (m *summaryPrecomputeManager) loop(ctx context.Context, cfg pluginConfig) {
 
 func defaultSummaryPrecomputeKeys() []summaryCacheKey {
 	return []summaryCacheKey{
+		{Window: "today", Limit: 2000},
 		{Window: "24h", Limit: 2000},
 		{Window: "7d", Limit: 2000},
 		{Window: "30d", Limit: 2000},
+		{Window: "all", Limit: 2000},
 		{Window: "24h", Limit: 100},
 		{Window: "24h", Limit: 500},
 		{Window: "all", Limit: 500},
@@ -114,7 +118,9 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 	for _, key := range keys {
 		key = normalizeSummaryCacheKey(key)
 		started := time.Now()
+		m.refreshMu.Lock()
 		data, err := store.summary(ctx, key.Window, key.Limit)
+		m.refreshMu.Unlock()
 		durationMs := time.Since(started).Milliseconds()
 		entry := summaryCacheEntry{
 			data:       data,
@@ -126,6 +132,7 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 			if firstErr == nil {
 				firstErr = err
 			}
+			var entryToSave summaryCacheEntry
 			m.mu.Lock()
 			if m.entries == nil {
 				m.entries = map[summaryCacheKey]summaryCacheEntry{}
@@ -133,18 +140,17 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 			if previous, ok := m.entries[key]; ok && previous.data != nil {
 				previous.err = entry.err
 				m.entries[key] = previous
+				entryToSave = previous
 			} else {
 				m.entries[key] = entry
 			}
 			m.mu.Unlock()
+			if entryToSave.data != nil && store != nil {
+				_ = store.saveSummaryCacheEntry(ctx, key, entryToSave)
+			}
 			continue
 		}
-		m.mu.Lock()
-		if m.entries == nil {
-			m.entries = map[summaryCacheKey]summaryCacheEntry{}
-		}
-		m.entries[key] = entry
-		m.mu.Unlock()
+		m.remember(ctx, store, key, entry)
 	}
 	return firstErr
 }
@@ -161,7 +167,11 @@ func (m *summaryPrecomputeManager) summary(ctx context.Context, store *store, wi
 		}
 		return data, err
 	}
-	if data, ok := m.cached(window, limit, cfg); ok {
+	if data, ok := m.cached(ctx, store, window, limit, cfg); ok {
+		if summaryPrecomputeStale(data) {
+			key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
+			m.refreshAsync(store, cfg, key)
+		}
 		attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
 		return data, nil
 	}
@@ -172,12 +182,8 @@ func (m *summaryPrecomputeManager) summary(ctx context.Context, store *store, wi
 	if err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
-	if m.entries == nil {
-		m.entries = map[summaryCacheKey]summaryCacheEntry{}
-	}
-	m.entries[key] = summaryCacheEntry{data: data, cachedAt: time.Now(), durationMs: durationMs}
-	m.mu.Unlock()
+	entry := summaryCacheEntry{data: data, cachedAt: time.Now(), durationMs: durationMs}
+	m.remember(ctx, store, key, entry)
 	out := cloneSummaryMap(data)
 	out["precompute"] = summaryPrecomputeInfo{
 		Enabled:      true,
@@ -199,7 +205,7 @@ func (m *summaryPrecomputeManager) summaryFresh(ctx context.Context, store *stor
 	cfg := m.config()
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
 	if cfg.SummaryPrecomputeEnabled {
-		if data, ok := m.cachedAny(key, cfg); ok {
+		if data, ok := m.cachedAny(ctx, store, key, cfg); ok {
 			m.refreshAsync(store, cfg, key)
 			attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
 			return data, nil
@@ -222,12 +228,8 @@ func (m *summaryPrecomputeManager) summarySyncWithStarted(ctx context.Context, s
 	if err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
-	if m.entries == nil {
-		m.entries = map[summaryCacheKey]summaryCacheEntry{}
-	}
-	m.entries[key] = summaryCacheEntry{data: data, cachedAt: time.Now(), durationMs: durationMs}
-	m.mu.Unlock()
+	entry := summaryCacheEntry{data: data, cachedAt: time.Now(), durationMs: durationMs}
+	m.remember(ctx, store, key, entry)
 	out := cloneSummaryMap(data)
 	out["precompute"] = summaryPrecomputeInfo{
 		Enabled:      cfg.SummaryPrecomputeEnabled,
@@ -269,31 +271,164 @@ func (m *summaryPrecomputeManager) refreshAsync(store *store, cfg pluginConfig, 
 	}()
 }
 
-func (m *summaryPrecomputeManager) cached(window string, limit int, cfg pluginConfig) (map[string]any, bool) {
+func (m *summaryPrecomputeManager) cached(ctx context.Context, store *store, window string, limit int, cfg pluginConfig) (map[string]any, bool) {
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
-	m.mu.Lock()
-	entry, ok := m.entries[key]
-	m.mu.Unlock()
-	if !ok || entry.data == nil {
+	if data, ok := m.cachedEntry(key, cfg); ok {
+		return data, true
+	}
+	if store == nil {
 		return nil, false
 	}
-	ttl := time.Duration(maxInt(cfg.SummaryPrecomputeIntervalSeconds*2, 10)) * time.Second
+	entry, ok, err := store.loadSummaryCacheEntry(ctx, key)
+	if err != nil || !ok {
+		return nil, false
+	}
+	m.rememberMemory(key, entry)
 	age := time.Since(entry.cachedAt)
-	if age > ttl {
-		return nil, false
-	}
-	return cloneCachedSummary(entry, key, cfg, age), true
+	return cloneCachedSummary(entry, key, cfg, age, age > summaryCacheTTL(cfg)), true
 }
 
-func (m *summaryPrecomputeManager) cachedAny(key summaryCacheKey, cfg pluginConfig) (map[string]any, bool) {
+func (m *summaryPrecomputeManager) cachedAny(ctx context.Context, store *store, key summaryCacheKey, cfg pluginConfig) (map[string]any, bool) {
 	key = normalizeSummaryCacheKey(key)
+	if data, ok := m.cachedEntry(key, cfg); ok {
+		return data, true
+	}
+	if store == nil {
+		return nil, false
+	}
+	entry, ok, err := store.loadSummaryCacheEntry(ctx, key)
+	if err != nil || !ok {
+		return nil, false
+	}
+	m.rememberMemory(key, entry)
+	age := time.Since(entry.cachedAt)
+	return cloneCachedSummary(entry, key, cfg, age, age > summaryCacheTTL(cfg)), true
+}
+
+func (m *summaryPrecomputeManager) cachedEntry(key summaryCacheKey, cfg pluginConfig) (map[string]any, bool) {
 	m.mu.Lock()
 	entry, ok := m.entries[key]
 	m.mu.Unlock()
 	if !ok || entry.data == nil {
 		return nil, false
 	}
-	return cloneCachedSummary(entry, key, cfg, time.Since(entry.cachedAt)), true
+	age := time.Since(entry.cachedAt)
+	return cloneCachedSummary(entry, key, cfg, age, age > summaryCacheTTL(cfg)), true
+}
+
+func (m *summaryPrecomputeManager) remember(ctx context.Context, store *store, key summaryCacheKey, entry summaryCacheEntry) {
+	m.rememberMemory(key, entry)
+	if store != nil && entry.data != nil {
+		_ = store.saveSummaryCacheEntry(ctx, key, entry)
+	}
+}
+
+func (m *summaryPrecomputeManager) rememberMemory(key summaryCacheKey, entry summaryCacheEntry) {
+	key = normalizeSummaryCacheKey(key)
+	if entry.data == nil {
+		return
+	}
+	if entry.cachedAt.IsZero() {
+		entry.cachedAt = time.Now()
+	}
+	m.mu.Lock()
+	if m.entries == nil {
+		m.entries = map[summaryCacheKey]summaryCacheEntry{}
+	}
+	m.entries[key] = entry
+	m.mu.Unlock()
+}
+
+func summaryCacheTTL(cfg pluginConfig) time.Duration {
+	return time.Duration(maxInt(cfg.SummaryPrecomputeIntervalSeconds*2, 10)) * time.Second
+}
+
+type summaryCacheLoadResult struct {
+	entry summaryCacheEntry
+	ok    bool
+}
+
+func summaryCacheStorageKey(key summaryCacheKey) string {
+	key = normalizeSummaryCacheKey(key)
+	return key.Window + "|" + strconv.Itoa(key.Limit)
+}
+
+func (s *store) loadSummaryCacheEntry(ctx context.Context, key summaryCacheKey) (summaryCacheEntry, bool, error) {
+	key = normalizeSummaryCacheKey(key)
+	result, err := withSQLiteAutoRepair(ctx, s, "load summary cache", func() (summaryCacheLoadResult, error) {
+		db, _, err := s.open(ctx)
+		if err != nil {
+			return summaryCacheLoadResult{}, err
+		}
+		var raw string
+		var cachedAt int64
+		var durationMs int64
+		var lastError string
+		err = db.QueryRowContext(ctx, `
+SELECT data_json, cached_at, duration_ms, last_error
+FROM summary_cache
+WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&raw, &cachedAt, &durationMs, &lastError)
+		if err == sql.ErrNoRows {
+			return summaryCacheLoadResult{}, nil
+		}
+		if err != nil {
+			return summaryCacheLoadResult{}, err
+		}
+		if strings.TrimSpace(raw) == "" || cachedAt <= 0 {
+			return summaryCacheLoadResult{}, nil
+		}
+		var data map[string]any
+		if err := json.Unmarshal([]byte(raw), &data); err != nil {
+			return summaryCacheLoadResult{}, err
+		}
+		return summaryCacheLoadResult{
+			entry: summaryCacheEntry{
+				data:       data,
+				cachedAt:   time.Unix(cachedAt, 0),
+				durationMs: durationMs,
+				err:        lastError,
+			},
+			ok: true,
+		}, nil
+	})
+	if err != nil {
+		return summaryCacheEntry{}, false, err
+	}
+	return result.entry, result.ok, nil
+}
+
+func (s *store) saveSummaryCacheEntry(ctx context.Context, key summaryCacheKey, entry summaryCacheEntry) error {
+	if s == nil || entry.data == nil {
+		return nil
+	}
+	key = normalizeSummaryCacheKey(key)
+	if entry.cachedAt.IsZero() {
+		entry.cachedAt = time.Now()
+	}
+	payload, err := json.Marshal(entry.data)
+	if err != nil {
+		return err
+	}
+	_, err = withSQLiteAutoRepair(ctx, s, "save summary cache", func() (struct{}, error) {
+		db, _, err := s.open(ctx)
+		if err != nil {
+			return struct{}{}, err
+		}
+		_, err = db.ExecContext(ctx, `
+INSERT INTO summary_cache (cache_key, window, limit_count, cached_at, duration_ms, last_error, data_json)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(cache_key) DO UPDATE SET
+  window=excluded.window,
+  limit_count=excluded.limit_count,
+  cached_at=excluded.cached_at,
+  duration_ms=excluded.duration_ms,
+  last_error=excluded.last_error,
+  data_json=excluded.data_json`,
+			summaryCacheStorageKey(key), key.Window, key.Limit, entry.cachedAt.Unix(), entry.durationMs, entry.err, string(payload),
+		)
+		return struct{}{}, err
+	})
+	return err
 }
 
 func (m *summaryPrecomputeManager) config() pluginConfig {
@@ -324,7 +459,7 @@ func cloneSummaryMap(data map[string]any) map[string]any {
 	return out
 }
 
-func cloneCachedSummary(entry summaryCacheEntry, key summaryCacheKey, cfg pluginConfig, age time.Duration) map[string]any {
+func cloneCachedSummary(entry summaryCacheEntry, key summaryCacheKey, cfg pluginConfig, age time.Duration, stale bool) map[string]any {
 	out := cloneSummaryMap(entry.data)
 	out["precompute"] = summaryPrecomputeInfo{
 		Enabled:      true,
@@ -338,8 +473,14 @@ func cloneCachedSummary(entry summaryCacheEntry, key summaryCacheKey, cfg plugin
 		LastError:    entry.err,
 		Precomputed:  true,
 		Synchronous:  false,
+		Stale:        stale,
 	}
 	return out
+}
+
+func summaryPrecomputeStale(data map[string]any) bool {
+	info, ok := data["precompute"].(summaryPrecomputeInfo)
+	return ok && info.Stale
 }
 
 func attachSummaryRuntimeInfo(data map[string]any, durationMs int64) {
@@ -1142,12 +1283,50 @@ func readConfiguredProviderNames() []string {
 	return out
 }
 
+type providerConfigEntryCacheState struct {
+	mu      sync.Mutex
+	path    string
+	modTime int64
+	size    int64
+	entries []providerConfigEntry
+}
+
+var configuredProviderEntriesCache providerConfigEntryCacheState
+
 func readConfiguredProviderEntries() []providerConfigEntry {
-	raw, err := os.ReadFile(configuredConfigPath())
+	path := configuredConfigPath()
+	info, err := os.Stat(path)
 	if err != nil {
 		return nil
 	}
-	return configuredProviderEntriesFromYAML(string(raw))
+	modTime := info.ModTime().UnixNano()
+	size := info.Size()
+	configuredProviderEntriesCache.mu.Lock()
+	if configuredProviderEntriesCache.path == path && configuredProviderEntriesCache.modTime == modTime && configuredProviderEntriesCache.size == size {
+		entries := cloneProviderConfigEntries(configuredProviderEntriesCache.entries)
+		configuredProviderEntriesCache.mu.Unlock()
+		return entries
+	}
+	configuredProviderEntriesCache.mu.Unlock()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	entries := configuredProviderEntriesFromYAML(string(raw))
+	configuredProviderEntriesCache.mu.Lock()
+	configuredProviderEntriesCache.path = path
+	configuredProviderEntriesCache.modTime = modTime
+	configuredProviderEntriesCache.size = size
+	configuredProviderEntriesCache.entries = cloneProviderConfigEntries(entries)
+	configuredProviderEntriesCache.mu.Unlock()
+	return entries
+}
+
+func cloneProviderConfigEntries(entries []providerConfigEntry) []providerConfigEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	return append([]providerConfigEntry(nil), entries...)
 }
 
 func configuredProviderNamesFromYAML(raw string) []string {
@@ -1804,12 +1983,52 @@ func accountQuotaAliases(account accountRow, emailCounts map[string]int) []strin
 	if email == "" || emailCounts[email] <= 1 {
 		return accountAliases(account)
 	}
-	values := []string{account.AuthFile, account.AuthIndex, account.ChatGPTAccountID}
+	values := strictFileIdentityAliases(account.AuthFile, account.AuthIndex)
+	if chatgptAccountID := normalizeAccountAlias(account.ChatGPTAccountID); chatgptAccountID != "" {
+		values = append(values, chatgptAccountID)
+	}
 	authID := normalizeAccountAlias(account.AuthID)
 	if authID != "" && authID != email && authID != normalizeAccountAlias(account.Source) && authID != normalizeAccountAlias(account.Name) {
-		values = append(values, account.AuthID)
+		values = append(values, normalizeAccountAliases(account.AuthID)...)
 	}
-	return normalizeAccountAliases(values...)
+	return uniqueNonEmptyAliases(values)
+}
+
+func strictFileIdentityAliases(values ...string) []string {
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		base := filepath.Base(value)
+		for _, candidate := range []string{value, base} {
+			alias := normalizeAccountAlias(candidate)
+			if alias == "" {
+				continue
+			}
+			out = append(out, alias)
+			lower := strings.ToLower(candidate)
+			if strings.HasSuffix(lower, ".json") {
+				out = append(out, normalizeAccountAlias(candidate[:len(candidate)-len(".json")]))
+			}
+		}
+	}
+	return uniqueNonEmptyAliases(out)
+}
+
+func uniqueNonEmptyAliases(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		alias := normalizeAccountAlias(value)
+		if alias == "" || seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		out = append(out, alias)
+	}
+	return out
 }
 
 func trustedUsageQuotaSnapshotSQL() string {
@@ -1871,20 +2090,127 @@ func applyAccountQuotaSource(account *accountRow) {
 	account.QuotaCredibility = ""
 }
 
-func queryAccountWindowTokens(ctx context.Context, db *sql.DB, account accountRow, reset sql.NullInt64, duration time.Duration, aliases []string) int64 {
+type accountTokenWindow struct {
+	Start   int64
+	End     int64
+	Aliases []string
+}
+
+func accountTokenWindowForReset(reset sql.NullInt64, duration time.Duration, aliases []string) accountTokenWindow {
 	if !reset.Valid || reset.Int64 <= 0 {
-		return 0
+		return accountTokenWindow{}
 	}
 	end := normalizeUnixSeconds(reset.Int64)
-	if end <= 0 || end <= time.Now().Unix() {
-		return 0
+	now := time.Now().Unix()
+	if end <= 0 || end <= now {
+		return accountTokenWindow{}
 	}
 	start := end - int64(duration.Seconds())
-	now := time.Now().Unix()
 	if start > now {
 		start = now - int64(duration.Seconds())
 	}
-	return queryAccountTokensBetween(ctx, db, account, start, end, aliases)
+	if start < 0 {
+		start = 0
+	}
+	return accountTokenWindow{Start: start, End: end, Aliases: aliases}
+}
+
+func queryAccountWindowTokens(ctx context.Context, db *sql.DB, account accountRow, reset sql.NullInt64, duration time.Duration, aliases []string) int64 {
+	window := accountTokenWindowForReset(reset, duration, aliases)
+	if len(window.Aliases) == 0 {
+		return 0
+	}
+	tokens := queryAccountWindowTokensBatch(ctx, db, []accountTokenWindow{window})
+	if len(tokens) == 0 {
+		return 0
+	}
+	return tokens[0]
+}
+
+func queryAccountWindowTokensBatch(ctx context.Context, db *sql.DB, windows []accountTokenWindow) []int64 {
+	out := make([]int64, len(windows))
+	if len(windows) == 0 {
+		return out
+	}
+	aliasToWindows := map[string][]int{}
+	minStart, maxEnd := int64(0), int64(0)
+	for i, window := range windows {
+		if window.End <= 0 || window.End < window.Start {
+			continue
+		}
+		if minStart == 0 || window.Start < minStart {
+			minStart = window.Start
+		}
+		if window.End > maxEnd {
+			maxEnd = window.End
+		}
+		seen := map[string]bool{}
+		for _, alias := range uniqueNonEmptyAliases(window.Aliases) {
+			if alias == "" || seen[alias] {
+				continue
+			}
+			seen[alias] = true
+			aliasToWindows[alias] = append(aliasToWindows[alias], i)
+		}
+	}
+	if minStart == 0 || maxEnd == 0 || len(aliasToWindows) == 0 {
+		return out
+	}
+	aliases := make([]string, 0, len(aliasToWindows))
+	for alias := range aliasToWindows {
+		aliases = append(aliases, alias)
+	}
+	const chunkSize = 250
+	for start := 0; start < len(aliases); start += chunkSize {
+		end := start + chunkSize
+		if end > len(aliases) {
+			end = len(aliases)
+		}
+		chunk := aliases[start:end]
+		placeholders := sqlPlaceholders(len(chunk))
+		args := make([]any, 0, 2+len(chunk)*3)
+		args = append(args, minStart, maxEnd)
+		for i := 0; i < 3; i++ {
+			for _, alias := range chunk {
+				args = append(args, alias)
+			}
+		}
+		rows, err := db.QueryContext(ctx, `
+SELECT requested_at, total_tokens, lower(auth_index), lower(auth_id), lower(source)
+FROM usage_events
+WHERE requested_at >= ? AND requested_at <= ?
+AND (
+  (auth_index <> '' AND lower(auth_index) IN (`+placeholders+`))
+  OR (auth_id <> '' AND lower(auth_id) IN (`+placeholders+`))
+  OR (source <> '' AND lower(source) IN (`+placeholders+`))
+)`, args...)
+		if err != nil {
+			continue
+		}
+		for rows.Next() {
+			var ts, tokens int64
+			var authIndex, authID, source string
+			if err := rows.Scan(&ts, &tokens, &authIndex, &authID, &source); err != nil {
+				continue
+			}
+			matched := map[int]bool{}
+			for _, alias := range []string{authIndex, authID, source} {
+				for _, windowIndex := range aliasToWindows[normalizeAccountAlias(alias)] {
+					if matched[windowIndex] {
+						continue
+					}
+					window := windows[windowIndex]
+					if ts < window.Start || ts > window.End {
+						continue
+					}
+					out[windowIndex] += tokens
+					matched[windowIndex] = true
+				}
+			}
+		}
+		_ = rows.Close()
+	}
+	return out
 }
 
 func queryAccountTokensBetween(ctx context.Context, db *sql.DB, account accountRow, start int64, end int64, aliases []string) int64 {
@@ -2264,10 +2590,14 @@ func applyLatestQuotaSnapshots(ctx context.Context, db *sql.DB, accounts []accou
 	primarySnapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, accounts, since, "primary")
 	secondarySnapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, accounts, since, "secondary")
 	quotaAliases := accountQuotaAliasSets(accounts)
+	primaryWindows := make([]accountTokenWindow, len(accounts))
+	secondaryWindows := make([]accountTokenWindow, len(accounts))
+	secondaryDurations := make([]time.Duration, len(accounts))
 	for i := range accounts {
 		primary := primarySnapshots[i]
 		secondary := secondarySnapshots[i]
 		primary, secondary = moveMonthlyPrimaryQuotaToSecondary(accounts[i], primary, secondary)
+		secondaryDurations[i] = secondaryQuotaDuration(accounts[i], secondary.ResetAt)
 		accounts[i].PrimaryUsedPercent = nil
 		accounts[i].PrimaryResetAt = nil
 		accounts[i].PrimaryQuotaWindow = ""
@@ -2280,11 +2610,25 @@ func applyLatestQuotaSnapshots(ctx context.Context, db *sql.DB, accounts []accou
 		accounts[i].PrimaryWindowTokens = 0
 		accounts[i].SecondaryWindowTokens = 0
 		applyAccountQuotaSnapshot(&accounts[i], primary, secondary)
-		accounts[i].PrimaryWindowTokens = queryAccountWindowTokens(ctx, db, accounts[i], primary.ResetAt, 5*time.Hour, quotaAliases[i])
-		secondaryDuration := secondaryQuotaDuration(accounts[i], secondary.ResetAt)
-		accounts[i].SecondaryWindowTokens = queryAccountWindowTokens(ctx, db, accounts[i], secondary.ResetAt, secondaryDuration, quotaAliases[i])
-		accounts[i].SecondaryQuotaWindow = secondaryQuotaWindowLabel(secondaryDuration)
-		accounts[i].QuotaWindowSource = secondaryQuotaWindowSource(accounts[i], secondary.ResetAt, secondaryDuration)
+		primaryWindows[i] = accountTokenWindowForReset(primary.ResetAt, 5*time.Hour, quotaAliases[i])
+		secondaryWindows[i] = accountTokenWindowForReset(secondary.ResetAt, secondaryDurations[i], quotaAliases[i])
+	}
+	primaryTokens := queryAccountWindowTokensBatch(ctx, db, primaryWindows)
+	secondaryTokens := queryAccountWindowTokensBatch(ctx, db, secondaryWindows)
+	for i := range accounts {
+		if i < len(primaryTokens) {
+			accounts[i].PrimaryWindowTokens = primaryTokens[i]
+		}
+		if i < len(secondaryTokens) {
+			accounts[i].SecondaryWindowTokens = secondaryTokens[i]
+		}
+		secondary := secondarySnapshots[i]
+		if primary, ok := primarySnapshots[i]; ok {
+			primary, secondary = moveMonthlyPrimaryQuotaToSecondary(accounts[i], primary, secondary)
+			_ = primary
+		}
+		accounts[i].SecondaryQuotaWindow = secondaryQuotaWindowLabel(secondaryDurations[i])
+		accounts[i].QuotaWindowSource = secondaryQuotaWindowSource(accounts[i], secondary.ResetAt, secondaryDurations[i])
 		applyAccountQuotaSource(&accounts[i])
 	}
 }

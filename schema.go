@@ -50,6 +50,22 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_quota_scan ON usage_events(requested
 CREATE INDEX IF NOT EXISTS idx_usage_events_api_key_requested ON usage_events(api_key, requested_at);
 CREATE INDEX IF NOT EXISTS idx_usage_events_provider_requested ON usage_events(provider, requested_at);
 CREATE INDEX IF NOT EXISTS idx_usage_events_status_requested ON usage_events(status_code, requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_requested_id_desc ON usage_events(requested_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_events_lower_auth_index_requested ON usage_events(lower(auth_index), requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_lower_auth_id_requested ON usage_events(lower(auth_id), requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_lower_source_requested ON usage_events(lower(source), requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_provider_model_requested ON usage_events(provider, model, alias, requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_api_key_provider_requested ON usage_events(api_key, provider, requested_at);
+CREATE TABLE IF NOT EXISTS summary_cache (
+  cache_key TEXT PRIMARY KEY,
+  window TEXT NOT NULL DEFAULT '',
+  limit_count INTEGER NOT NULL DEFAULT 0,
+  cached_at INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  data_json TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_summary_cache_cached_at ON summary_cache(cached_at);
 CREATE TABLE IF NOT EXISTS autoban_bans (
   auth_id TEXT PRIMARY KEY,
   auth_index TEXT NOT NULL DEFAULT '',
@@ -64,7 +80,9 @@ CREATE TABLE IF NOT EXISTS autoban_bans (
   primary_used_percent REAL,
   primary_reset_at INTEGER,
   secondary_used_percent REAL,
-  secondary_reset_at INTEGER
+  secondary_reset_at INTEGER,
+  released_at INTEGER NOT NULL DEFAULT 0,
+  release_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_autoban_bans_active_reset ON autoban_bans(active, reset_at);
 CREATE TABLE IF NOT EXISTS invalid_auths (
