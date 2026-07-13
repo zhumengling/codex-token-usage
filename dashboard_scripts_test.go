@@ -55,3 +55,17 @@ func TestInvalidAuthManagementUsesUnfilteredCountsAndPartialDeleteResults(t *tes
 		}
 	}
 }
+
+func TestNonStandardAuthImportUIUsesPluginHostSaveFlow(t *testing.T) {
+	for _, marker := range []string{
+		"账号 JSON 导入",
+		"auth-import/preview",
+		"auth-import/commit",
+		"host.auth.save",
+		"无 RT",
+	} {
+		if !strings.Contains(dashboardBody+dashboardScripts, marker) && !strings.Contains(dashboardBody+dashboardScripts+dashboardStyles, marker) {
+			t.Fatalf("auth import UI marker %q not found", marker)
+		}
+	}
+}

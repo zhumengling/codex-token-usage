@@ -8,6 +8,7 @@ const dashboardBody = `</style>
     <div><h1>CPA Token Usage</h1><div class="hint" id="pool-hero-hint">按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。</div></div>
     <div class="controls">
       <input id="key" class="fallback-key" type="password" autocomplete="current-password" aria-label="CPA 管理密码备用输入" placeholder="管理密钥备用输入">
+      <button id="auth-import-open" class="ghost" type="button">账号 JSON 导入</button>
       <button id="batch-proxy-open" class="ghost" type="button">批量写入代理</button>
       <select id="language" data-no-i18n aria-label="语言"><option value="zh">中文</option><option value="en">English</option></select>
       <select id="window" aria-label="统计窗口"><option value="24h">最近 24 小时</option><option value="today">今天</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="all">全部</option></select>
@@ -87,6 +88,24 @@ const dashboardBody = `</style>
   </section>
   <div id="provider-pages"></div>
 </main>
+<div id="auth-import-modal" class="modal-backdrop" hidden>
+  <div class="modal-panel auth-import-panel" role="dialog" aria-modal="true" aria-labelledby="auth-import-title">
+    <div class="modal-head"><h2 id="auth-import-title">非标准账号 JSON 批量导入</h2><button id="auth-import-close" class="icon-button ghost" type="button" aria-label="关闭账号 JSON 导入">×</button></div>
+    <div class="modal-body">
+      <label class="form-row auth-import-file-row"><span>文件</span><input id="auth-import-files" type="file" accept=".json,.txt,application/json,text/plain" multiple></label>
+      <label class="form-row auth-import-text-row"><span>账号内容</span><textarea id="auth-import-text" spellcheck="false" placeholder="粘贴 ChatGPT Session、sub2api、9router、Codex auth.json、AxonHub、Codex-Manager 或卖家卡密文本。"></textarea></label>
+      <label class="auth-import-overwrite"><input id="auth-import-overwrite" type="checkbox">覆盖同名 CPA 认证文件</label>
+      <div class="modal-note">内容只发送到当前 CPA 插件进行本地转换，通过 <code>host.auth.save</code> 保存；预览结果不会返回或显示 Token。</div>
+      <div id="auth-import-status" class="modal-status" role="status" aria-live="polite">等待粘贴或选择账号文件。</div>
+      <div id="auth-import-results" class="auth-import-results"></div>
+    </div>
+    <div class="modal-actions">
+      <button id="auth-import-clear" class="ghost" type="button">清空</button>
+      <button id="auth-import-preview" class="ghost" type="button">识别预览</button>
+      <button id="auth-import-commit" type="button">导入 CPA</button>
+    </div>
+  </div>
+</div>
 <div id="batch-proxy-modal" class="modal-backdrop" hidden>
   <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="batch-proxy-title">
     <div class="modal-head"><h2 id="batch-proxy-title">批量写入 Codex 代理</h2><button id="batch-proxy-close" class="icon-button ghost" type="button" aria-label="关闭批量写入代理">×</button></div>

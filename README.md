@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.27`
+Current version: `0.1.28`
 
 ## Features
 
@@ -18,6 +18,7 @@ Current version: `0.1.27`
 - Manual Chinese / English language switch saved in the browser.
 - xAI account-pool dashboard for xAI OAuth JSON credentials, with xAI-specific 401/403/429 and free-usage-exhausted states.
 - xAI accounts are read through CPA `host.auth.list/get/get_runtime` when available, with filesystem fallback for older CPA versions; account rows classify Free, Super, and Heavy tiers from auth metadata.
+- Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
 - Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
 
 ## Install Manually
@@ -148,11 +149,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.27_linux_amd64.zip
-codex-token-usage_0.1.27_linux_arm64.zip
-codex-token-usage_0.1.27_windows_amd64.zip
-codex-token-usage_0.1.27_darwin_amd64.zip
-codex-token-usage_0.1.27_darwin_arm64.zip
+codex-token-usage_0.1.28_linux_amd64.zip
+codex-token-usage_0.1.28_linux_arm64.zip
+codex-token-usage_0.1.28_windows_amd64.zip
+codex-token-usage_0.1.28_darwin_amd64.zip
+codex-token-usage_0.1.28_darwin_arm64.zip
 checksums.txt
 ```
 

@@ -4,12 +4,18 @@ const dashboardScripts = `
 const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
 const managementAutobanReleaseApi='/v0/management/plugins/__PLUGIN_ID__/autobans/release';
+const managementAuthImportPreviewApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/preview';
+const managementAuthImportCommitApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/commit';
 const managementAuthFilesApi='/v0/management/auth-files';
 const managementAuthFieldsApi='/v0/management/auth-files/fields';
 const managementCodexAuthUrlApi='/v0/management/codex-auth-url';
 const managementAuthStatusApi='/v0/management/get-auth-status';
 const keyEl=document.getElementById('key');
 const languageEl=document.getElementById('language');
+const authImportModal=document.getElementById('auth-import-modal');
+const authImportTextEl=document.getElementById('auth-import-text');
+const authImportStatusEl=document.getElementById('auth-import-status');
+const authImportResultsEl=document.getElementById('auth-import-results');
 const batchProxyModal=document.getElementById('batch-proxy-modal');
 const batchProxyUrlEl=document.getElementById('batch-proxy-url');
 const batchProxyStatusEl=document.getElementById('batch-proxy-status');
@@ -54,6 +60,7 @@ const summaryWindowCache=new Map();
 const saved=managementKey(); if(saved) keyEl.value=saved;
 selectedProviders=loadSelectedProviders();
 initLanguageControl();
+initAuthImportControl();
 initBatchProxyControl();
 initInvalidAuthControl();
 initWorkspaceDeactivatedControl();
@@ -221,6 +228,16 @@ function initBatchProxyControl(){
   batchProxyModal.addEventListener('click',e=>{if(e.target===batchProxyModal)closeBatchProxyModal()});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!batchProxyModal.hidden)closeBatchProxyModal()});
 }
+function initAuthImportControl(){
+  document.getElementById('auth-import-open').onclick=openAuthImportModal;
+  document.getElementById('auth-import-close').onclick=closeAuthImportModal;
+  document.getElementById('auth-import-clear').onclick=clearAuthImport;
+  document.getElementById('auth-import-preview').onclick=previewAuthImport;
+  document.getElementById('auth-import-commit').onclick=commitAuthImport;
+  document.getElementById('auth-import-files').onchange=readAuthImportFiles;
+  authImportModal.addEventListener('click',e=>{if(e.target===authImportModal)closeAuthImportModal()});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!authImportModal.hidden)closeAuthImportModal()});
+}
 function initInvalidAuthControl(){
   document.getElementById('invalid-auth-card').onclick=openInvalidAuthModal;
   document.getElementById('invalid-auth-close').onclick=closeInvalidAuthModal;
@@ -268,6 +285,18 @@ function openBatchProxyModal(){
   setBatchProxyStatus('等待输入代理地址。','');
   batchProxyModal.hidden=false;
   setTimeout(()=>batchProxyUrlEl.focus(),0);
+}
+function openAuthImportModal(){
+  setAuthImportStatus(authImportTextEl.value?'账号内容已就绪，可以识别预览。':'等待粘贴或选择账号文件。','');
+  authImportModal.hidden=false;
+  setTimeout(()=>authImportTextEl.focus(),0);
+}
+function closeAuthImportModal(){authImportModal.hidden=true}
+function clearAuthImport(){
+  authImportTextEl.value='';
+  document.getElementById('auth-import-files').value='';
+  authImportResultsEl.innerHTML='';
+  setAuthImportStatus('已清空，等待新的账号内容。','ok');
 }
 function closeBatchProxyModal(){batchProxyModal.hidden=true}
 function openInvalidAuthModal(){
@@ -1001,6 +1030,72 @@ async function readResponseBody(res){const text=await res.text();return text}
 function authFileDeleteAlreadyApplied(res,body){
   const text=String(body||'').toLowerCase();
   return !!res&&res.status===404&&(text.includes('auth file not found')||text.includes('auth_file_not_found'));
+}
+function setAuthImportStatus(text,tone){
+  authImportStatusEl.textContent=tr(text);
+  authImportStatusEl.classList.remove('ok','warn','bad');
+  if(tone)authImportStatusEl.classList.add(tone);
+}
+async function readAuthImportFiles(e){
+  const files=Array.from((e.target&&e.target.files)||[]);
+  if(!files.length)return;
+  setAuthImportStatus('正在读取 '+files.length+' 个文件...','');
+  const parts=[];
+  for(const file of files){
+    try{parts.push('=== '+file.name+' ===\n'+await file.text())}catch(err){parts.push('=== '+file.name+' 读取失败 ===')}
+  }
+  authImportTextEl.value=[authImportTextEl.value.trim(),parts.join('\n')].filter(Boolean).join('\n');
+  setAuthImportStatus('已读取 '+files.length+' 个文件，可以识别预览。','ok');
+}
+function authImportKey(){
+  const key=managementKey();
+  if(!key){showFallbackKeyInput();setAuthImportStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');return ''}
+  safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
+  return key;
+}
+function setAuthImportBusy(busy){
+  document.getElementById('auth-import-preview').disabled=busy;
+  document.getElementById('auth-import-commit').disabled=busy;
+  document.getElementById('auth-import-clear').disabled=busy;
+  document.getElementById('auth-import-files').disabled=busy;
+}
+async function requestAuthImport(url){
+  const text=authImportTextEl.value.trim();
+  if(!text){setAuthImportStatus('请先粘贴或选择账号文件。','warn');return null}
+  const key=authImportKey();if(!key)return null;
+  const res=await fetch(url,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({text:text,overwrite:document.getElementById('auth-import-overwrite').checked})});
+  const body=await readResponseBody(res);
+  if(!res.ok){if(res.status===401)rejectManagementKey(key);const parsed=parseJSONBody(body);throw new Error(firstText(parsed.message,parsed.error,'HTTP '+res.status))}
+  return parseJSONBody(body);
+}
+async function previewAuthImport(){
+  setAuthImportBusy(true);setAuthImportStatus('正在识别账号格式...','');
+  try{const result=await requestAuthImport(managementAuthImportPreviewApi);if(!result)return;renderAuthImportResults(result);setAuthImportStatus('识别完成：'+fmt(result.detected||0)+' 个账号，跳过 '+fmt(result.skipped||0)+' 项。',(result.detected||0)?'ok':'warn')}
+  catch(e){setAuthImportStatus('识别失败：'+e.message,'bad')}
+  finally{setAuthImportBusy(false)}
+}
+async function commitAuthImport(){
+  if(!confirm(tr('确认将识别出的账号写入 CPA 认证文件？')))return;
+  setAuthImportBusy(true);setAuthImportStatus('正在转换并导入 CPA...','');
+  try{
+    const result=await requestAuthImport(managementAuthImportCommitApi);if(!result)return;
+    renderAuthImportResults(result);
+    const tone=(result.failed||0)?'warn':'ok';
+    setAuthImportStatus('导入完成：成功 '+fmt(result.imported||0)+'，跳过 '+fmt(result.skipped||0)+'，失败 '+fmt(result.failed||0)+'。',tone);
+    await load(true,true);
+  }catch(e){setAuthImportStatus('导入失败：'+e.message,'bad')}
+  finally{setAuthImportBusy(false)}
+}
+function renderAuthImportResults(result){
+  const items=result.items||[];
+  const rows=items.map(item=>{
+    const warnings=(item.warnings||[]).map(v=>'<span class="auth-import-warning">'+esc(v)+'</span>').join('');
+    const state=item.existing?'<span class="pill warn">已存在</span>':'<span class="pill ok">可导入</span>';
+    const refresh=item.has_refresh_token?'<span class="pill ok">可刷新</span>':'<span class="pill danger">无 RT</span>';
+    return '<div class="auth-import-result"><div><b>'+esc(item.email||item.file_name||'unknown')+'</b><span>'+esc(item.file_name||'-')+'</span></div><div class="auth-import-result-meta"><span class="pill">'+esc(item.source_format||'generic')+'</span><span class="pill">'+esc(item.plan_type||'unknown')+'</span>'+refresh+state+'</div><div class="auth-import-warnings">'+warnings+'</div></div>';
+  }).join('');
+  const errors=(result.errors||[]).map(v=>'<div class="auth-import-error">'+esc(v)+'</div>').join('');
+  authImportResultsEl.innerHTML=rows+errors||'<div class="invalid-auth-empty">没有识别到可导入账号。</div>';
 }
 function parseAuthFileDeleteResult(res,body,requested){
   const status=res?res.status:0;

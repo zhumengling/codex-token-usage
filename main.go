@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.27"
+	pluginVersion    = "0.1.28"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -437,6 +437,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: "GET", Path: "/plugins/codex-token-usage/summary", Description: "Token usage summary JSON."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
+				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/preview", Description: "Preview non-standard Codex auth JSON imports."},
+				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/commit", Description: "Convert and save non-standard Codex auth JSON imports."},
 			},
 			Resources: []resourceRoute{
 				{Path: "/dashboard", Menu: "Token Usage", Description: "Account token usage dashboard."},
@@ -569,6 +571,18 @@ func handleManagement(req managementRequest) managementResponse {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
 		}
 		return jsonResponse(http.StatusOK, result)
+	}
+	if req.Path == "/v0/management/plugins/"+pluginID+"/auth-import/preview" {
+		if !strings.EqualFold(req.Method, http.MethodPost) {
+			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		}
+		return handleAuthImportPreview(req.Body)
+	}
+	if req.Path == "/v0/management/plugins/"+pluginID+"/auth-import/commit" {
+		if !strings.EqualFold(req.Method, http.MethodPost) {
+			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		}
+		return handleAuthImportCommit(req.Body)
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
 }
