@@ -44,6 +44,7 @@ func TestNormalizedProtectionPlan(t *testing.T) {
 }
 
 func TestProtectionConcurrencySwitchesCandidate(t *testing.T) {
+	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
 	cfg := defaultPluginConfig()
 	cfg.AccountProtectionEnabled = true
@@ -52,7 +53,7 @@ func TestProtectionConcurrencySwitchesCandidate(t *testing.T) {
 	ctx := context.Background()
 	candidates := []schedulerAuthCandidate{protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1)}
 	for _, want := range []string{"a", "a", "b"} {
-		got, err := s.pickProtectedAuth(ctx, db, candidates, cfg)
+		got, err := s.pickProtectedAuth(ctx, db, candidates, cfg, "codex\x00test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -63,6 +64,7 @@ func TestProtectionConcurrencySwitchesCandidate(t *testing.T) {
 }
 
 func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
+	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
 	cfg := defaultPluginConfig()
 	cfg.AccountProtectionEnabled = true
@@ -73,7 +75,7 @@ func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 	}
 	got, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
 		protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1),
-	}, cfg)
+	}, cfg, "codex\x00test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +85,7 @@ func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 }
 
 func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
+	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
 	cfg := defaultPluginConfig()
 	cfg.AccountProtectionEnabled = true
@@ -98,7 +101,7 @@ func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
 	}
 	got, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
 		protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1),
-	}, cfg)
+	}, cfg, "codex\x00test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +111,7 @@ func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
 }
 
 func TestProtectionSaturationUsesPriorityBeforeTokenDemotion(t *testing.T) {
+	globalSchedulerRotation.reset()
 	states := []protectionCandidate{
 		{
 			Candidate: schedulerAuthCandidate{ID: "high", Priority: 10},
@@ -124,8 +128,41 @@ func TestProtectionSaturationUsesPriorityBeforeTokenDemotion(t *testing.T) {
 			Threshold: 100,
 		},
 	}
-	if got := chooseProtectedCandidate(states); got.Candidate.ID != "high" {
+	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "high" {
 		t.Fatalf("picked %q, want higher-priority saturated candidate", got.Candidate.ID)
+	}
+}
+
+func TestProtectionRoundRobinsWithinSamePriority(t *testing.T) {
+	globalSchedulerRotation.reset()
+	states := []protectionCandidate{
+		{Candidate: schedulerAuthCandidate{ID: "z-account", Priority: 1}, Limit: 5},
+		{Candidate: schedulerAuthCandidate{ID: "a-account", Priority: 1}, Limit: 5},
+	}
+	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "a-account" {
+		t.Fatalf("first pick = %q, want a-account", got.Candidate.ID)
+	}
+	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "z-account" {
+		t.Fatalf("second pick = %q, want z-account", got.Candidate.ID)
+	}
+}
+
+func TestSchedulerRotationUsesHighestPriorityAndStableOrder(t *testing.T) {
+	var rotation schedulerRotationManager
+	candidates := []schedulerAuthCandidate{
+		{ID: "z-high", Priority: 9},
+		{ID: "low", Priority: 1},
+		{ID: "a-high", Priority: 9},
+	}
+	if got := rotation.pick("codex\x00model", candidates); got.ID != "a-high" {
+		t.Fatalf("first pick = %q, want a-high", got.ID)
+	}
+	reordered := []schedulerAuthCandidate{candidates[2], candidates[0], candidates[1]}
+	if got := rotation.pick("codex\x00model", reordered); got.ID != "z-high" {
+		t.Fatalf("second pick = %q, want z-high", got.ID)
+	}
+	if got := rotation.pick("codex\x00model", candidates); got.ID != "a-high" {
+		t.Fatalf("third pick = %q, want a-high", got.ID)
 	}
 }
 
@@ -139,7 +176,7 @@ func TestProtectionReservationExpiresAndReleasesOnUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := defaultPluginConfig()
-	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{protectionTestCandidate("other", "plus", 1)}, cfg)
+	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{protectionTestCandidate("other", "plus", 1)}, cfg, "codex\x00test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +189,63 @@ func TestProtectionReservationExpiresAndReleasesOnUsage(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("reservation count = %d, want 0", count)
+	}
+}
+
+func TestProtectionCandidateAliasesExcludeSharedWorkspaceID(t *testing.T) {
+	candidates := []schedulerAuthCandidate{
+		{ID: "shared-workspace", Attributes: map[string]string{"auth_index": "shared-workspace", "source": "a@example.com", "auth_file": "a.json"}},
+		{ID: "shared-workspace", Attributes: map[string]string{"auth_index": "shared-workspace", "source": "b@example.com", "auth_file": "b.json"}},
+	}
+	sets := protectionCandidateAliasSets(candidates)
+	if len(sets) != 2 {
+		t.Fatalf("alias sets = %+v", sets)
+	}
+	for i, aliases := range sets {
+		if containsAlias(aliases, "shared-workspace") {
+			t.Fatalf("candidate %d retained shared workspace alias: %+v", i, aliases)
+		}
+	}
+	if !containsAlias(sets[0], "a.json") || !containsAlias(sets[0], "a@example.com") {
+		t.Fatalf("candidate A aliases = %+v", sets[0])
+	}
+	if !containsAlias(sets[1], "b.json") || !containsAlias(sets[1], "b@example.com") {
+		t.Fatalf("candidate B aliases = %+v", sets[1])
+	}
+}
+
+func TestConfiguredProtectionPlanIndexIgnoresSharedAliases(t *testing.T) {
+	index := configuredProtectionPlanIndex([]configuredAccount{
+		{AuthID: "shared", AuthIndex: "shared", Email: "a@example.com", AuthFile: "a.json", PlanType: "free"},
+		{AuthID: "shared", AuthIndex: "shared", Email: "b@example.com", AuthFile: "b.json", PlanType: "team"},
+	})
+	if index["shared"] != "" {
+		t.Fatalf("shared alias retained plan %q", index["shared"])
+	}
+	if index["a@example.com"] != "free" || index["b@example.com"] != "team" {
+		t.Fatalf("unique plan index = %+v", index)
+	}
+}
+
+func TestProtectionSnapshotBatchesReservationAndTokenMetrics(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at) VALUES ('shared', 'shared', 'a@example.com', 'k12', ?, ?)`, now, now+900); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, source, total_tokens) VALUES (?, 'codex', 'shared', 'shared', 'a@example.com', 100), (?, 'codex', 'shared', 'shared', 'b@example.com', 200)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := loadProtectionSnapshot(context.Background(), db, now-300, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inFlight, tokens := snapshot.metrics([]string{"a@example.com"})
+	if inFlight != 1 || tokens != 100 {
+		t.Fatalf("account A metrics = %d/%d, want 1/100", inFlight, tokens)
+	}
+	inFlight, tokens = snapshot.metrics([]string{"b@example.com"})
+	if inFlight != 0 || tokens != 200 {
+		t.Fatalf("account B metrics = %d/%d, want 0/200", inFlight, tokens)
 	}
 }

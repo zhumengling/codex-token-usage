@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +18,7 @@ var globalAccountProtection accountProtectionManager
 
 type protectionCandidate struct {
 	Candidate schedulerAuthCandidate
+	Aliases   []string
 	AuthID    string
 	AuthIndex string
 	Source    string
@@ -100,7 +100,7 @@ func schedulerCandidateIdentity(candidate schedulerAuthCandidate) accountIdentit
 	}
 }
 
-func schedulerCandidatePlan(candidate schedulerAuthCandidate) string {
+func schedulerCandidatePlan(candidate schedulerAuthCandidate, aliases []string, configuredPlans map[string]string) string {
 	plan := firstNonEmptyString(
 		candidate.Attributes["plan_type"], candidate.Attributes["plan"],
 		stringFromAny(candidate.Metadata["plan_type"]), stringFromAny(candidate.Metadata["plan"]),
@@ -108,13 +108,33 @@ func schedulerCandidatePlan(candidate schedulerAuthCandidate) string {
 	if plan != "" {
 		return normalizedProtectionPlan(plan)
 	}
-	aliases := schedulerCandidateAliases(candidate)
-	for _, account := range readConfiguredAuthAccounts() {
-		if aliasesOverlap(aliases, configuredAliases(account)) {
-			return normalizedProtectionPlan(account.PlanType)
+	for _, alias := range aliases {
+		if plan := configuredPlans[normalizeAccountAlias(alias)]; plan != "" {
+			return plan
 		}
 	}
 	return "plus"
+}
+
+func configuredProtectionPlanIndex(configured []configuredAccount) map[string]string {
+	aliases := make([][]string, len(configured))
+	counts := make(map[string]int, len(configured)*5)
+	for i := range configured {
+		aliases[i] = configuredAliases(configured[i])
+		for _, alias := range aliases[i] {
+			counts[alias]++
+		}
+	}
+	out := make(map[string]string, len(counts))
+	for i := range configured {
+		plan := normalizedProtectionPlan(configured[i].PlanType)
+		for _, alias := range aliases[i] {
+			if counts[alias] == 1 {
+				out[alias] = plan
+			}
+		}
+	}
+	return out
 }
 
 func aliasesOverlap(left, right []string) bool {
@@ -134,14 +154,18 @@ func aliasesOverlap(left, right []string) bool {
 	return false
 }
 
-func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig) protectionCandidate {
+func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig, configuredPlans map[string]string, aliases []string) protectionCandidate {
 	identity := schedulerCandidateIdentity(candidate)
 	if identity.AuthIndex == "" {
 		identity.AuthIndex = identity.AuthID
 	}
-	plan := schedulerCandidatePlan(candidate)
+	if len(aliases) == 0 {
+		aliases = schedulerCandidateAliases(candidate)
+	}
+	plan := schedulerCandidatePlan(candidate, aliases, configuredPlans)
 	return protectionCandidate{
 		Candidate: candidate,
+		Aliases:   aliases,
 		AuthID:    identity.AuthID,
 		AuthIndex: identity.AuthIndex,
 		Source:    identity.Source,
@@ -151,7 +175,7 @@ func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig) 
 	}
 }
 
-func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig) (schedulerAuthCandidate, error) {
+func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey string) (schedulerAuthCandidate, error) {
 	globalAccountProtection.pickMu.Lock()
 	defer globalAccountProtection.pickMu.Unlock()
 	tx, err := db.BeginTx(ctx, nil)
@@ -163,20 +187,19 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 	if _, err = tx.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE expires_at <= ?`, now); err != nil {
 		return schedulerAuthCandidate{}, err
 	}
+	configuredPlans := configuredProtectionPlanIndex(readConfiguredAuthAccounts())
+	aliasSets := protectionCandidateAliasSets(candidates)
+	snapshot, err := loadProtectionSnapshot(ctx, tx, now-int64(cfg.AccountProtectionTokenWindowSeconds), now)
+	if err != nil {
+		return schedulerAuthCandidate{}, err
+	}
 	states := make([]protectionCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		state := protectionCandidateFor(candidate, cfg)
-		state.InFlight, err = reservationCount(ctx, tx, state)
-		if err != nil {
-			return schedulerAuthCandidate{}, err
-		}
-		state.Tokens, err = rollingCandidateTokens(ctx, tx, state, now-int64(cfg.AccountProtectionTokenWindowSeconds))
-		if err != nil {
-			return schedulerAuthCandidate{}, err
-		}
+	for i, candidate := range candidates {
+		state := protectionCandidateFor(candidate, cfg, configuredPlans, aliasSets[i])
+		state.InFlight, state.Tokens = snapshot.metrics(state.Aliases)
 		states = append(states, state)
 	}
-	chosen := chooseProtectedCandidate(states)
+	chosen := chooseProtectedCandidate(states, rotationKey)
 	if _, err = tx.ExecContext(ctx, `
 INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at)
 VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
@@ -188,90 +211,175 @@ VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chos
 	return chosen.Candidate, nil
 }
 
-func chooseProtectedCandidate(states []protectionCandidate) protectionCandidate {
-	available := make([]protectionCandidate, 0, len(states))
+func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) protectionCandidate {
+	eligible := make([]protectionCandidate, 0, len(states))
+	for _, state := range states {
+		demoted := state.Threshold > 0 && state.Tokens >= state.Threshold
+		if state.InFlight < state.Limit && !demoted {
+			eligible = append(eligible, state)
+		}
+	}
+	if len(eligible) > 0 {
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal")
+	}
 	for _, state := range states {
 		if state.InFlight < state.Limit {
-			available = append(available, state)
+			eligible = append(eligible, state)
 		}
 	}
-	if len(available) > 0 {
-		sort.SliceStable(available, func(i, j int) bool {
-			return protectionPriorityLess(available[i], available[j], false)
+	if len(eligible) > 0 {
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted")
+	}
+	minInFlight := states[0].InFlight
+	for _, state := range states[1:] {
+		if state.InFlight < minInFlight {
+			minInFlight = state.InFlight
+		}
+	}
+	for _, state := range states {
+		if state.InFlight == minInFlight {
+			eligible = append(eligible, state)
+		}
+	}
+	return rotateProtectedCandidate(eligible, rotationKey+"\x00saturated")
+}
+
+func rotateProtectedCandidate(states []protectionCandidate, rotationKey string) protectionCandidate {
+	candidates := make([]schedulerAuthCandidate, 0, len(states))
+	byID := make(map[string]protectionCandidate, len(states))
+	for _, state := range states {
+		candidates = append(candidates, state.Candidate)
+		byID[state.Candidate.ID] = state
+	}
+	chosen := globalSchedulerRotation.pick(rotationKey, candidates)
+	return byID[chosen.ID]
+}
+
+func protectionCandidateAliasSets(candidates []schedulerAuthCandidate) [][]string {
+	raw := make([][]string, len(candidates))
+	counts := make(map[string]int, len(candidates)*5)
+	for i := range candidates {
+		raw[i] = schedulerCandidateAliases(candidates[i])
+		for _, alias := range raw[i] {
+			counts[alias]++
+		}
+	}
+	out := make([][]string, len(candidates))
+	for i := range candidates {
+		authFile := firstNonEmptyString(
+			candidates[i].Attributes["auth_file"],
+			stringFromAny(candidates[i].Metadata["auth_file"]),
+			candidates[i].Attributes["path"],
+			stringFromAny(candidates[i].Metadata["path"]),
+		)
+		aliases := strictFileIdentityAliases(fileNameIfJSON(authFile))
+		for _, alias := range raw[i] {
+			if counts[alias] == 1 {
+				aliases = append(aliases, alias)
+			}
+		}
+		out[i] = uniqueNonEmptyAliases(aliases)
+		if len(out[i]) == 0 {
+			out[i] = raw[i]
+		}
+	}
+	return out
+}
+
+type protectionRowsQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+type protectionUsageSample struct {
+	Aliases []string
+	Tokens  int64
+}
+
+type protectionSnapshot struct {
+	Reservations [][]string
+	Usage        []protectionUsageSample
+}
+
+func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since int64, now int64) (protectionSnapshot, error) {
+	var snapshot protectionSnapshot
+	rows, err := db.QueryContext(ctx, `
+SELECT auth_id, auth_index, source
+FROM account_protection_reservations
+WHERE expires_at > ?`, now)
+	if err != nil {
+		return snapshot, err
+	}
+	for rows.Next() {
+		var authID, authIndex, source string
+		if err := rows.Scan(&authID, &authIndex, &source); err != nil {
+			_ = rows.Close()
+			return snapshot, err
+		}
+		snapshot.Reservations = append(snapshot.Reservations, normalizeAccountAliases(authID, authIndex, source))
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return snapshot, err
+	}
+	if err := rows.Close(); err != nil {
+		return snapshot, err
+	}
+	rows, err = db.QueryContext(ctx, `
+SELECT auth_id, auth_index, source, total_tokens
+FROM usage_events INDEXED BY idx_usage_events_provider_requested
+WHERE provider IN ('codex','Codex','CODEX') AND requested_at >= ?`, since)
+	if err != nil {
+		return snapshot, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var authID, authIndex, source string
+		var tokens int64
+		if err := rows.Scan(&authID, &authIndex, &source, &tokens); err != nil {
+			return snapshot, err
+		}
+		if tokens <= 0 {
+			continue
+		}
+		snapshot.Usage = append(snapshot.Usage, protectionUsageSample{
+			Aliases: normalizeAccountAliases(authID, authIndex, source),
+			Tokens:  tokens,
 		})
-		return available[0]
 	}
-	sort.SliceStable(states, func(i, j int) bool {
-		if states[i].InFlight != states[j].InFlight {
-			return states[i].InFlight < states[j].InFlight
-		}
-		return protectionPriorityLess(states[i], states[j], true)
-	})
-	return states[0]
+	return snapshot, rows.Err()
 }
 
-func protectionPriorityLess(left, right protectionCandidate, ignoreToken bool) bool {
-	leftDemoted := !ignoreToken && left.Threshold > 0 && left.Tokens >= left.Threshold
-	rightDemoted := !ignoreToken && right.Threshold > 0 && right.Tokens >= right.Threshold
-	if leftDemoted != rightDemoted {
-		return !leftDemoted
-	}
-	if left.Candidate.Priority != right.Candidate.Priority {
-		return left.Candidate.Priority > right.Candidate.Priority
-	}
-	return left.Candidate.ID < right.Candidate.ID
-}
-
-type reservationQueryer interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-func reservationCount(ctx context.Context, db reservationQueryer, state protectionCandidate) (int, error) {
-	aliases := schedulerCandidateAliases(state.Candidate)
+func (snapshot protectionSnapshot) metrics(aliases []string) (int, int64) {
 	if len(aliases) == 0 {
-		aliases = normalizeAccountAliases(state.AuthID, state.AuthIndex, state.Source)
+		return 0, 0
 	}
-	if len(aliases) == 0 {
-		return 0, nil
-	}
-	args := make([]any, 0, len(aliases)*3)
-	for _, column := range []string{"auth_id", "auth_index", "source"} {
-		_ = column
-		for _, alias := range aliases {
-			args = append(args, alias)
+	aliasSet := make(map[string]struct{}, len(aliases))
+	for _, alias := range aliases {
+		if alias = normalizeAccountAlias(alias); alias != "" {
+			aliasSet[alias] = struct{}{}
 		}
 	}
-	query := `SELECT COUNT(*) FROM account_protection_reservations WHERE lower(auth_id) IN (` + sqlPlaceholders(len(aliases)) + `)
-OR lower(auth_index) IN (` + sqlPlaceholders(len(aliases)) + `)
-OR lower(source) IN (` + sqlPlaceholders(len(aliases)) + `)`
-	var count int
-	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
-	return count, err
-}
-
-func rollingCandidateTokens(ctx context.Context, db reservationQueryer, state protectionCandidate, since int64) (int64, error) {
-	aliases := schedulerCandidateAliases(state.Candidate)
-	if len(aliases) == 0 {
-		aliases = normalizeAccountAliases(state.AuthID, state.AuthIndex, state.Source)
+	overlaps := func(values []string) bool {
+		for _, value := range values {
+			if _, ok := aliasSet[normalizeAccountAlias(value)]; ok {
+				return true
+			}
+		}
+		return false
 	}
-	if len(aliases) == 0 {
-		return 0, nil
-	}
-	args := make([]any, 0, 1+len(aliases)*3)
-	args = append(args, since)
-	for range []string{"auth_id", "auth_index", "source"} {
-		for _, alias := range aliases {
-			args = append(args, alias)
+	inFlight := 0
+	for _, reservation := range snapshot.Reservations {
+		if overlaps(reservation) {
+			inFlight++
 		}
 	}
-	query := `SELECT COALESCE(SUM(total_tokens),0) FROM usage_events
-WHERE requested_at >= ? AND lower(provider)='codex' AND (
-lower(auth_id) IN (` + sqlPlaceholders(len(aliases)) + `) OR
-lower(auth_index) IN (` + sqlPlaceholders(len(aliases)) + `) OR
-lower(source) IN (` + sqlPlaceholders(len(aliases)) + `))`
 	var tokens int64
-	err := db.QueryRowContext(ctx, query, args...).Scan(&tokens)
-	return tokens, err
+	for _, sample := range snapshot.Usage {
+		if overlaps(sample.Aliases) {
+			tokens += sample.Tokens
+		}
+	}
+	return inFlight, tokens
 }
 
 func releaseProtectionReservation(ctx context.Context, db *sql.DB, rec usageRecord) error {
@@ -321,9 +429,10 @@ func applyAccountProtectionState(ctx context.Context, db *sql.DB, accounts []acc
 	}
 	now := time.Now().Unix()
 	_, _ = db.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE expires_at <= ?`, now)
+	candidates := make([]schedulerAuthCandidate, len(accounts))
 	for i := range accounts {
 		account := &accounts[i]
-		candidate := schedulerAuthCandidate{
+		candidates[i] = schedulerAuthCandidate{
 			ID:       firstNonEmptyString(account.AuthID, account.AuthIndex, account.Source),
 			Provider: account.Provider,
 			Attributes: map[string]string{
@@ -333,15 +442,16 @@ func applyAccountProtectionState(ctx context.Context, db *sql.DB, accounts []acc
 				"plan_type":  account.PlanType,
 			},
 		}
-		state := protectionCandidateFor(candidate, cfg)
-		inFlight, err := reservationCount(ctx, db, state)
-		if err != nil {
-			continue
-		}
-		tokens, err := rollingCandidateTokens(ctx, db, state, now-int64(cfg.AccountProtectionTokenWindowSeconds))
-		if err != nil {
-			continue
-		}
+	}
+	snapshot, err := loadProtectionSnapshot(ctx, db, now-int64(cfg.AccountProtectionTokenWindowSeconds), now)
+	if err != nil {
+		return
+	}
+	aliasSets := protectionCandidateAliasSets(candidates)
+	for i := range accounts {
+		account := &accounts[i]
+		state := protectionCandidateFor(candidates[i], cfg, nil, aliasSets[i])
+		inFlight, tokens := snapshot.metrics(state.Aliases)
 		account.ProtectionPlan = state.PlanType
 		account.ProtectionInFlight = inFlight
 		account.ProtectionConcurrencyLimit = state.Limit

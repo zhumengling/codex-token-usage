@@ -18,7 +18,7 @@ func newTestStore(t *testing.T) *store {
 	return s
 }
 
-func TestSummaryCacheInvalidatesAfterUsageRevisionChange(t *testing.T) {
+func TestSummarySyncRefreshesAfterUsageRevisionChange(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 	cfg := normalizePluginConfig(defaultPluginConfig())
@@ -49,7 +49,7 @@ func TestSummaryCacheInvalidatesAfterUsageRevisionChange(t *testing.T) {
 		t.Fatalf("record usage: %v", err)
 	}
 
-	data, err = m.summary(ctx, s, "24h", 50)
+	data, err = m.summarySync(ctx, s, "24h", 50)
 	if err != nil {
 		t.Fatalf("second summary: %v", err)
 	}
@@ -62,6 +62,61 @@ func TestSummaryCacheInvalidatesAfterUsageRevisionChange(t *testing.T) {
 	}
 	if pre, ok := data["precompute"].(summaryPrecomputeInfo); ok && pre.Hit {
 		t.Fatalf("summary reused stale cache after usage revision changed: %+v", pre)
+	}
+}
+
+func TestSummaryReturnsStaleCacheWhileRevisionRefreshRuns(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	m := &summaryPrecomputeManager{}
+	data, err := m.summary(ctx, s, "24h", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals := data["totals"].(totalsRow); totals.Requests != 0 {
+		t.Fatalf("initial requests = %d", totals.Requests)
+	}
+	if err := s.recordUsage(ctx, usageRecord{
+		Provider: "codex", AuthID: "alice", AuthIndex: "alice", Source: "alice",
+		RequestedAt: time.Now(), Detail: usageDetail{TotalTokens: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: "24h", Limit: 50})
+	m.mu.Lock()
+	if m.refreshing == nil {
+		m.refreshing = map[summaryCacheKey]bool{}
+	}
+	m.refreshing[key] = true
+	m.mu.Unlock()
+	data, err = m.summary(ctx, s, "24h", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals := data["totals"].(totalsRow); totals.Requests != 0 {
+		t.Fatalf("stale response requests = %d, want cached 0", totals.Requests)
+	}
+	pre, ok := data["precompute"].(summaryPrecomputeInfo)
+	if !ok || !pre.Hit || !pre.Stale || pre.Synchronous || pre.Reason != "revision_stale" {
+		t.Fatalf("precompute = %#v, want asynchronous revision-stale hit", data["precompute"])
+	}
+}
+
+func TestSummaryAsyncRefreshIsThrottledWithinPrecomputeInterval(t *testing.T) {
+	cfg := normalizePluginConfig(defaultPluginConfig())
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: "24h", Limit: 50})
+	m := &summaryPrecomputeManager{
+		entries: map[summaryCacheKey]summaryCacheEntry{
+			key: {data: map[string]any{"ok": true}, cachedAt: time.Now(), revision: "old"},
+		},
+		refreshing: map[summaryCacheKey]bool{},
+	}
+	m.refreshAsyncThrottled(nil, cfg, key)
+	m.mu.Lock()
+	refreshing := m.refreshing[key]
+	m.mu.Unlock()
+	if refreshing {
+		t.Fatal("recent cache entry unexpectedly started another asynchronous refresh")
 	}
 }
 
@@ -139,11 +194,14 @@ func TestParseLowUsageConfigDefaultsAndOverrides(t *testing.T) {
 	if cfg.SummaryPrecomputeMode != "active_dirty" {
 		t.Fatalf("default precompute mode = %q, want active_dirty", cfg.SummaryPrecomputeMode)
 	}
-	if cfg.SummaryCacheMaxAgeSeconds != 5 {
-		t.Fatalf("default cache max age = %d, want 5", cfg.SummaryCacheMaxAgeSeconds)
+	if cfg.SummaryCacheMaxAgeSeconds != 30 {
+		t.Fatalf("default cache max age = %d, want 30", cfg.SummaryCacheMaxAgeSeconds)
 	}
 	if cfg.SummaryMaintenanceIntervalSeconds != 180 {
 		t.Fatalf("default maintenance interval = %d, want 180", cfg.SummaryMaintenanceIntervalSeconds)
+	}
+	if cfg.SummaryPrecomputeActiveWindowTTLSeconds != 120 {
+		t.Fatalf("default active window TTL = %d, want 120", cfg.SummaryPrecomputeActiveWindowTTLSeconds)
 	}
 
 	cfg = parsePluginConfigYAML([]byte(`
@@ -155,6 +213,63 @@ summary_precompute_active_window_ttl_seconds: 900
 	cfg = normalizePluginConfig(cfg)
 	if cfg.SummaryPrecomputeMode != "legacy" || cfg.SummaryCacheMaxAgeSeconds != 9 || cfg.SummaryMaintenanceIntervalSeconds != 240 || cfg.SummaryPrecomputeActiveWindowTTLSeconds != 900 {
 		t.Fatalf("overridden config not applied: %+v", cfg)
+	}
+}
+
+func TestConfiguredAuthFilesCacheInvalidatesOnFileChange(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", dir)
+	path := filepath.Join(dir, "alice.json")
+	if err := os.WriteFile(path, []byte(`{"provider":"codex","email":"alice@example.com","plan_type":"plus"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	first := readConfiguredAuthFiles()
+	if len(first) != 1 || first[0].PlanType != "plus" {
+		t.Fatalf("first read = %+v", first)
+	}
+	first[0].PlanType = "mutated"
+	second := readConfiguredAuthFiles()
+	if len(second) != 1 || second[0].PlanType != "plus" {
+		t.Fatalf("cached clone was mutated: %+v", second)
+	}
+	if err := os.WriteFile(path, []byte(`{"provider":"codex","email":"alice@example.com","plan_type":"team","name":"changed"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	third := readConfiguredAuthFiles()
+	if len(third) != 1 || third[0].PlanType != "team" {
+		t.Fatalf("cache did not invalidate: %+v", third)
+	}
+}
+
+func TestExternalUseScanIsCappedAt24Hours(t *testing.T) {
+	now := time.Now().Unix()
+	if got := externalUseScanSince(0, now); got != now-int64((24*time.Hour)/time.Second) {
+		t.Fatalf("all-window scan since = %d", got)
+	}
+	recent := now - int64(time.Hour/time.Second)
+	if got := externalUseScanSince(recent, now); got != recent {
+		t.Fatalf("recent scan since = %d, want %d", got, recent)
+	}
+}
+
+func TestQueryHasXAIUsageUsesProviderIndexPath(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	db, _, err := s.open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found, err := queryHasXAIUsage(ctx, db, 0); err != nil || found {
+		t.Fatalf("empty xAI usage found=%v err=%v", found, err)
+	}
+	if err := s.recordUsage(ctx, usageRecord{
+		Provider: "xai", AuthID: "grok", AuthIndex: "grok", Source: "grok",
+		RequestedAt: time.Now(), Detail: usageDetail{TotalTokens: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := queryHasXAIUsage(ctx, db, 0); err != nil || !found {
+		t.Fatalf("xAI usage found=%v err=%v", found, err)
 	}
 }
 

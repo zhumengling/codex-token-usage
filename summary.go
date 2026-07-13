@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"hash/fnv"
 	"net/http"
 	"net/url"
 	"os"
@@ -144,6 +145,8 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 	if len(keys) == 0 {
 		return nil
 	}
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
 	revision, err := store.currentRevision(ctx)
 	if err != nil {
 		return err
@@ -155,9 +158,7 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 			continue
 		}
 		started := time.Now()
-		m.refreshMu.Lock()
 		data, err := store.summary(ctx, key.Window, key.Limit)
-		m.refreshMu.Unlock()
 		durationMs := time.Since(started).Milliseconds()
 		entry := summaryCacheEntry{
 			data:       data,
@@ -256,8 +257,13 @@ func (m *summaryPrecomputeManager) summary(ctx context.Context, store *store, wi
 	}
 	if data, ok := m.cached(ctx, store, key, cfg, revision.Revision); ok {
 		if summaryPrecomputeStale(data) {
-			m.refreshAsync(store, cfg, key)
+			m.refreshAsyncThrottled(store, cfg, key)
 		}
+		attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
+		return data, nil
+	}
+	if data, ok := m.cachedAny(ctx, store, key, cfg, revision.Revision); ok {
+		m.refreshAsyncThrottled(store, cfg, key)
 		attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
 		return data, nil
 	}
@@ -346,6 +352,14 @@ func (m *summaryPrecomputeManager) summarySyncWithStarted(ctx context.Context, s
 }
 
 func (m *summaryPrecomputeManager) refreshAsync(store *store, cfg pluginConfig, key summaryCacheKey) {
+	m.refreshAsyncMode(store, cfg, key, false)
+}
+
+func (m *summaryPrecomputeManager) refreshAsyncThrottled(store *store, cfg pluginConfig, key summaryCacheKey) {
+	m.refreshAsyncMode(store, cfg, key, true)
+}
+
+func (m *summaryPrecomputeManager) refreshAsyncMode(store *store, cfg pluginConfig, key summaryCacheKey, throttle bool) {
 	if !cfg.SummaryPrecomputeEnabled {
 		return
 	}
@@ -357,6 +371,15 @@ func (m *summaryPrecomputeManager) refreshAsync(store *store, cfg pluginConfig, 
 	if m.refreshing[key] {
 		m.mu.Unlock()
 		return
+	}
+	if throttle {
+		if entry, ok := m.entries[key]; ok && entry.data != nil {
+			minimumAge := time.Duration(maxInt(cfg.SummaryPrecomputeIntervalSeconds, 1)) * time.Second
+			if time.Since(entry.cachedAt) < minimumAge {
+				m.mu.Unlock()
+				return
+			}
+		}
 	}
 	m.refreshing[key] = true
 	m.mu.Unlock()
@@ -384,24 +407,42 @@ func (m *summaryPrecomputeManager) cached(ctx context.Context, store *store, key
 	}
 	m.rememberMemory(key, entry)
 	age := time.Since(entry.cachedAt)
-	return cloneCachedSummary(entry, key, cfg, age, age > summaryCacheTTL(cfg)), true
+	return cloneCachedSummary(entry, key, cfg, age), true
 }
 
 func (m *summaryPrecomputeManager) cachedAny(ctx context.Context, store *store, key summaryCacheKey, cfg pluginConfig, revision string) (map[string]any, bool) {
 	key = normalizeSummaryCacheKey(key)
-	if data, ok := m.cachedEntry(key, cfg, revision); ok {
+	if data, ok := m.cachedAnyEntry(key, cfg, revision); ok {
 		return data, true
 	}
 	if store == nil {
 		return nil, false
 	}
 	entry, ok, err := store.loadSummaryCacheEntry(ctx, key)
-	if err != nil || !ok || entry.revision != revision {
+	if err != nil || !ok {
+		return nil, false
+	}
+	age := time.Since(entry.cachedAt)
+	if age > summaryStaleMaxAge(cfg) {
 		return nil, false
 	}
 	m.rememberMemory(key, entry)
+	return cloneCachedSummaryForRevision(entry, key, cfg, age, revision), true
+}
+
+func (m *summaryPrecomputeManager) cachedAnyEntry(key summaryCacheKey, cfg pluginConfig, revision string) (map[string]any, bool) {
+	key = normalizeSummaryCacheKey(key)
+	m.mu.Lock()
+	entry, ok := m.entries[key]
+	m.mu.Unlock()
+	if !ok || entry.data == nil {
+		return nil, false
+	}
 	age := time.Since(entry.cachedAt)
-	return cloneCachedSummary(entry, key, cfg, age, age > summaryCacheTTL(cfg)), true
+	if age > summaryStaleMaxAge(cfg) {
+		return nil, false
+	}
+	return cloneCachedSummaryForRevision(entry, key, cfg, age, revision), true
 }
 
 func (m *summaryPrecomputeManager) cachedEntry(key summaryCacheKey, cfg pluginConfig, revision string) (map[string]any, bool) {
@@ -412,7 +453,7 @@ func (m *summaryPrecomputeManager) cachedEntry(key summaryCacheKey, cfg pluginCo
 		return nil, false
 	}
 	age := time.Since(entry.cachedAt)
-	return cloneCachedSummary(entry, key, cfg, age, age > summaryCacheTTL(cfg)), true
+	return cloneCachedSummary(entry, key, cfg, age), true
 }
 
 func (m *summaryPrecomputeManager) remember(ctx context.Context, store *store, key summaryCacheKey, entry summaryCacheEntry) {
@@ -442,6 +483,10 @@ func summaryCacheTTL(cfg pluginConfig) time.Duration {
 	return time.Duration(maxInt(cfg.SummaryCacheMaxAgeSeconds, 1)) * time.Second
 }
 
+func summaryStaleMaxAge(cfg pluginConfig) time.Duration {
+	return time.Duration(maxInt(cfg.SummaryCacheMaxAgeSeconds, cfg.SummaryPrecomputeIntervalSeconds*2)) * time.Second
+}
+
 type summaryCacheLoadResult struct {
 	entry summaryCacheEntry
 	ok    bool
@@ -467,7 +512,7 @@ func (s *store) loadSummaryCacheEntry(ctx context.Context, key summaryCacheKey) 
 		err = db.QueryRowContext(ctx, `
 SELECT data_json, cached_at, duration_ms, last_error, revision
 FROM summary_cache
-WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&raw, &cachedAt, &durationMs, &lastError)
+WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&raw, &cachedAt, &durationMs, &lastError, &revision)
 		if err == sql.ErrNoRows {
 			return summaryCacheLoadResult{}, nil
 		}
@@ -568,7 +613,18 @@ func cloneSummaryMap(data map[string]any) map[string]any {
 	return out
 }
 
-func cloneCachedSummary(entry summaryCacheEntry, key summaryCacheKey, cfg pluginConfig, age time.Duration, stale bool) map[string]any {
+func cloneCachedSummary(entry summaryCacheEntry, key summaryCacheKey, cfg pluginConfig, age time.Duration) map[string]any {
+	return cloneCachedSummaryForRevision(entry, key, cfg, age, entry.revision)
+}
+
+func cloneCachedSummaryForRevision(entry summaryCacheEntry, key summaryCacheKey, cfg pluginConfig, age time.Duration, storeRevision string) map[string]any {
+	stale := entry.revision != storeRevision || age > summaryCacheTTL(cfg)
+	reason := "revision_hit"
+	if entry.revision != storeRevision {
+		reason = "revision_stale"
+	} else if stale {
+		reason = "age_stale"
+	}
 	out := cloneSummaryMap(entry.data)
 	out["precompute"] = summaryPrecomputeInfo{
 		Enabled:      true,
@@ -583,9 +639,9 @@ func cloneCachedSummary(entry summaryCacheEntry, key summaryCacheKey, cfg plugin
 		Precomputed:  true,
 		Synchronous:  false,
 		Stale:        stale,
-		Reason:       "revision_hit",
+		Reason:       reason,
 	}
-	attachSummaryRevision(out, entry.revision, entry.revision)
+	attachSummaryRevision(out, storeRevision, entry.revision)
 	return out
 }
 
@@ -646,30 +702,11 @@ func authFilesRevision() string {
 	if authDir == "" {
 		return "none"
 	}
-	entries, err := os.ReadDir(authDir)
+	_, revision, err := configuredAuthDirectorySnapshot(authDir)
 	if err != nil {
 		return "unreadable"
 	}
-	parts := make([]string, 0, len(entries))
-	var count int64
-	var maxMTime int64
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		count++
-		mtime := info.ModTime().Unix()
-		if mtime > maxMTime {
-			maxMTime = mtime
-		}
-		parts = append(parts, entry.Name()+":"+strconv.FormatInt(info.Size(), 10)+":"+strconv.FormatInt(mtime, 10))
-	}
-	sort.Strings(parts)
-	return strconv.FormatInt(count, 10) + ":" + strconv.FormatInt(maxMTime, 10) + ":" + strings.Join(parts, ",")
+	return revision
 }
 
 func attachSummaryRuntimeInfo(data map[string]any, durationMs int64) {
@@ -727,15 +764,23 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyCosts(ctx, db, since, &providerTotals, prices, "other"); err != nil {
 		return nil, err
 	}
-	xaiTotals, err := queryOneTotals(ctx, db, since, "xai")
+	now := time.Now().Unix()
+	authDirReadable := configuredAuthDirectoryReadable()
+	configuredXAIAccounts := readConfiguredXAIAccounts()
+	xaiHasUsage, err := queryHasXAIUsage(ctx, db, since)
 	if err != nil {
 		return nil, err
 	}
-	if err := applyCosts(ctx, db, since, &xaiTotals, prices, "xai"); err != nil {
-		return nil, err
+	var xaiTotals totalsRow
+	if xaiHasUsage {
+		xaiTotals, err = queryOneTotals(ctx, db, since, "xai")
+		if err != nil {
+			return nil, err
+		}
+		if err := applyCosts(ctx, db, since, &xaiTotals, prices, "xai"); err != nil {
+			return nil, err
+		}
 	}
-	now := time.Now().Unix()
-	authDirReadable := configuredAuthDirectoryReadable()
 	accounts, err := queryAccounts(ctx, db, since, limit, "codex")
 	if err != nil {
 		return nil, err
@@ -749,14 +794,16 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if globalAccountProtection.enabled() {
 		applyAccountProtectionState(ctx, db, accounts)
 	}
-	xaiAccounts, err := queryAccounts(ctx, db, since, limit, "xai")
-	if err != nil {
-		return nil, err
+	var xaiAccounts []accountRow
+	if xaiHasUsage {
+		xaiAccounts, err = queryAccounts(ctx, db, since, limit, "xai")
+		if err != nil {
+			return nil, err
+		}
+		if err := applyScopedAccountCosts(ctx, db, since, xaiAccounts, prices, "xai"); err != nil {
+			return nil, err
+		}
 	}
-	if err := applyScopedAccountCosts(ctx, db, since, xaiAccounts, prices, "xai"); err != nil {
-		return nil, err
-	}
-	configuredXAIAccounts := readConfiguredXAIAccounts()
 	xaiAccounts = mergeConfiguredAccounts(xaiAccounts, configuredXAIAccounts)
 	xaiAccounts = filterCurrentConfiguredAccounts(xaiAccounts, configuredXAIAccounts, globalXAIAuthSource.authoritative())
 	xaiStates, err := queryActiveXAIStates(ctx, db, now)
@@ -776,7 +823,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	applyInvalidAuths(accounts, invalidAuths)
 	workspaceDeactivatedAuths := filterWorkspaceDeactivatedAuths(invalidAuths)
 	unauthorizedInvalidAuths := filterUnauthorizedInvalidAuths(invalidAuths)
-	externalUseAlerts, err := queryExternalUseAlerts(ctx, db, since)
+	externalUseAlerts, err := queryExternalUseAlerts(ctx, db, externalUseScanSince(since, now))
 	if err != nil {
 		return nil, err
 	}
@@ -815,12 +862,15 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyModelCosts(ctx, db, since, providerModels, prices, "other"); err != nil {
 		return nil, err
 	}
-	xaiModels, err := queryModels(ctx, db, since, limit, "xai")
-	if err != nil {
-		return nil, err
-	}
-	if err := applyModelCosts(ctx, db, since, xaiModels, prices, "xai"); err != nil {
-		return nil, err
+	var xaiModels []modelRow
+	if xaiHasUsage {
+		xaiModels, err = queryModels(ctx, db, since, limit, "xai")
+		if err != nil {
+			return nil, err
+		}
+		if err := applyModelCosts(ctx, db, since, xaiModels, prices, "xai"); err != nil {
+			return nil, err
+		}
 	}
 	trend, err := queryTrend(ctx, db, since, label, "codex")
 	if err != nil {
@@ -830,9 +880,12 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
-	xaiTrend, err := queryTrend(ctx, db, since, label, "xai")
-	if err != nil {
-		return nil, err
+	var xaiTrend []trendPoint
+	if xaiHasUsage {
+		xaiTrend, err = queryTrend(ctx, db, since, label, "xai")
+		if err != nil {
+			return nil, err
+		}
 	}
 	recent, err := queryRecent(ctx, db, since, 30, "codex", prices)
 	if err != nil {
@@ -842,9 +895,12 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
-	xaiRecent, err := queryRecent(ctx, db, since, 30, "xai", prices)
-	if err != nil {
-		return nil, err
+	var xaiRecent []recentRow
+	if xaiHasUsage {
+		xaiRecent, err = queryRecent(ctx, db, since, 30, "xai", prices)
+		if err != nil {
+			return nil, err
+		}
 	}
 	autobans, err := queryActiveAutobans(ctx, db, now)
 	if err != nil {
@@ -1391,6 +1447,19 @@ FROM usage_events WHERE requested_at >= ? AND ` + usageScopeSQL(scope)
 	return row, err
 }
 
+func queryHasXAIUsage(ctx context.Context, db *sql.DB, since int64) (bool, error) {
+	var found int
+	err := db.QueryRowContext(ctx, `
+SELECT 1
+FROM usage_events INDEXED BY idx_usage_events_provider_requested
+WHERE provider IN ('xai','XAI') AND requested_at >= ?
+LIMIT 1`, since).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func queryAccounts(ctx context.Context, db *sql.DB, since int64, limit int, scope string) ([]accountRow, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT COALESCE(NULLIF(auth_index,''), NULLIF(auth_id,''), 'unknown') AS account_key,
@@ -1457,15 +1526,31 @@ func readConfiguredXAIAccounts() []configuredAccount {
 	return out
 }
 
+type configuredAuthFilesCacheState struct {
+	mu       sync.Mutex
+	dir      string
+	revision string
+	accounts []configuredAccount
+}
+
+var configuredAuthFilesCache configuredAuthFilesCacheState
+
 func readConfiguredAuthFiles() []configuredAccount {
 	authDir := configuredAuthDir()
 	if authDir == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(authDir)
+	entries, revision, err := configuredAuthDirectorySnapshot(authDir)
 	if err != nil {
 		return nil
 	}
+	configuredAuthFilesCache.mu.Lock()
+	if configuredAuthFilesCache.dir == authDir && configuredAuthFilesCache.revision == revision {
+		accounts := cloneConfiguredAccounts(configuredAuthFilesCache.accounts)
+		configuredAuthFilesCache.mu.Unlock()
+		return accounts
+	}
+	configuredAuthFilesCache.mu.Unlock()
 	out := make([]configuredAccount, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
@@ -1526,7 +1611,38 @@ func readConfiguredAuthFiles() []configuredAccount {
 			),
 		})
 	}
-	return out
+	configuredAuthFilesCache.mu.Lock()
+	configuredAuthFilesCache.dir = authDir
+	configuredAuthFilesCache.revision = revision
+	configuredAuthFilesCache.accounts = cloneConfiguredAccounts(out)
+	configuredAuthFilesCache.mu.Unlock()
+	return cloneConfiguredAccounts(out)
+}
+
+func configuredAuthDirectorySnapshot(authDir string) ([]os.DirEntry, string, error) {
+	entries, err := os.ReadDir(authDir)
+	if err != nil {
+		return nil, "", err
+	}
+	hash := fnv.New64a()
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		count++
+		_, _ = hash.Write([]byte(entry.Name()))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(strconv.FormatInt(info.Size(), 10)))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(strconv.FormatInt(info.ModTime().UnixNano(), 10)))
+		_, _ = hash.Write([]byte{0})
+	}
+	return entries, strconv.Itoa(count) + ":" + strconv.FormatUint(hash.Sum64(), 16), nil
 }
 
 func normalizeAuthProvider(value, filename string) string {
@@ -2313,33 +2429,25 @@ func accountQuotaAliasIndex(accounts []accountRow) map[string][]int {
 }
 
 func accountQuotaAliasSets(accounts []accountRow) [][]string {
-	emailCounts := make(map[string]int, len(accounts))
-	for _, account := range accounts {
-		if email := normalizeAccountAlias(account.Email); email != "" {
-			emailCounts[email]++
+	rawAliases := make([][]string, len(accounts))
+	aliasCounts := make(map[string]int, len(accounts)*5)
+	for i := range accounts {
+		rawAliases[i] = uniqueNonEmptyAliases(append(accountAliases(accounts[i]), accounts[i].ChatGPTAccountID))
+		for _, alias := range rawAliases[i] {
+			aliasCounts[alias]++
 		}
 	}
 	out := make([][]string, len(accounts))
 	for i := range accounts {
-		out[i] = accountQuotaAliases(accounts[i], emailCounts)
+		aliases := strictFileIdentityAliases(accounts[i].AuthFile)
+		for _, alias := range rawAliases[i] {
+			if aliasCounts[alias] == 1 {
+				aliases = append(aliases, alias)
+			}
+		}
+		out[i] = uniqueNonEmptyAliases(aliases)
 	}
 	return out
-}
-
-func accountQuotaAliases(account accountRow, emailCounts map[string]int) []string {
-	email := normalizeAccountAlias(account.Email)
-	if email == "" || emailCounts[email] <= 1 {
-		return accountAliases(account)
-	}
-	values := strictFileIdentityAliases(account.AuthFile, account.AuthIndex)
-	if chatgptAccountID := normalizeAccountAlias(account.ChatGPTAccountID); chatgptAccountID != "" {
-		values = append(values, chatgptAccountID)
-	}
-	authID := normalizeAccountAlias(account.AuthID)
-	if authID != "" && authID != email && authID != normalizeAccountAlias(account.Source) && authID != normalizeAccountAlias(account.Name) {
-		values = append(values, normalizeAccountAliases(account.AuthID)...)
-	}
-	return uniqueNonEmptyAliases(values)
 }
 
 func strictFileIdentityAliases(values ...string) []string {
@@ -2751,6 +2859,10 @@ ORDER BY COALESCE(NULLIF(source,''), NULLIF(auth_id,''), NULLIF(auth_index,''), 
 		return nil, err
 	}
 	return alerts, nil
+}
+
+func externalUseScanSince(summarySince int64, now int64) int64 {
+	return maxInt64(summarySince, now-int64((24*time.Hour)/time.Second))
 }
 
 func checkExternalUseWindow(alerts *[]externalUseAlert, seen map[string]externalUseAlert, window string, ev externalUseEvent, percent sql.NullFloat64, reset sql.NullInt64, tracker *externalUseTracker, cumulativeTokens int64, recentLocalTokens int64, minDeltaPct float64, maxLocalTokens int64, minIdleSeconds int64, delayGraceMinTokens int64) {

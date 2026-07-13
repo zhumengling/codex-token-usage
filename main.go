@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.29"
+	pluginVersion    = "0.1.30"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -509,9 +509,9 @@ func pluginConfigFields() []configField {
 		{Name: "开启后台预计算", Type: "boolean", Description: "是否后台预热常用 summary，减少页面首次等待。默认开启。"},
 		{Name: "预计算间隔秒数", Type: "number", Description: "后台 summary 预热间隔，单位秒。默认 30；低占用模式下只检查活跃脏窗口。"},
 		{Name: "summary_precompute_mode", Type: "enum", Description: "active_dirty=只刷新活跃且变脏窗口；legacy=按旧逻辑刷新全部默认窗口。默认 active_dirty。"},
-		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "相同数据 revision 下 summary 缓存最大复用秒数。默认 5。"},
+		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "summary 缓存直接复用秒数；revision 变化时会先返回短期旧缓存并异步刷新。默认 30。"},
 		{Name: "summary_maintenance_interval_seconds", Type: "number", Description: "后台状态维护间隔，单位秒；无数据变化会跳过。默认 180。"},
-		{Name: "summary_precompute_active_window_ttl_seconds", Type: "number", Description: "窗口被访问后保留为活跃预计算窗口的时间。默认 600。"},
+		{Name: "summary_precompute_active_window_ttl_seconds", Type: "number", Description: "窗口被访问后保留为活跃预计算窗口的时间。默认 120。"},
 	}
 }
 
@@ -643,9 +643,9 @@ func defaultPluginConfig() pluginConfig {
 		SummaryPrecomputeEnabled:                true,
 		SummaryPrecomputeIntervalSeconds:        30,
 		SummaryPrecomputeMode:                   "active_dirty",
-		SummaryCacheMaxAgeSeconds:               5,
+		SummaryCacheMaxAgeSeconds:               30,
 		SummaryMaintenanceIntervalSeconds:       180,
-		SummaryPrecomputeActiveWindowTTLSeconds: 600,
+		SummaryPrecomputeActiveWindowTTLSeconds: 120,
 	}
 }
 
@@ -1709,20 +1709,22 @@ func (m *quotaTriggerManager) status() quotaTriggerState {
 }
 
 func (m *quotaTriggerManager) loop(ctx context.Context, cfg pluginConfig) {
-	m.runRound(ctx, cfg)
-	ticker := time.NewTicker(time.Duration(cfg.QuotaTriggerIntervalMinutes) * time.Minute)
-	defer ticker.Stop()
+	interval := time.Duration(cfg.QuotaTriggerIntervalMinutes) * time.Minute
 	for {
+		m.runRound(ctx, cfg)
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			m.mu.Lock()
 			if m.cancel != nil {
 				m.state.Running = false
 			}
 			m.mu.Unlock()
 			return
-		case <-ticker.C:
-			m.runRound(ctx, cfg)
+		case <-timer.C:
 		}
 	}
 }
@@ -3101,13 +3103,13 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
 	}
 	if protectionCfg.AccountProtectionEnabled {
-		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg)
+		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg, schedulerRotationKey(req, "codex"))
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
 		return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 	}
-	chosen := chooseFillFirstSchedulerCandidate(available)
+	chosen := globalSchedulerRotation.pick(schedulerRotationKey(req, "codex"), available)
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 }
 
@@ -3153,22 +3155,8 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		}
 		return schedulerPickResponse{}, &schedulerRejectError{Code: "auth_unavailable", Message: message, HTTPStatus: http.StatusServiceUnavailable}
 	}
-	chosen := chooseFillFirstSchedulerCandidate(available)
+	chosen := globalSchedulerRotation.pick(schedulerRotationKey(req, "xai"), available)
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
-}
-
-func chooseFillFirstSchedulerCandidate(candidates []schedulerAuthCandidate) schedulerAuthCandidate {
-	chosen := candidates[0]
-	for _, candidate := range candidates[1:] {
-		if candidate.Priority > chosen.Priority {
-			chosen = candidate
-			continue
-		}
-		if candidate.Priority == chosen.Priority && candidate.ID < chosen.ID {
-			chosen = candidate
-		}
-	}
-	return chosen
 }
 
 func newNoAvailableCodexAuthError(bans []autobanRow, now int64) error {
