@@ -17,6 +17,8 @@ type schedulerStateCache struct {
 	xaiInitialized   bool
 	codexGeneration  uint64
 	xaiGeneration    uint64
+	codexPending     int
+	xaiPending       int
 	codexRestricted  bool
 	xaiRestricted    bool
 	codexResetAt     int64
@@ -106,12 +108,12 @@ func (c *schedulerStateCache) refreshWithLoader(loader func() (schedulerRestrict
 	}
 
 	c.mu.Lock()
-	if c.codexGeneration == codexGeneration {
+	if c.codexGeneration == codexGeneration && c.codexPending == 0 {
 		c.codexInitialized = true
 		c.codexRestricted = state.codexRestricted
 		c.codexResetAt = state.codexResetAt
 	}
-	if c.xaiGeneration == xaiGeneration {
+	if c.xaiGeneration == xaiGeneration && c.xaiPending == 0 {
 		c.xaiInitialized = true
 		c.xaiRestricted = state.xaiRestricted
 		c.xaiResetAt = state.xaiResetAt
@@ -139,6 +141,82 @@ func (c *schedulerStateCache) setRestricted(provider string, restricted bool) {
 		}
 	}
 	c.mu.Unlock()
+}
+
+func (c *schedulerStateCache) generation(provider string) uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		return c.codexGeneration
+	case "xai":
+		return c.xaiGeneration
+	default:
+		return 0
+	}
+}
+
+func (c *schedulerStateCache) beginRestrictionWrite(provider string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		c.codexInitialized = true
+		c.codexGeneration++
+		c.codexPending++
+		c.codexRestricted = true
+	case "xai":
+		c.xaiInitialized = true
+		c.xaiGeneration++
+		c.xaiPending++
+		c.xaiRestricted = true
+	}
+}
+
+func (c *schedulerStateCache) finishRestrictionWrite(provider string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		if c.codexPending > 0 {
+			c.codexPending--
+		}
+		c.codexGeneration++
+		c.codexRestricted = true
+	case "xai":
+		if c.xaiPending > 0 {
+			c.xaiPending--
+		}
+		c.xaiGeneration++
+		c.xaiRestricted = true
+	}
+}
+
+func (c *schedulerStateCache) clearRestrictedIfGeneration(provider string, expected uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		if c.codexGeneration != expected || c.codexPending > 0 {
+			return false
+		}
+		c.codexInitialized = true
+		c.codexGeneration++
+		c.codexRestricted = false
+		c.codexResetAt = 0
+		return true
+	case "xai":
+		if c.xaiGeneration != expected || c.xaiPending > 0 {
+			return false
+		}
+		c.xaiInitialized = true
+		c.xaiGeneration++
+		c.xaiRestricted = false
+		c.xaiResetAt = 0
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *store) refreshSchedulerState(ctx context.Context) error {

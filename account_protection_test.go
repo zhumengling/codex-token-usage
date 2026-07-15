@@ -28,6 +28,22 @@ func TestProtectionPickLockHonorsContextCancellation(t *testing.T) {
 	manager.pickMu.Unlock()
 }
 
+func TestProtectionUsageSnapshotLockHonorsContextCancellation(t *testing.T) {
+	var manager accountProtectionManager
+	manager.usageMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := manager.loadUsageSnapshot(ctx, nil, 0)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("usage snapshot lock error = %v, want context deadline exceeded", err)
+	}
+	manager.usageMu.Unlock()
+	if !manager.usageMu.TryLock() {
+		t.Fatal("canceled usage lock attempt left a waiter holding the mutex")
+	}
+	manager.usageMu.Unlock()
+}
+
 func newProtectionTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -343,6 +359,38 @@ func TestProtectionSnapshotSumsDistinctIdentityGroups(t *testing.T) {
 	})
 	if inFlight != 5 || tokens != 300 {
 		t.Fatalf("metrics = %d/%d, want 5/300", inFlight, tokens)
+	}
+}
+
+func TestProtectionSnapshotTraversesAliasConnectedComponent(t *testing.T) {
+	snapshot := newProtectionSnapshot(
+		[]protectionReservationSample{
+			{Aliases: []string{"old-auth-id", "shared@example.com"}, Count: 2},
+			{Aliases: []string{"new-auth-id", "shared@example.com"}, Count: 3},
+		},
+		[]protectionUsageSample{
+			{Aliases: []string{"old-auth-id", "shared@example.com"}, Tokens: 100},
+			{Aliases: []string{"new-auth-id", "shared@example.com"}, Tokens: 200},
+		},
+	)
+	inFlight, tokens := snapshot.metrics([]string{"new-auth-id"})
+	if inFlight != 5 || tokens != 300 {
+		t.Fatalf("connected metrics = %d/%d, want 5/300", inFlight, tokens)
+	}
+}
+
+func TestProtectionSnapshotDoesNotBridgeAmbiguousCandidateEmail(t *testing.T) {
+	snapshot := newProtectionSnapshot(nil, []protectionUsageSample{
+		{Aliases: []string{"a.json", "shared@example.com"}, Tokens: 100},
+		{Aliases: []string{"b.json", "shared@example.com"}, Tokens: 200},
+	})
+	snapshot.blockedBridgeAliases = protectionAmbiguousCandidateAliases([]schedulerAuthCandidate{
+		{ID: "shared", Provider: "codex", Attributes: map[string]string{"auth_file": "a.json", "source": "shared@example.com"}},
+		{ID: "shared", Provider: "codex", Attributes: map[string]string{"auth_file": "b.json", "source": "shared@example.com"}},
+	})
+	_, tokens := snapshot.metrics([]string{"a.json"})
+	if tokens != 100 {
+		t.Fatalf("ambiguous-email tokens=%d, want 100", tokens)
 	}
 }
 

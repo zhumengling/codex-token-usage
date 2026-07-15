@@ -174,7 +174,7 @@ func TestQuotaProbeRestrictionWritesMarkSchedulerState(t *testing.T) {
 	}
 }
 
-func TestEmptySchedulerSnapshotDoesNotClearRestrictionCache(t *testing.T) {
+func TestEmptySchedulerSnapshotClearsMatchingRestrictionGeneration(t *testing.T) {
 	for _, provider := range []string{"codex", "xai"} {
 		t.Run(provider, func(t *testing.T) {
 			resetSchedulerStateForTest()
@@ -206,8 +206,60 @@ func TestEmptySchedulerSnapshotDoesNotClearRestrictionCache(t *testing.T) {
 			if resp.Handled {
 				t.Fatalf("response=%+v, want native scheduler delegation", resp)
 			}
-			if !globalSchedulerState.needsDatabase(provider, false) {
-				t.Fatal("request-path database snapshot cleared a possibly newer restriction")
+			if globalSchedulerState.needsDatabase(provider, false) {
+				t.Fatal("empty database snapshot did not clear its matching restriction generation")
+			}
+		})
+	}
+}
+
+func TestSchedulerStateGenerationClearRejectsNewRestriction(t *testing.T) {
+	for _, provider := range []string{"codex", "xai"} {
+		t.Run(provider, func(t *testing.T) {
+			var cache schedulerStateCache
+			cache.setRestricted(provider, true)
+			staleGeneration := cache.generation(provider)
+			cache.setRestricted(provider, true)
+			if cache.clearRestrictedIfGeneration(provider, staleGeneration) {
+				t.Fatal("stale generation cleared a newer restriction")
+			}
+			if !cache.needsDatabase(provider, false) {
+				t.Fatal("newer restriction was lost after stale clear attempt")
+			}
+			if !cache.clearRestrictedIfGeneration(provider, cache.generation(provider)) {
+				t.Fatal("matching generation did not clear restriction")
+			}
+			if cache.needsDatabase(provider, false) {
+				t.Fatal("matching generation clear left restriction active")
+			}
+		})
+	}
+}
+
+func TestSchedulerStatePendingWriteBlocksRefreshAndGenerationClear(t *testing.T) {
+	for _, provider := range []string{"codex", "xai"} {
+		t.Run(provider, func(t *testing.T) {
+			var cache schedulerStateCache
+			cache.setRestricted(provider, false)
+			cache.beginRestrictionWrite(provider)
+			pendingGeneration := cache.generation(provider)
+			if cache.clearRestrictedIfGeneration(provider, pendingGeneration) {
+				t.Fatal("pending restriction write was cleared")
+			}
+			if err := cache.refreshWithLoader(func() (schedulerRestrictionState, error) {
+				return schedulerRestrictionState{}, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !cache.needsDatabase(provider, false) {
+				t.Fatal("empty refresh cleared a pending restriction write")
+			}
+			cache.finishRestrictionWrite(provider)
+			if cache.clearRestrictedIfGeneration(provider, pendingGeneration) {
+				t.Fatal("generation captured during pending write cleared committed restriction")
+			}
+			if !cache.needsDatabase(provider, false) {
+				t.Fatal("finished restriction write was not retained")
 			}
 		})
 	}

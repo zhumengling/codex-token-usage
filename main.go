@@ -1870,6 +1870,7 @@ func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord,
 }
 
 func upsertInvalidAuth(ctx context.Context, db *sql.DB, rec usageRecord, status int, reason, authID, authFile string, authFileMTime int64, invalidatedAt int64) error {
+	globalSchedulerState.beginRestrictionWrite("codex")
 	_, err := db.ExecContext(ctx, `
 INSERT INTO invalid_auths (
   auth_id, auth_index, source, provider, reason, invalidated_at, active,
@@ -1888,10 +1889,10 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
 		reason, invalidatedAt, status, authFile, authFileMTime,
 	)
+	globalSchedulerState.finishRestrictionWrite("codex")
 	if err != nil {
 		return err
 	}
-	globalSchedulerState.setRestricted("codex", true)
 	return nil
 }
 
@@ -2050,6 +2051,7 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	normalizeInt64Ptr(primaryReset)
 	normalizeInt64Ptr(secondaryReset)
 	resetAt, window, reason := classifyCodexBan(rec.ResponseHeaders, primaryPct, primaryReset, secondaryPct, secondaryReset, now)
+	globalSchedulerState.beginRestrictionWrite("codex")
 	_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
@@ -2077,10 +2079,10 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
 		primaryPct, primaryReset, secondaryPct, secondaryReset, authFile, authFileMTime,
 	)
+	globalSchedulerState.finishRestrictionWrite("codex")
 	if err != nil {
 		return err
 	}
-	globalSchedulerState.setRestricted("codex", true)
 	return nil
 }
 
@@ -3108,6 +3110,10 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if s == globalStore && !globalSchedulerState.needsDatabase("codex", protectionCfg.AccountProtectionEnabled) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
+	var stateGeneration uint64
+	if s == globalStore {
+		stateGeneration = globalSchedulerState.generation("codex")
+	}
 	db, _, err := s.open(ctx)
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
@@ -3132,6 +3138,9 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{Handled: false}, err
 	}
 	if len(bans) == 0 && len(invalids) == 0 && !protectionCfg.AccountProtectionEnabled {
+		if s == globalStore {
+			globalSchedulerState.clearRestrictedIfGeneration("codex", stateGeneration)
+		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	effectiveBans := mergeEffectiveAutobans(bans, invalids)
@@ -3162,6 +3171,9 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		recordSchedulerFilteringDiagnostics(effectiveBans, banFilteredCandidates, matchedBanIndexes)
 	}
 	if !filtered && !protectionCfg.AccountProtectionEnabled {
+		if len(bans) == 0 && len(invalids) == 0 && s == globalStore {
+			globalSchedulerState.clearRestrictedIfGeneration("codex", stateGeneration)
+		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
@@ -3214,6 +3226,10 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 	if len(req.Candidates) == 0 {
 		return schedulerPickResponse{Handled: false}, nil
 	}
+	var stateGeneration uint64
+	if s == globalStore {
+		stateGeneration = globalSchedulerState.generation("xai")
+	}
 	db, _, err := s.open(ctx)
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
@@ -3227,6 +3243,9 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		return schedulerPickResponse{Handled: false}, err
 	}
 	if len(states) == 0 {
+		if s == globalStore {
+			globalSchedulerState.clearRestrictedIfGeneration("xai", stateGeneration)
+		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
@@ -3420,6 +3439,7 @@ LIMIT 1000`, now, now)
 		if hasLaterSuccessfulUsage(ctx, db, rec, requestedAt) {
 			continue
 		}
+		globalSchedulerState.beginRestrictionWrite("codex")
 		_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
@@ -3452,10 +3472,10 @@ WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
 			key, authIndex, source, provider, window, reason, requestedAt, resetAt, status,
 			nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp), nullIntPtr(sr), authFile, authFileMTime, now,
 		)
+		globalSchedulerState.finishRestrictionWrite("codex")
 		if err != nil {
 			return err
 		}
-		globalSchedulerState.setRestricted("codex", true)
 	}
 	return rows.Err()
 }

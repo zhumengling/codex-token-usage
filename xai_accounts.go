@@ -158,6 +158,7 @@ func recordXAIStateIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, st
 	if stateKey == "" {
 		return nil
 	}
+	globalSchedulerState.beginRestrictionWrite("xai")
 	_, err := db.ExecContext(ctx, `
 INSERT INTO xai_account_states (
   state_key, auth_id, auth_index, source, provider, state, reason, observed_at,
@@ -177,9 +178,7 @@ ON CONFLICT(state_key) DO UPDATE SET
   auth_file=excluded.auth_file,
   auth_file_mtime=excluded.auth_file_mtime`,
 		stateKey, trim(rec.AuthID), trim(rec.AuthIndex), trim(rec.Source), state, reason, now, resetAt, status, authFile, authFileMTime)
-	if err == nil {
-		globalSchedulerState.setRestricted("xai", true)
-	}
+	globalSchedulerState.finishRestrictionWrite("xai")
 	return err
 }
 

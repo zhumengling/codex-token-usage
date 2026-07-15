@@ -85,8 +85,13 @@ func (m *accountProtectionManager) enabled() bool {
 	return m.config().AccountProtectionEnabled
 }
 
-func (m *accountProtectionManager) lockPick(ctx context.Context) error {
-	if m.pickMu.TryLock() {
+func lockMutexWithContext(ctx context.Context, mu *sync.Mutex) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if mu.TryLock() {
 		return nil
 	}
 	ticker := time.NewTicker(time.Millisecond)
@@ -96,11 +101,15 @@ func (m *accountProtectionManager) lockPick(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if m.pickMu.TryLock() {
+			if mu.TryLock() {
 				return nil
 			}
 		}
 	}
+}
+
+func (m *accountProtectionManager) lockPick(ctx context.Context) error {
+	return lockMutexWithContext(ctx, &m.pickMu)
 }
 
 func normalizedProtectionPlan(value string) string {
@@ -262,6 +271,7 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		return schedulerAuthCandidate{}, err
 	}
 	snapshot := newProtectionSnapshotWithUsage(reservations, usage)
+	snapshot.blockedBridgeAliases = protectionAmbiguousCandidateAliases(candidates)
 	states := make([]protectionCandidate, 0, len(candidates))
 	for i, candidate := range candidates {
 		state := protectionCandidateFor(candidate, cfg, configuredPlans, aliasSets[i])
@@ -392,8 +402,26 @@ type protectionUsageSnapshot struct {
 	samplesByAlias map[string][]int
 }
 
+func protectionAmbiguousCandidateAliases(candidates []schedulerAuthCandidate) map[string]struct{} {
+	counts := make(map[string]int, len(candidates)*5)
+	for _, candidate := range candidates {
+		for _, alias := range schedulerCandidateAliases(candidate) {
+			counts[alias]++
+		}
+	}
+	ambiguous := make(map[string]struct{})
+	for alias, count := range counts {
+		if count > 1 {
+			ambiguous[alias] = struct{}{}
+		}
+	}
+	return ambiguous
+}
+
 func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sql.DB, since int64) (protectionUsageSnapshot, error) {
-	m.usageMu.Lock()
+	if err := lockMutexWithContext(ctx, &m.usageMu); err != nil {
+		return protectionUsageSnapshot{}, err
+	}
 	defer m.usageMu.Unlock()
 	if m.usageDB == db && m.usageSince == since && time.Since(m.usageLoadedAt) < 250*time.Millisecond {
 		return m.usage, nil
@@ -420,6 +448,7 @@ type protectionSnapshot struct {
 	Usage                     []protectionUsageSample
 	reservationSamplesByAlias map[string][]int
 	usageSamplesByAlias       map[string][]int
+	blockedBridgeAliases      map[string]struct{}
 }
 
 func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since int64, now int64) (protectionSnapshot, error) {
@@ -544,12 +573,24 @@ func (snapshot protectionSnapshot) metrics(aliases []string) (int, int64) {
 	if len(aliases) == 0 {
 		return 0, 0
 	}
-	inFlight := 0
-	var tokens int64
-	seenAliases := make(map[string]struct{}, len(aliases))
+	return snapshot.reservationMetric(aliases), snapshot.usageMetric(aliases)
+}
+
+func (snapshot protectionSnapshot) aliasCanBridge(value string) bool {
+	value = normalizeAccountAlias(value)
+	if _, blocked := snapshot.blockedBridgeAliases[value]; blocked {
+		return false
+	}
+	return strings.Contains(value, "@") || strings.HasSuffix(value, ".json")
+}
+
+func (snapshot protectionSnapshot) reservationMetric(aliases []string) int {
+	queue := append([]string(nil), aliases...)
+	seenAliases := make(map[string]struct{}, len(queue))
 	seenReservations := make(map[int]struct{})
-	seenUsage := make(map[int]struct{})
-	for _, alias := range aliases {
+	inFlight := 0
+	for next := 0; next < len(queue); next++ {
+		alias := queue[next]
 		alias = normalizeAccountAlias(alias)
 		if alias == "" {
 			continue
@@ -564,16 +605,44 @@ func (snapshot protectionSnapshot) metrics(aliases []string) (int, int64) {
 			}
 			seenReservations[index] = struct{}{}
 			inFlight += snapshot.Reservations[index].Count
+			for _, bridge := range snapshot.Reservations[index].Aliases {
+				if snapshot.aliasCanBridge(bridge) {
+					queue = append(queue, bridge)
+				}
+			}
 		}
+	}
+	return inFlight
+}
+
+func (snapshot protectionSnapshot) usageMetric(aliases []string) int64 {
+	queue := append([]string(nil), aliases...)
+	seenAliases := make(map[string]struct{}, len(queue))
+	seenUsage := make(map[int]struct{})
+	var tokens int64
+	for next := 0; next < len(queue); next++ {
+		alias := normalizeAccountAlias(queue[next])
+		if alias == "" {
+			continue
+		}
+		if _, ok := seenAliases[alias]; ok {
+			continue
+		}
+		seenAliases[alias] = struct{}{}
 		for _, index := range snapshot.usageSamplesByAlias[alias] {
 			if _, ok := seenUsage[index]; ok {
 				continue
 			}
 			seenUsage[index] = struct{}{}
 			tokens += snapshot.Usage[index].Tokens
+			for _, bridge := range snapshot.Usage[index].Aliases {
+				if snapshot.aliasCanBridge(bridge) {
+					queue = append(queue, bridge)
+				}
+			}
 		}
 	}
-	return inFlight, tokens
+	return tokens
 }
 
 func releaseProtectionReservation(ctx context.Context, db *sql.DB, rec usageRecord) error {
