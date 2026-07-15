@@ -464,7 +464,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return okJSON(schedulerPickResponse{Handled: false})
 		}
-		resp, err := globalStore.pickAuth(context.Background(), req)
+		ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+		defer cancel()
+		resp, err := globalStore.pickAuth(ctx, req)
 		if err != nil {
 			var reject *schedulerRejectError
 			if errors.As(err, &reject) && reject != nil {
@@ -672,6 +674,9 @@ func configurePlugin(request []byte) error {
 	globalDBHealth.configure(cfg)
 	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
+	if err := globalStore.refreshSchedulerState(context.Background()); err != nil {
+		globalSchedulerState.invalidate()
+	}
 	return nil
 }
 
@@ -1475,6 +1480,9 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 			return struct{}{}, err
 		}
 		if strings.EqualFold(mode, "light") {
+			if err := globalSchedulerState.refresh(ctx, db); err != nil {
+				return struct{}{}, err
+			}
 			return struct{}{}, nil
 		}
 		if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
@@ -1500,6 +1508,9 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 		}
 		configuredAccounts := readConfiguredAuthAccounts()
 		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, configuredAuthDirectoryReadable()); err != nil {
+			return struct{}{}, err
+		}
+		if err := globalSchedulerState.refresh(ctx, db); err != nil {
 			return struct{}{}, err
 		}
 		return struct{}{}, nil
@@ -1807,7 +1818,13 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err := clearRecoveredAuthStateIfNeeded(ctx, db, rec, status); err != nil {
 		return err
 	}
-	return recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset)
+	if err := recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset); err != nil {
+		return err
+	}
+	if strings.EqualFold(trim(rec.Provider), "codex") && (status == http.StatusUnauthorized || status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusTooManyRequests) {
+		globalSchedulerState.setRestricted("codex", true)
+	}
+	return nil
 }
 
 func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, status int) error {
@@ -3036,6 +3053,9 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 
 func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
 	if isXAISchedulerRequest(req) {
+		if s == globalStore && !globalSchedulerState.needsDatabase("xai", false) {
+			return schedulerPickResponse{Handled: false}, nil
+		}
 		return s.pickXAIAuthOnce(ctx, req)
 	}
 	if !isCodexSchedulerRequest(req) {
@@ -3044,23 +3064,15 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if len(req.Candidates) == 0 {
 		return schedulerPickResponse{Handled: false}, nil
 	}
+	protectionCfg := globalAccountProtection.config()
+	if s == globalStore && !globalSchedulerState.needsDatabase("codex", protectionCfg.AccountProtectionEnabled) {
+		return schedulerPickResponse{Handled: false}, nil
+	}
 	db, _, err := s.open(ctx)
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
 	}
 	now := time.Now().Unix()
-	if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := expireAutobans(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
 	bans, err := queryActiveAutobans(ctx, db, now)
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
@@ -3069,8 +3081,10 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
 	}
-	protectionCfg := globalAccountProtection.config()
 	if len(bans) == 0 && len(invalids) == 0 && !protectionCfg.AccountProtectionEnabled {
+		if s == globalStore {
+			globalSchedulerState.setRestricted("codex", false)
+		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	effectiveBans := mergeEffectiveAutobans(bans, invalids)
@@ -3130,6 +3144,9 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		return schedulerPickResponse{Handled: false}, err
 	}
 	if len(states) == 0 {
+		if s == globalStore {
+			globalSchedulerState.setRestricted("xai", false)
+		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
@@ -3195,9 +3212,6 @@ func isCodexSchedulerRequest(req schedulerPickRequest) bool {
 }
 
 func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
-	if err := normalizeStoredResetColumns(ctx, db); err != nil {
-		return err
-	}
 	_, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND reset_at <= ?`, now)
 	return err
 }

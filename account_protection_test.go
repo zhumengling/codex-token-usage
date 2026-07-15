@@ -249,3 +249,68 @@ func TestProtectionSnapshotBatchesReservationAndTokenMetrics(t *testing.T) {
 		t.Fatalf("account B metrics = %d/%d, want 0/200", inFlight, tokens)
 	}
 }
+
+func TestProtectionSnapshotAggregatesUsageBeforeLoading(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, source, total_tokens) VALUES
+		(?, 'codex', 'a', 'a', 'a@example.com', 100),
+		(?, 'CODEX', 'a', 'a', 'a@example.com', 200),
+		(?, 'codex', 'b', 'b', 'b@example.com', 400)`, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := loadProtectionSnapshot(context.Background(), db, now-300, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Usage) != 2 {
+		t.Fatalf("usage groups = %d, want 2", len(snapshot.Usage))
+	}
+	_, tokens := snapshot.metrics([]string{"a@example.com"})
+	if tokens != 300 {
+		t.Fatalf("account A tokens = %d, want 300", tokens)
+	}
+}
+
+func TestProtectionSnapshotCountsGroupedReservations(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at) VALUES
+		('a', 'a', '', 'plus', ?, ?),
+		('a', 'a', '', 'plus', ?, ?),
+		('a', 'a', '', 'plus', ?, ?)`, now, now+900, now, now+900, now, now+900); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := loadProtectionSnapshot(context.Background(), db, now-300, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inFlight, _ := snapshot.metrics([]string{"a"})
+	if inFlight != 3 {
+		t.Fatalf("in-flight = %d, want 3", inFlight)
+	}
+}
+
+func TestProtectionSnapshotDoesNotDoubleCountSharedAliases(t *testing.T) {
+	snapshot := newProtectionSnapshot(
+		[]protectionReservationSample{{Aliases: []string{"account", "account@example.com"}, Count: 2}},
+		[]protectionUsageSample{{Aliases: []string{"account", "account@example.com"}, Tokens: 300}},
+	)
+	inFlight, tokens := snapshot.metrics([]string{"account", "account@example.com"})
+	if inFlight != 2 || tokens != 300 {
+		t.Fatalf("metrics = %d/%d, want 2/300", inFlight, tokens)
+	}
+}
+
+func TestProtectionRotationHandlesDuplicateCandidateIDs(t *testing.T) {
+	globalSchedulerRotation.reset()
+	states := []protectionCandidate{
+		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "a.json"}}, AuthIndex: "a", Limit: 5},
+		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "b.json"}}, AuthIndex: "b", Limit: 5},
+	}
+	first := chooseProtectedCandidate(states, "duplicate")
+	second := chooseProtectedCandidate(states, "duplicate")
+	if first.AuthIndex == second.AuthIndex {
+		t.Fatalf("duplicate-ID rotation chose %q twice", first.AuthIndex)
+	}
+}
