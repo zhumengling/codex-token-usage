@@ -18,7 +18,7 @@ type accountProtectionManager struct {
 	usageDB       *sql.DB
 	usageSince    int64
 	usageLoadedAt time.Time
-	usage         []protectionUsageSample
+	usage         protectionUsageSnapshot
 }
 
 var globalAccountProtection accountProtectionManager
@@ -261,7 +261,7 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 	if err != nil {
 		return schedulerAuthCandidate{}, err
 	}
-	snapshot := newProtectionSnapshot(reservations, usage)
+	snapshot := newProtectionSnapshotWithUsage(reservations, usage)
 	states := make([]protectionCandidate, 0, len(candidates))
 	for i, candidate := range candidates {
 		state := protectionCandidateFor(candidate, cfg, configuredPlans, aliasSets[i])
@@ -387,16 +387,22 @@ type protectionUsageSample struct {
 	Tokens  int64
 }
 
-func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sql.DB, since int64) ([]protectionUsageSample, error) {
+type protectionUsageSnapshot struct {
+	Samples        []protectionUsageSample
+	samplesByAlias map[string][]int
+}
+
+func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sql.DB, since int64) (protectionUsageSnapshot, error) {
 	m.usageMu.Lock()
 	defer m.usageMu.Unlock()
 	if m.usageDB == db && m.usageSince == since && time.Since(m.usageLoadedAt) < 250*time.Millisecond {
 		return m.usage, nil
 	}
-	usage, err := loadProtectionUsageSnapshot(ctx, db, since)
+	samples, err := loadProtectionUsageSnapshot(ctx, db, since)
 	if err != nil {
-		return nil, err
+		return protectionUsageSnapshot{}, err
 	}
+	usage := newProtectionUsageSnapshot(samples)
 	m.usageDB = db
 	m.usageSince = since
 	m.usageLoadedAt = time.Now()
@@ -429,11 +435,35 @@ func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since
 }
 
 func newProtectionSnapshot(reservations []protectionReservationSample, usage []protectionUsageSample) protectionSnapshot {
+	return newProtectionSnapshotWithUsage(reservations, newProtectionUsageSnapshot(usage))
+}
+
+func newProtectionUsageSnapshot(usage []protectionUsageSample) protectionUsageSnapshot {
+	snapshot := protectionUsageSnapshot{
+		Samples:        usage,
+		samplesByAlias: make(map[string][]int),
+	}
+	for index, sample := range usage {
+		seen := make(map[string]struct{}, len(sample.Aliases))
+		for _, alias := range sample.Aliases {
+			if alias = normalizeAccountAlias(alias); alias != "" {
+				if _, ok := seen[alias]; ok {
+					continue
+				}
+				seen[alias] = struct{}{}
+				snapshot.samplesByAlias[alias] = append(snapshot.samplesByAlias[alias], index)
+			}
+		}
+	}
+	return snapshot
+}
+
+func newProtectionSnapshotWithUsage(reservations []protectionReservationSample, usage protectionUsageSnapshot) protectionSnapshot {
 	snapshot := protectionSnapshot{
 		Reservations:              reservations,
-		Usage:                     usage,
+		Usage:                     usage.Samples,
 		reservationSamplesByAlias: make(map[string][]int),
-		usageSamplesByAlias:       make(map[string][]int),
+		usageSamplesByAlias:       usage.samplesByAlias,
 	}
 	for index, reservation := range reservations {
 		seen := make(map[string]struct{}, len(reservation.Aliases))
@@ -444,18 +474,6 @@ func newProtectionSnapshot(reservations []protectionReservationSample, usage []p
 				}
 				seen[alias] = struct{}{}
 				snapshot.reservationSamplesByAlias[alias] = append(snapshot.reservationSamplesByAlias[alias], index)
-			}
-		}
-	}
-	for index, sample := range usage {
-		seen := make(map[string]struct{}, len(sample.Aliases))
-		for _, alias := range sample.Aliases {
-			if alias = normalizeAccountAlias(alias); alias != "" {
-				if _, ok := seen[alias]; ok {
-					continue
-				}
-				seen[alias] = struct{}{}
-				snapshot.usageSamplesByAlias[alias] = append(snapshot.usageSamplesByAlias[alias], index)
 			}
 		}
 	}
