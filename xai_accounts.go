@@ -140,7 +140,11 @@ func recordXAIStateIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, st
 		now = time.Now().Unix()
 	}
 	if !rec.Failed && successfulStatusCode(status) {
-		return clearRecoveredXAIState(ctx, db, rec)
+		if err := clearRecoveredXAIState(ctx, db, rec); err != nil {
+			return err
+		}
+		globalSchedulerState.invalidate()
+		return nil
 	}
 	state, reason, resetAt := xaiStateForRecord(rec, status, now)
 	if state == "" {
@@ -170,6 +174,9 @@ ON CONFLICT(state_key) DO UPDATE SET
   auth_file=excluded.auth_file,
   auth_file_mtime=excluded.auth_file_mtime`,
 		stateKey, trim(rec.AuthID), trim(rec.AuthIndex), trim(rec.Source), state, reason, now, resetAt, status, authFile, authFileMTime)
+	if err == nil {
+		globalSchedulerState.setRestricted("xai", true)
+	}
 	return err
 }
 
@@ -196,15 +203,12 @@ func expireXAIStates(ctx context.Context, db *sql.DB, now int64) error {
 }
 
 func queryActiveXAIStates(ctx context.Context, db *sql.DB, now int64) ([]xaiAccountStateRow, error) {
-	if err := expireXAIStates(ctx, db, now); err != nil {
-		return nil, err
-	}
 	rows, err := db.QueryContext(ctx, `
 SELECT state_key, auth_id, auth_index, source, provider, state, reason, observed_at, reset_at,
 active, last_status_code, auth_file, auth_file_mtime
 FROM xai_account_states
-WHERE active=1
-ORDER BY CASE WHEN reset_at=0 THEN 1 ELSE 0 END, reset_at, observed_at DESC`)
+WHERE active=1 AND (reset_at=0 OR reset_at>?)
+ORDER BY CASE WHEN reset_at=0 THEN 1 ELSE 0 END, reset_at, observed_at DESC`, now)
 	if err != nil {
 		return nil, err
 	}

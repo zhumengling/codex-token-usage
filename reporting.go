@@ -149,9 +149,6 @@ func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, 
 }
 
 func queryActiveAutobans(ctx context.Context, db *sql.DB, now int64) ([]autobanRow, error) {
-	if err := normalizeStoredResetColumns(ctx, db); err != nil {
-		return nil, err
-	}
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code,
 primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at

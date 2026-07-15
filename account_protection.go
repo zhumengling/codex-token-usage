@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,12 @@ type accountProtectionManager struct {
 	mu     sync.RWMutex
 	pickMu sync.Mutex
 	cfg    pluginConfig
+
+	usageMu       sync.Mutex
+	usageDB       *sql.DB
+	usageSince    int64
+	usageLoadedAt time.Time
+	usage         []protectionUsageSample
 }
 
 var globalAccountProtection accountProtectionManager
@@ -176,6 +183,17 @@ func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig, 
 }
 
 func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey string) (schedulerAuthCandidate, error) {
+	// File discovery and alias construction do not participate in reservation
+	// consistency. Keep them outside the serialized transaction.
+	configuredPlans := configuredProtectionPlanIndex(readConfiguredAuthAccounts())
+	aliasSets := protectionCandidateAliasSets(candidates)
+	now := time.Now().Unix()
+	// Token accounting is a soft-demotion signal and does not need to be in the
+	// reservation critical section. This is the expensive scan on busy stores.
+	usage, err := globalAccountProtection.loadUsageSnapshot(ctx, db, now-int64(cfg.AccountProtectionTokenWindowSeconds))
+	if err != nil {
+		return schedulerAuthCandidate{}, err
+	}
 	globalAccountProtection.pickMu.Lock()
 	defer globalAccountProtection.pickMu.Unlock()
 	tx, err := db.BeginTx(ctx, nil)
@@ -183,16 +201,14 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		return schedulerAuthCandidate{}, err
 	}
 	defer tx.Rollback()
-	now := time.Now().Unix()
 	if _, err = tx.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE expires_at <= ?`, now); err != nil {
 		return schedulerAuthCandidate{}, err
 	}
-	configuredPlans := configuredProtectionPlanIndex(readConfiguredAuthAccounts())
-	aliasSets := protectionCandidateAliasSets(candidates)
-	snapshot, err := loadProtectionSnapshot(ctx, tx, now-int64(cfg.AccountProtectionTokenWindowSeconds), now)
+	reservations, err := loadProtectionReservationSnapshot(ctx, tx, now)
 	if err != nil {
 		return schedulerAuthCandidate{}, err
 	}
+	snapshot := protectionSnapshot{Reservations: reservations, Usage: usage}
 	states := make([]protectionCandidate, 0, len(candidates))
 	for i, candidate := range candidates {
 		state := protectionCandidateFor(candidate, cfg, configuredPlans, aliasSets[i])
@@ -247,9 +263,13 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) 
 func rotateProtectedCandidate(states []protectionCandidate, rotationKey string) protectionCandidate {
 	candidates := make([]schedulerAuthCandidate, 0, len(states))
 	byID := make(map[string]protectionCandidate, len(states))
-	for _, state := range states {
-		candidates = append(candidates, state.Candidate)
-		byID[state.Candidate.ID] = state
+	for i, state := range states {
+		candidate := state.Candidate
+		// Multiple auth files may share one workspace ID. Decorate the temporary
+		// rotation identity so no protection state is overwritten in the map.
+		candidate.ID = candidate.ID + "\x00" + strconv.Itoa(i)
+		candidates = append(candidates, candidate)
+		byID[candidate.ID] = state
 	}
 	chosen := globalSchedulerRotation.pick(rotationKey, candidates)
 	return byID[chosen.ID]
@@ -295,27 +315,66 @@ type protectionUsageSample struct {
 	Tokens  int64
 }
 
+func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sql.DB, since int64) ([]protectionUsageSample, error) {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	if m.usageDB == db && m.usageSince == since && time.Since(m.usageLoadedAt) < 250*time.Millisecond {
+		return m.usage, nil
+	}
+	usage, err := loadProtectionUsageSnapshot(ctx, db, since)
+	if err != nil {
+		return nil, err
+	}
+	m.usageDB = db
+	m.usageSince = since
+	m.usageLoadedAt = time.Now()
+	m.usage = usage
+	return usage, nil
+}
+
+type protectionReservationSample struct {
+	Aliases []string
+	Count   int
+}
+
 type protectionSnapshot struct {
-	Reservations [][]string
+	Reservations []protectionReservationSample
 	Usage        []protectionUsageSample
 }
 
 func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since int64, now int64) (protectionSnapshot, error) {
-	var snapshot protectionSnapshot
+	reservations, err := loadProtectionReservationSnapshot(ctx, db, now)
+	if err != nil {
+		return protectionSnapshot{}, err
+	}
+	usage, err := loadProtectionUsageSnapshot(ctx, db, since)
+	if err != nil {
+		return protectionSnapshot{}, err
+	}
+	return protectionSnapshot{Reservations: reservations, Usage: usage}, nil
+}
+
+func loadProtectionReservationSnapshot(ctx context.Context, db protectionRowsQueryer, now int64) ([]protectionReservationSample, error) {
+	var snapshot []protectionReservationSample
 	rows, err := db.QueryContext(ctx, `
-SELECT auth_id, auth_index, source
+SELECT auth_id, auth_index, source, COUNT(*)
 FROM account_protection_reservations
-WHERE expires_at > ?`, now)
+WHERE expires_at > ?
+GROUP BY auth_id, auth_index, source`, now)
 	if err != nil {
 		return snapshot, err
 	}
 	for rows.Next() {
 		var authID, authIndex, source string
-		if err := rows.Scan(&authID, &authIndex, &source); err != nil {
+		var count int
+		if err := rows.Scan(&authID, &authIndex, &source, &count); err != nil {
 			_ = rows.Close()
 			return snapshot, err
 		}
-		snapshot.Reservations = append(snapshot.Reservations, normalizeAccountAliases(authID, authIndex, source))
+		snapshot = append(snapshot, protectionReservationSample{
+			Aliases: normalizeAccountAliases(authID, authIndex, source),
+			Count:   count,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -324,10 +383,16 @@ WHERE expires_at > ?`, now)
 	if err := rows.Close(); err != nil {
 		return snapshot, err
 	}
-	rows, err = db.QueryContext(ctx, `
-SELECT auth_id, auth_index, source, total_tokens
+	return snapshot, nil
+}
+
+func loadProtectionUsageSnapshot(ctx context.Context, db protectionRowsQueryer, since int64) ([]protectionUsageSample, error) {
+	var snapshot []protectionUsageSample
+	rows, err := db.QueryContext(ctx, `
+SELECT auth_id, auth_index, source, SUM(total_tokens)
 FROM usage_events INDEXED BY idx_usage_events_provider_requested
-WHERE provider IN ('codex','Codex','CODEX') AND requested_at >= ?`, since)
+WHERE provider IN ('codex','Codex','CODEX') AND requested_at >= ?
+GROUP BY auth_id, auth_index, source`, since)
 	if err != nil {
 		return snapshot, err
 	}
@@ -341,7 +406,7 @@ WHERE provider IN ('codex','Codex','CODEX') AND requested_at >= ?`, since)
 		if tokens <= 0 {
 			continue
 		}
-		snapshot.Usage = append(snapshot.Usage, protectionUsageSample{
+		snapshot = append(snapshot, protectionUsageSample{
 			Aliases: normalizeAccountAliases(authID, authIndex, source),
 			Tokens:  tokens,
 		})
@@ -369,8 +434,8 @@ func (snapshot protectionSnapshot) metrics(aliases []string) (int, int64) {
 	}
 	inFlight := 0
 	for _, reservation := range snapshot.Reservations {
-		if overlaps(reservation) {
-			inFlight++
+		if overlaps(reservation.Aliases) {
+			inFlight += reservation.Count
 		}
 	}
 	var tokens int64
