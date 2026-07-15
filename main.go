@@ -1467,10 +1467,6 @@ func (m *summaryMaintenanceManager) lightMaintenanceEnough(revision storeRevisio
 	if m.state.LastRevision == "" {
 		return false
 	}
-	if m.state.LastProcessedUsageEventID != revision.UsageMaxID ||
-		m.state.LastProcessedQuotaTriggerID != revision.QuotaMaxID {
-		return false
-	}
 	if m.state.LastProcessedAuthFilesRevision != "" && m.state.LastProcessedAuthFilesRevision != revision.AuthFilesRevision {
 		return false
 	}
@@ -1499,12 +1495,6 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 		if err := expireXAIStates(ctx, db, now); err != nil {
 			return struct{}{}, err
 		}
-		if strings.EqualFold(mode, "light") {
-			if err := globalSchedulerState.refresh(ctx, db); err != nil {
-				return struct{}{}, err
-			}
-			return struct{}{}, nil
-		}
 		if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
 			return struct{}{}, err
 		}
@@ -1519,6 +1509,12 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 		}
 		if err := clearRecoveredAuthStatesFromUsage(ctx, db); err != nil {
 			return struct{}{}, err
+		}
+		if strings.EqualFold(mode, "light") {
+			if err := globalSchedulerState.refresh(ctx, db); err != nil {
+				return struct{}{}, err
+			}
+			return struct{}{}, nil
 		}
 		if err := clearReplacedInvalidAuths(ctx, db); err != nil {
 			return struct{}{}, err
