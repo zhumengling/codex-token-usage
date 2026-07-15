@@ -464,6 +464,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return okJSON(schedulerPickResponse{Handled: false})
 		}
+		mustHandle := schedulerPickRequiresPlugin(req)
 		ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 		defer cancel()
 		resp, err := globalStore.pickAuth(ctx, req)
@@ -471,6 +472,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			var reject *schedulerRejectError
 			if errors.As(err, &reject) && reject != nil {
 				return errorEnvelopeWithStatus(reject.Code, reject.Message, reject.HTTPStatus), nil
+			}
+			if mustHandle || schedulerPickRequiresPlugin(req) {
+				return errorEnvelopeWithStatus(
+					"scheduler_unavailable",
+					"account protection scheduler is temporarily unavailable",
+					http.StatusServiceUnavailable,
+				), nil
 			}
 			return okJSON(schedulerPickResponse{Handled: false})
 		}
@@ -1400,7 +1408,7 @@ func (m *summaryMaintenanceManager) run(ctx context.Context) {
 	if revErr == nil {
 		m.mu.Lock()
 		unchanged := m.state.LastRevision != "" && m.state.LastRevision == revision.Revision
-		resetDue := revision.NextBanResetAt > 0 && revision.NextBanResetAt <= time.Now().Unix()
+		resetDue := storeRevisionResetDue(revision, time.Now().Unix())
 		if unchanged {
 			if resetDue {
 				m.mu.Unlock()
@@ -1459,10 +1467,19 @@ func (m *summaryMaintenanceManager) lightMaintenanceEnough(revision storeRevisio
 	if m.state.LastRevision == "" {
 		return false
 	}
+	if m.state.LastProcessedUsageEventID != revision.UsageMaxID ||
+		m.state.LastProcessedQuotaTriggerID != revision.QuotaMaxID {
+		return false
+	}
 	if m.state.LastProcessedAuthFilesRevision != "" && m.state.LastProcessedAuthFilesRevision != revision.AuthFilesRevision {
 		return false
 	}
 	return true
+}
+
+func storeRevisionResetDue(revision storeRevision, now int64) bool {
+	return (revision.NextBanResetAt > 0 && revision.NextBanResetAt <= now) ||
+		(revision.NextXAIResetAt > 0 && revision.NextXAIResetAt <= now)
 }
 
 func (s *store) runSummaryMaintenance(ctx context.Context) error {
@@ -1477,6 +1494,9 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 		}
 		now := time.Now().Unix()
 		if err := expireAutobans(ctx, db, now); err != nil {
+			return struct{}{}, err
+		}
+		if err := expireXAIStates(ctx, db, now); err != nil {
 			return struct{}{}, err
 		}
 		if strings.EqualFold(mode, "light") {
@@ -1830,9 +1850,6 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err := recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset); err != nil {
 		return err
 	}
-	if strings.EqualFold(trim(rec.Provider), "codex") && (status == http.StatusUnauthorized || status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusTooManyRequests) {
-		globalSchedulerState.setRestricted("codex", true)
-	}
 	return nil
 }
 
@@ -1875,7 +1892,11 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
 		reason, invalidatedAt, status, authFile, authFileMTime,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	globalSchedulerState.setRestricted("codex", true)
+	return nil
 }
 
 func invalidAuthIDForRecord(rec usageRecord, authFile string) string {
@@ -2060,7 +2081,11 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
 		primaryPct, primaryReset, secondaryPct, secondaryReset, authFile, authFileMTime,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	globalSchedulerState.setRestricted("codex", true)
+	return nil
 }
 
 type autobanReleaseRequest struct {
@@ -3111,9 +3136,6 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{Handled: false}, err
 	}
 	if len(bans) == 0 && len(invalids) == 0 && !protectionCfg.AccountProtectionEnabled {
-		if s == globalStore {
-			globalSchedulerState.setRestricted("codex", false)
-		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	effectiveBans := mergeEffectiveAutobans(bans, invalids)
@@ -3209,9 +3231,6 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		return schedulerPickResponse{Handled: false}, err
 	}
 	if len(states) == 0 {
-		if s == globalStore {
-			globalSchedulerState.setRestricted("xai", false)
-		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
@@ -3272,6 +3291,16 @@ func isCodexSchedulerRequest(req schedulerPickRequest) bool {
 	}
 	if len(req.Providers) == 1 && strings.EqualFold(strings.TrimSpace(req.Providers[0]), "codex") {
 		return true
+	}
+	return false
+}
+
+func schedulerPickRequiresPlugin(req schedulerPickRequest) bool {
+	if isXAISchedulerRequest(req) {
+		return globalSchedulerState.needsDatabase("xai", false)
+	}
+	if isCodexSchedulerRequest(req) {
+		return globalSchedulerState.needsDatabase("codex", globalAccountProtection.config().AccountProtectionEnabled)
 	}
 	return false
 }
@@ -3430,6 +3459,7 @@ WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
 		if err != nil {
 			return err
 		}
+		globalSchedulerState.setRestricted("codex", true)
 	}
 	return rows.Err()
 }

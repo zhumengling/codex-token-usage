@@ -3,9 +3,30 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 )
+
+func TestProtectionPickLockHonorsContextCancellation(t *testing.T) {
+	var manager accountProtectionManager
+	manager.pickMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := manager.lockPick(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("canceled pick lock waited too long: %s", elapsed)
+	}
+	manager.pickMu.Unlock()
+	if !manager.pickMu.TryLock() {
+		t.Fatal("canceled lock attempt left a waiter holding the mutex")
+	}
+	manager.pickMu.Unlock()
+}
 
 func newProtectionTestDB(t *testing.T) *sql.DB {
 	t.Helper()
@@ -299,6 +320,29 @@ func TestProtectionSnapshotDoesNotDoubleCountSharedAliases(t *testing.T) {
 	inFlight, tokens := snapshot.metrics([]string{"account", "account@example.com"})
 	if inFlight != 2 || tokens != 300 {
 		t.Fatalf("metrics = %d/%d, want 2/300", inFlight, tokens)
+	}
+}
+
+func TestProtectionSnapshotSumsDistinctIdentityGroups(t *testing.T) {
+	snapshot := newProtectionSnapshot(
+		[]protectionReservationSample{
+			{Aliases: []string{"old-auth-id", "old@example.com"}, Count: 2},
+			{Aliases: []string{"new-auth-id", "new@example.com"}, Count: 3},
+		},
+		[]protectionUsageSample{
+			{Aliases: []string{"old-auth-id", "old@example.com"}, Tokens: 100},
+			{Aliases: []string{"new-auth-id", "new@example.com"}, Tokens: 200},
+		},
+	)
+
+	// A candidate can retain several historical identity fields. Each matching
+	// sample must contribute once even when more than one of its aliases match.
+	inFlight, tokens := snapshot.metrics([]string{
+		"old-auth-id", "old@example.com",
+		"new-auth-id", "new@example.com",
+	})
+	if inFlight != 5 || tokens != 300 {
+		t.Fatalf("metrics = %d/%d, want 5/300", inFlight, tokens)
 	}
 }
 

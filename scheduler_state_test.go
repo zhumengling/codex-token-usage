@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -65,6 +67,149 @@ func TestSchedulerStateRefreshTracksActiveRestrictions(t *testing.T) {
 	}
 	if !globalSchedulerState.needsDatabase("xai", false) {
 		t.Fatal("active xAI state was not cached")
+	}
+}
+
+func TestSchedulerStateRefreshDoesNotOverwriteConcurrentRestriction(t *testing.T) {
+	var cache schedulerStateCache
+	cache.setRestricted("codex", false)
+
+	loaderStarted := make(chan struct{})
+	allowLoaderReturn := make(chan struct{})
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- cache.refreshWithLoader(func() (schedulerRestrictionState, error) {
+			close(loaderStarted)
+			<-allowLoaderReturn
+			return schedulerRestrictionState{}, nil
+		})
+	}()
+
+	<-loaderStarted
+	cache.setRestricted("codex", true)
+	close(allowLoaderReturn)
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+	if !cache.needsDatabase("codex", false) {
+		t.Fatal("stale refresh result overwrote a concurrent Codex restriction")
+	}
+	if cache.needsDatabase("xai", false) {
+		t.Fatal("unchanged xAI generation did not accept the refresh result")
+	}
+}
+
+func TestCodexRestrictionWritesMarkSchedulerState(t *testing.T) {
+	resetSchedulerStateForTest()
+	t.Cleanup(resetSchedulerStateForTest)
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	globalSchedulerState.setRestricted("codex", false)
+	if err := recordInvalidAuthIfNeeded(context.Background(), db, usageRecord{
+		Provider:    "codex",
+		AuthID:      "invalid-account",
+		RequestedAt: time.Now(),
+	}, http.StatusUnauthorized); err != nil {
+		t.Fatal(err)
+	}
+	if !globalSchedulerState.needsDatabase("codex", false) {
+		t.Fatal("successful invalid-auth write did not restrict the scheduler cache")
+	}
+
+	globalSchedulerState.setRestricted("codex", false)
+	if err := recordAutobanIfNeeded(context.Background(), db, usageRecord{
+		Provider:    "codex",
+		AuthID:      "rate-limited-account",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+	}, http.StatusTooManyRequests, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !globalSchedulerState.needsDatabase("codex", false) {
+		t.Fatal("successful autoban write did not restrict the scheduler cache")
+	}
+}
+
+func TestQuotaProbeRestrictionWritesMarkSchedulerState(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			resetSchedulerStateForTest()
+			t.Cleanup(resetSchedulerStateForTest)
+			s := newTestStore(t)
+			db, _, err := s.open(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			t.Cleanup(server.Close)
+			codexResponsesURLOverrideForTest = server.URL
+			t.Cleanup(func() { codexResponsesURLOverrideForTest = "" })
+
+			globalSchedulerState.setRestricted("codex", false)
+			cfg := defaultPluginConfig()
+			run := executeQuotaProbeRequest(context.Background(), db, triggerAuthAccount{
+				configuredAccount: configuredAccount{
+					AuthID:    "probe-account",
+					AuthIndex: "probe-account.json",
+					Provider:  "codex",
+					Source:    "probe@example.com",
+				},
+				AccessToken: "test-token",
+			}, cfg)
+			if run.HTTPStatus != status {
+				t.Fatalf("HTTP status=%d, want %d", run.HTTPStatus, status)
+			}
+			if !globalSchedulerState.needsDatabase("codex", false) {
+				t.Fatalf("quota probe %d write did not restrict the scheduler cache", status)
+			}
+		})
+	}
+}
+
+func TestEmptySchedulerSnapshotDoesNotClearRestrictionCache(t *testing.T) {
+	for _, provider := range []string{"codex", "xai"} {
+		t.Run(provider, func(t *testing.T) {
+			resetSchedulerStateForTest()
+			t.Cleanup(resetSchedulerStateForTest)
+			s := newTestStore(t)
+			previousStore := globalStore
+			previousProtectionConfig := globalAccountProtection.config()
+			globalStore = s
+			t.Cleanup(func() {
+				globalStore = previousStore
+				globalAccountProtection.configure(previousProtectionConfig)
+			})
+			if provider == "codex" {
+				cfg := defaultPluginConfig()
+				cfg.AccountProtectionEnabled = false
+				globalAccountProtection.configure(cfg)
+			}
+
+			globalSchedulerState.setRestricted(provider, true)
+			resp, err := s.pickAuthOnce(context.Background(), schedulerPickRequest{
+				Provider: provider,
+				Candidates: []schedulerAuthCandidate{
+					{ID: "account", Provider: provider, Priority: 1},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.Handled {
+				t.Fatalf("response=%+v, want native scheduler delegation", resp)
+			}
+			if !globalSchedulerState.needsDatabase(provider, false) {
+				t.Fatal("request-path database snapshot cleared a possibly newer restriction")
+			}
+		})
 	}
 }
 

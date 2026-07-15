@@ -85,6 +85,24 @@ func (m *accountProtectionManager) enabled() bool {
 	return m.config().AccountProtectionEnabled
 }
 
+func (m *accountProtectionManager) lockPick(ctx context.Context) error {
+	if m.pickMu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if m.pickMu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
 func normalizedProtectionPlan(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	switch {
@@ -227,7 +245,9 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 	if err != nil {
 		return schedulerAuthCandidate{}, err
 	}
-	globalAccountProtection.pickMu.Lock()
+	if err := globalAccountProtection.lockPick(ctx); err != nil {
+		return schedulerAuthCandidate{}, err
+	}
 	defer globalAccountProtection.pickMu.Unlock()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -390,10 +410,10 @@ type protectionReservationSample struct {
 }
 
 type protectionSnapshot struct {
-	Reservations       []protectionReservationSample
-	Usage              []protectionUsageSample
-	reservationByAlias map[string]int
-	tokensByAlias      map[string]int64
+	Reservations              []protectionReservationSample
+	Usage                     []protectionUsageSample
+	reservationSamplesByAlias map[string][]int
+	usageSamplesByAlias       map[string][]int
 }
 
 func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since int64, now int64) (protectionSnapshot, error) {
@@ -410,22 +430,32 @@ func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since
 
 func newProtectionSnapshot(reservations []protectionReservationSample, usage []protectionUsageSample) protectionSnapshot {
 	snapshot := protectionSnapshot{
-		Reservations:       reservations,
-		Usage:              usage,
-		reservationByAlias: make(map[string]int),
-		tokensByAlias:      make(map[string]int64),
+		Reservations:              reservations,
+		Usage:                     usage,
+		reservationSamplesByAlias: make(map[string][]int),
+		usageSamplesByAlias:       make(map[string][]int),
 	}
-	for _, reservation := range reservations {
+	for index, reservation := range reservations {
+		seen := make(map[string]struct{}, len(reservation.Aliases))
 		for _, alias := range reservation.Aliases {
 			if alias = normalizeAccountAlias(alias); alias != "" {
-				snapshot.reservationByAlias[alias] += reservation.Count
+				if _, ok := seen[alias]; ok {
+					continue
+				}
+				seen[alias] = struct{}{}
+				snapshot.reservationSamplesByAlias[alias] = append(snapshot.reservationSamplesByAlias[alias], index)
 			}
 		}
 	}
-	for _, sample := range usage {
+	for index, sample := range usage {
+		seen := make(map[string]struct{}, len(sample.Aliases))
 		for _, alias := range sample.Aliases {
 			if alias = normalizeAccountAlias(alias); alias != "" {
-				snapshot.tokensByAlias[alias] += sample.Tokens
+				if _, ok := seen[alias]; ok {
+					continue
+				}
+				seen[alias] = struct{}{}
+				snapshot.usageSamplesByAlias[alias] = append(snapshot.usageSamplesByAlias[alias], index)
 			}
 		}
 	}
@@ -498,19 +528,31 @@ func (snapshot protectionSnapshot) metrics(aliases []string) (int, int64) {
 	}
 	inFlight := 0
 	var tokens int64
-	seen := make(map[string]struct{}, len(aliases))
+	seenAliases := make(map[string]struct{}, len(aliases))
+	seenReservations := make(map[int]struct{})
+	seenUsage := make(map[int]struct{})
 	for _, alias := range aliases {
 		alias = normalizeAccountAlias(alias)
 		if alias == "" {
 			continue
 		}
-		if _, ok := seen[alias]; ok {
+		if _, ok := seenAliases[alias]; ok {
 			continue
 		}
-		seen[alias] = struct{}{}
-		inFlight = maxInt(inFlight, snapshot.reservationByAlias[alias])
-		if value := snapshot.tokensByAlias[alias]; value > tokens {
-			tokens = value
+		seenAliases[alias] = struct{}{}
+		for _, index := range snapshot.reservationSamplesByAlias[alias] {
+			if _, ok := seenReservations[index]; ok {
+				continue
+			}
+			seenReservations[index] = struct{}{}
+			inFlight += snapshot.Reservations[index].Count
+		}
+		for _, index := range snapshot.usageSamplesByAlias[alias] {
+			if _, ok := seenUsage[index]; ok {
+				continue
+			}
+			seenUsage[index] = struct{}{}
+			tokens += snapshot.Usage[index].Tokens
 		}
 	}
 	return inFlight, tokens
