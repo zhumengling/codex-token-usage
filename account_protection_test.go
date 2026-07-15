@@ -291,6 +291,17 @@ func TestProtectionSnapshotCountsGroupedReservations(t *testing.T) {
 	}
 }
 
+func TestProtectionSnapshotDoesNotDoubleCountSharedAliases(t *testing.T) {
+	snapshot := newProtectionSnapshot(
+		[]protectionReservationSample{{Aliases: []string{"account", "account@example.com"}, Count: 2}},
+		[]protectionUsageSample{{Aliases: []string{"account", "account@example.com"}, Tokens: 300}},
+	)
+	inFlight, tokens := snapshot.metrics([]string{"account", "account@example.com"})
+	if inFlight != 2 || tokens != 300 {
+		t.Fatalf("metrics = %d/%d, want 2/300", inFlight, tokens)
+	}
+}
+
 func TestProtectionRotationHandlesDuplicateCandidateIDs(t *testing.T) {
 	globalSchedulerRotation.reset()
 	states := []protectionCandidate{

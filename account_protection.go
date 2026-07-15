@@ -208,7 +208,7 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 	if err != nil {
 		return schedulerAuthCandidate{}, err
 	}
-	snapshot := protectionSnapshot{Reservations: reservations, Usage: usage}
+	snapshot := newProtectionSnapshot(reservations, usage)
 	states := make([]protectionCandidate, 0, len(candidates))
 	for i, candidate := range candidates {
 		state := protectionCandidateFor(candidate, cfg, configuredPlans, aliasSets[i])
@@ -338,8 +338,10 @@ type protectionReservationSample struct {
 }
 
 type protectionSnapshot struct {
-	Reservations []protectionReservationSample
-	Usage        []protectionUsageSample
+	Reservations       []protectionReservationSample
+	Usage              []protectionUsageSample
+	reservationByAlias map[string]int
+	tokensByAlias      map[string]int64
 }
 
 func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since int64, now int64) (protectionSnapshot, error) {
@@ -351,7 +353,31 @@ func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since
 	if err != nil {
 		return protectionSnapshot{}, err
 	}
-	return protectionSnapshot{Reservations: reservations, Usage: usage}, nil
+	return newProtectionSnapshot(reservations, usage), nil
+}
+
+func newProtectionSnapshot(reservations []protectionReservationSample, usage []protectionUsageSample) protectionSnapshot {
+	snapshot := protectionSnapshot{
+		Reservations:       reservations,
+		Usage:              usage,
+		reservationByAlias: make(map[string]int),
+		tokensByAlias:      make(map[string]int64),
+	}
+	for _, reservation := range reservations {
+		for _, alias := range reservation.Aliases {
+			if alias = normalizeAccountAlias(alias); alias != "" {
+				snapshot.reservationByAlias[alias] += reservation.Count
+			}
+		}
+	}
+	for _, sample := range usage {
+		for _, alias := range sample.Aliases {
+			if alias = normalizeAccountAlias(alias); alias != "" {
+				snapshot.tokensByAlias[alias] += sample.Tokens
+			}
+		}
+	}
+	return snapshot
 }
 
 func loadProtectionReservationSnapshot(ctx context.Context, db protectionRowsQueryer, now int64) ([]protectionReservationSample, error) {
@@ -418,30 +444,21 @@ func (snapshot protectionSnapshot) metrics(aliases []string) (int, int64) {
 	if len(aliases) == 0 {
 		return 0, 0
 	}
-	aliasSet := make(map[string]struct{}, len(aliases))
-	for _, alias := range aliases {
-		if alias = normalizeAccountAlias(alias); alias != "" {
-			aliasSet[alias] = struct{}{}
-		}
-	}
-	overlaps := func(values []string) bool {
-		for _, value := range values {
-			if _, ok := aliasSet[normalizeAccountAlias(value)]; ok {
-				return true
-			}
-		}
-		return false
-	}
 	inFlight := 0
-	for _, reservation := range snapshot.Reservations {
-		if overlaps(reservation.Aliases) {
-			inFlight += reservation.Count
-		}
-	}
 	var tokens int64
-	for _, sample := range snapshot.Usage {
-		if overlaps(sample.Aliases) {
-			tokens += sample.Tokens
+	seen := make(map[string]struct{}, len(aliases))
+	for _, alias := range aliases {
+		alias = normalizeAccountAlias(alias)
+		if alias == "" {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		inFlight = maxInt(inFlight, snapshot.reservationByAlias[alias])
+		if value := snapshot.tokensByAlias[alias]; value > tokens {
+			tokens = value
 		}
 	}
 	return inFlight, tokens
