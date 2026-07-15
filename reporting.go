@@ -151,7 +151,7 @@ func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, 
 func queryActiveAutobans(ctx context.Context, db *sql.DB, now int64) ([]autobanRow, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code,
-primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
+primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at, auth_file, auth_file_mtime
 FROM autoban_bans
 WHERE active=1 AND reset_at > ?
 ORDER BY reset_at DESC`, now)
@@ -167,7 +167,7 @@ ORDER BY reset_at DESC`, now)
 		var pr, sr sql.NullInt64
 		if err := rows.Scan(
 			&r.AuthID, &r.AuthIndex, &r.Source, &r.Provider, &r.Window, &r.Reason,
-			&r.BannedAt, &r.ResetAt, &active, &r.LastStatusCode, &pp, &pr, &sp, &sr,
+			&r.BannedAt, &r.ResetAt, &active, &r.LastStatusCode, &pp, &pr, &sp, &sr, &r.AuthFile, &r.AuthFileMTime,
 		); err != nil {
 			return nil, err
 		}
@@ -294,6 +294,9 @@ func mergeDuplicateAutobanRow(left, right autobanRow) autobanRow {
 	merged.Provider = firstNonEmptyString(merged.Provider, other.Provider)
 	merged.Source = firstNonEmptyString(merged.Source, other.Source)
 	merged.AuthFile = firstNonEmptyString(merged.AuthFile, other.AuthFile)
+	if merged.AuthFileMTime == 0 {
+		merged.AuthFileMTime = other.AuthFileMTime
+	}
 	if merged.LastStatusCode == 0 {
 		merged.LastStatusCode = other.LastStatusCode
 	}

@@ -53,7 +53,7 @@ func TestProtectionConcurrencySwitchesCandidate(t *testing.T) {
 	ctx := context.Background()
 	candidates := []schedulerAuthCandidate{protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1)}
 	for _, want := range []string{"a", "a", "b"} {
-		got, err := s.pickProtectedAuth(ctx, db, candidates, cfg, "codex\x00test")
+		got, err := s.pickProtectedAuth(ctx, db, candidates, cfg, "codex\x00test", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -75,7 +75,7 @@ func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 	}
 	got, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
 		protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1),
-	}, cfg, "codex\x00test")
+	}, cfg, "codex\x00test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
 	}
 	got, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
 		protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1),
-	}, cfg, "codex\x00test")
+	}, cfg, "codex\x00test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestProtectionSaturationUsesPriorityBeforeTokenDemotion(t *testing.T) {
 			Threshold: 100,
 		},
 	}
-	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "high" {
+	if got := chooseProtectedCandidate(states, "test", ""); got.Candidate.ID != "high" {
 		t.Fatalf("picked %q, want higher-priority saturated candidate", got.Candidate.ID)
 	}
 }
@@ -139,10 +139,10 @@ func TestProtectionRoundRobinsWithinSamePriority(t *testing.T) {
 		{Candidate: schedulerAuthCandidate{ID: "z-account", Priority: 1}, Limit: 5},
 		{Candidate: schedulerAuthCandidate{ID: "a-account", Priority: 1}, Limit: 5},
 	}
-	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "a-account" {
+	if got := chooseProtectedCandidate(states, "test", ""); got.Candidate.ID != "a-account" {
 		t.Fatalf("first pick = %q, want a-account", got.Candidate.ID)
 	}
-	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "z-account" {
+	if got := chooseProtectedCandidate(states, "test", ""); got.Candidate.ID != "z-account" {
 		t.Fatalf("second pick = %q, want z-account", got.Candidate.ID)
 	}
 }
@@ -176,7 +176,7 @@ func TestProtectionReservationExpiresAndReleasesOnUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := defaultPluginConfig()
-	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{protectionTestCandidate("other", "plus", 1)}, cfg, "codex\x00test")
+	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{protectionTestCandidate("other", "plus", 1)}, cfg, "codex\x00test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,8 +308,8 @@ func TestProtectionRotationHandlesDuplicateCandidateIDs(t *testing.T) {
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "a.json"}}, AuthIndex: "a", Limit: 5},
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "b.json"}}, AuthIndex: "b", Limit: 5},
 	}
-	first := chooseProtectedCandidate(states, "duplicate")
-	second := chooseProtectedCandidate(states, "duplicate")
+	first := chooseProtectedCandidate(states, "duplicate", "")
+	second := chooseProtectedCandidate(states, "duplicate", "")
 	if first.AuthIndex == second.AuthIndex {
 		t.Fatalf("duplicate-ID rotation chose %q twice", first.AuthIndex)
 	}

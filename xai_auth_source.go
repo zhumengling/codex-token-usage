@@ -49,6 +49,8 @@ type hostAuthFileEntry struct {
 	Tag           string `json:"tag"`
 	Type          string `json:"type"`
 	Unavailable   bool   `json:"unavailable"`
+	RuntimeOnly   bool   `json:"runtime_only"`
+	ModTime       string `json:"modtime"`
 	UpdatedAt     string `json:"updated_at"`
 }
 

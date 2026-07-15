@@ -90,7 +90,7 @@ func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := s.pickProtectedAuth(context.Background(), db, candidates, cfg, "benchmark"); err != nil {
+		if _, err := s.pickProtectedAuth(context.Background(), db, candidates, cfg, "benchmark", ""); err != nil {
 			b.Fatal(err)
 		}
 	}

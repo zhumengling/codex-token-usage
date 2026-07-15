@@ -182,7 +182,7 @@ func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig, 
 	}
 }
 
-func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey string) (schedulerAuthCandidate, error) {
+func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey, affinityKey string) (schedulerAuthCandidate, error) {
 	// File discovery and alias construction do not participate in reservation
 	// consistency. Keep them outside the serialized transaction.
 	configuredPlans := configuredProtectionPlanIndex(readConfiguredAuthAccounts())
@@ -215,7 +215,7 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		state.InFlight, state.Tokens = snapshot.metrics(state.Aliases)
 		states = append(states, state)
 	}
-	chosen := chooseProtectedCandidate(states, rotationKey)
+	chosen := chooseProtectedCandidate(states, rotationKey, affinityKey)
 	if _, err = tx.ExecContext(ctx, `
 INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at)
 VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
@@ -227,7 +227,10 @@ VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chos
 	return chosen.Candidate, nil
 }
 
-func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) protectionCandidate {
+func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) protectionCandidate {
+	if bound, ok := boundProtectedCandidate(states, affinityKey); ok && bound.InFlight < bound.Limit {
+		return bound
+	}
 	eligible := make([]protectionCandidate, 0, len(states))
 	for _, state := range states {
 		demoted := state.Threshold > 0 && state.Tokens >= state.Threshold
@@ -236,7 +239,7 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) 
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal")
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal", affinityKey)
 	}
 	for _, state := range states {
 		if state.InFlight < state.Limit {
@@ -244,7 +247,7 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) 
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted")
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted", affinityKey)
 	}
 	minInFlight := states[0].InFlight
 	for _, state := range states[1:] {
@@ -257,10 +260,10 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) 
 			eligible = append(eligible, state)
 		}
 	}
-	return rotateProtectedCandidate(eligible, rotationKey+"\x00saturated")
+	return rotateProtectedCandidate(eligible, rotationKey+"\x00saturated", affinityKey)
 }
 
-func rotateProtectedCandidate(states []protectionCandidate, rotationKey string) protectionCandidate {
+func boundProtectedCandidate(states []protectionCandidate, affinityKey string) (protectionCandidate, bool) {
 	candidates := make([]schedulerAuthCandidate, 0, len(states))
 	byID := make(map[string]protectionCandidate, len(states))
 	for i, state := range states {
@@ -271,7 +274,27 @@ func rotateProtectedCandidate(states []protectionCandidate, rotationKey string) 
 		candidates = append(candidates, candidate)
 		byID[candidate.ID] = state
 	}
-	chosen := globalSchedulerRotation.pick(rotationKey, candidates)
+	chosen, ok := globalSchedulerAffinity.pick(affinityKey, candidates)
+	if !ok {
+		return protectionCandidate{}, false
+	}
+	state, ok := byID[chosen.ID]
+	return state, ok
+}
+
+func rotateProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) protectionCandidate {
+	candidates := make([]schedulerAuthCandidate, 0, len(states))
+	byID := make(map[string]protectionCandidate, len(states))
+	for i, state := range states {
+		candidate := state.Candidate
+		// Keep candidates with the same CPA-visible ID distinct while selecting.
+		// The ordering is stable for one scheduler candidate list, so affinity can
+		// safely bind to this temporary identity and still return the original ID.
+		candidate.ID = candidate.ID + "\x00" + strconv.Itoa(i)
+		candidates = append(candidates, candidate)
+		byID[candidate.ID] = state
+	}
+	chosen := pickSchedulerCandidate(rotationKey, affinityKey, candidates)
 	return byID[chosen.ID]
 }
 

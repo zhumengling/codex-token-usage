@@ -698,6 +698,10 @@ WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.Next
 }
 
 func authFilesRevision() string {
+	_ = readConfiguredAuthAccounts()
+	if status := globalCodexAuthSource.status(); status.Authoritative && status.Source == "host_callback" {
+		return "host:" + globalCodexAuthSource.currentRevision()
+	}
 	authDir := configuredAuthDir()
 	if authDir == "" {
 		return "none"
@@ -765,7 +769,6 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		return nil, err
 	}
 	now := time.Now().Unix()
-	authDirReadable := configuredAuthDirectoryReadable()
 	configuredXAIAccounts := readConfiguredXAIAccounts()
 	xaiHasUsage, err := queryHasXAIUsage(ctx, db, since)
 	if err != nil {
@@ -789,6 +792,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		return nil, err
 	}
 	configuredAccounts := readConfiguredAuthAccounts()
+	authDirReadable := globalCodexAuthSource.authoritative()
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
 	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
 	if globalAccountProtection.enabled() {
@@ -1335,6 +1339,7 @@ type autobanRow struct {
 	Source               string   `json:"source"`
 	Provider             string   `json:"provider"`
 	AuthFile             string   `json:"auth_file,omitempty"`
+	AuthFileMTime        int64    `json:"auth_file_mtime,omitempty"`
 	Window               string   `json:"window"`
 	Reason               string   `json:"reason"`
 	BannedAt             int64    `json:"banned_at"`
@@ -1500,6 +1505,16 @@ LIMIT ?`, since, limit)
 }
 
 func readConfiguredAuthAccounts() []configuredAccount {
+	accounts, err := globalCodexAuthSource.hostAccounts()
+	if err == nil {
+		var metadata []configuredAccount
+		for _, file := range readConfiguredAuthFiles() {
+			if isCodexAuthProvider(file.Provider) {
+				metadata = append(metadata, file)
+			}
+		}
+		return mergeConfiguredAccountMetadata(accounts, metadata)
+	}
 	files := readConfiguredAuthFiles()
 	out := make([]configuredAccount, 0, len(files))
 	for _, file := range files {
@@ -1507,6 +1522,7 @@ func readConfiguredAuthAccounts() []configuredAccount {
 			out = append(out, file)
 		}
 	}
+	globalCodexAuthSource.markFilesystemFallback(out, err)
 	return out
 }
 
@@ -1696,14 +1712,38 @@ func readTriggerAuthAccounts() []triggerAuthAccount {
 
 func configuredAuthDir() string {
 	if dir := strings.TrimSpace(os.Getenv("CPA_AUTH_DIR")); dir != "" {
-		return dir
+		return resolveConfiguredAuthDir(dir)
 	}
 	configPath := configuredConfigPath()
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
 		return ""
 	}
-	return yamlScalar(string(raw), "auth-dir", "auth_dir")
+	dir := yamlScalar(string(raw), "auth-dir", "auth_dir")
+	if dir == "" {
+		dir = "~/.cli-proxy-api"
+	}
+	return resolveConfiguredAuthDir(dir)
+}
+
+func resolveConfiguredAuthDir(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if !strings.HasPrefix(path, "~") {
+		return filepath.Clean(path)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	remainder := strings.TrimLeft(strings.TrimPrefix(path, "~"), "/\\")
+	if remainder == "" {
+		return filepath.Clean(home)
+	}
+	remainder = strings.ReplaceAll(remainder, "\\", "/")
+	return filepath.Clean(filepath.Join(home, filepath.FromSlash(remainder)))
 }
 
 func configuredConfigPath() string {
@@ -1979,6 +2019,28 @@ func authFileStateForRecord(rec usageRecord) (string, int64) {
 }
 
 func authFileStateForName(authFile string) (string, int64) {
+	authFile = fileNameIfJSON(authFile)
+	if authFile == "" {
+		return "", 0
+	}
+	targetAliases := normalizeAccountAliases(authFile)
+	for _, cfg := range readConfiguredAuthAccounts() {
+		matched := false
+		for _, left := range normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex, cfg.AuthID) {
+			for _, right := range targetAliases {
+				if left == right {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if matched && cfg.AuthFileMTime > 0 {
+			return firstNonEmptyString(cfg.AuthFile, authFile), cfg.AuthFileMTime
+		}
+	}
 	authDir := configuredAuthDir()
 	if authDir == "" {
 		return authFile, 0

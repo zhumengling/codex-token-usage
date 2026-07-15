@@ -107,6 +107,7 @@ type modelPriceDiagnostics struct {
 type diagnosticsSummary struct {
 	Database     databaseDiagnostics      `json:"database"`
 	AuthFiles    authDiagnostics          `json:"auth_files"`
+	CodexAuth    xaiAuthSourceDiagnostics `json:"codex_auth"`
 	XAIAuth      xaiAuthSourceDiagnostics `json:"xai_auth"`
 	Scheduler    schedulerDiagnostics     `json:"scheduler"`
 	Providers    providerDiagnostics      `json:"providers"`
@@ -246,6 +247,7 @@ func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts [
 	return diagnosticsSummary{
 		Database:     queryDatabaseDiagnostics(ctx, db, dbPath),
 		AuthFiles:    buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
+		CodexAuth:    globalCodexAuthSource.status(),
 		XAIAuth:      globalXAIAuthSource.status(),
 		Scheduler:    globalSchedulerDiagnostics.status(len(autobans)),
 		Providers:    buildProviderDiagnostics(providers),
@@ -300,8 +302,10 @@ func queryMaxUnix(ctx context.Context, db *sql.DB, query string) int64 {
 
 func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, autobans []autobanRow, externalAlerts []externalUseAlert) authDiagnostics {
 	files := readConfiguredAuthFiles()
+	codexStatus := globalCodexAuthSource.status()
 	out := authDiagnostics{
 		Files:                len(files),
+		Codex:                codexStatus.Accounts,
 		XAI:                  globalXAIAuthSource.status().Accounts,
 		Invalid401:           len(invalidAuths),
 		Autoban429:           count429Autobans(autobans),
@@ -309,8 +313,6 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 	}
 	for _, file := range files {
 		switch strings.ToLower(strings.TrimSpace(file.Provider)) {
-		case "codex":
-			out.Codex++
 		case "anthropic":
 			out.Anthropic++
 		case "antigravity":
@@ -318,14 +320,20 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 		case "gemini":
 			out.Gemini++
 		}
-		if file.Disabled {
+		if !isCodexAuthProvider(file.Provider) && file.Disabled {
 			out.Disabled++
 		}
-		if file.Expired {
+		if !isCodexAuthProvider(file.Provider) && file.Expired {
 			out.Expired++
 		}
 	}
 	for _, account := range accounts {
+		if account.Configured && isCodexAuthProvider(account.Provider) && account.Disabled {
+			out.Disabled++
+		}
+		if account.Configured && isCodexAuthProvider(account.Provider) && account.Expired {
+			out.Expired++
+		}
 		if isCodexAuthProvider(account.Provider) && !account.Disabled && !account.Expired && !account.InvalidAuth && !account.ExternalUseSuspected {
 			out.QuotaTriggerAvailable++
 		}

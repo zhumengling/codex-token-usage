@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS autoban_bans (
   primary_reset_at INTEGER,
   secondary_used_percent REAL,
   secondary_reset_at INTEGER,
+  auth_file TEXT NOT NULL DEFAULT '',
+  auth_file_mtime INTEGER NOT NULL DEFAULT 0,
   released_at INTEGER NOT NULL DEFAULT 0,
   release_reason TEXT NOT NULL DEFAULT ''
 );

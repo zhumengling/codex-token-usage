@@ -1503,11 +1503,14 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 		if err := clearReplacedInvalidAuths(ctx, db); err != nil {
 			return struct{}{}, err
 		}
+		if err := clearReplacedAutobans(ctx, db); err != nil {
+			return struct{}{}, err
+		}
 		if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
 			return struct{}{}, err
 		}
 		configuredAccounts := readConfiguredAuthAccounts()
-		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, configuredAuthDirectoryReadable()); err != nil {
+		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
 			return struct{}{}, err
 		}
 		if err := globalSchedulerState.refresh(ctx, db); err != nil {
@@ -1637,6 +1640,8 @@ func ensureAutobanBanColumns(ctx context.Context, db *sql.DB) error {
 		name string
 		def  string
 	}{
+		{"auth_file", "TEXT NOT NULL DEFAULT ''"},
+		{"auth_file_mtime", "INTEGER NOT NULL DEFAULT 0"},
 		{"released_at", "INTEGER NOT NULL DEFAULT 0"},
 		{"release_reason", "TEXT NOT NULL DEFAULT ''"},
 	}
@@ -1660,6 +1665,9 @@ func ensureAutobanBanColumns(ctx context.Context, db *sql.DB) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	for _, column := range columns {
 		if existing[column.name] {
 			continue
@@ -1668,7 +1676,8 @@ func ensureAutobanBanColumns(ctx context.Context, db *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	_, err = db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_autoban_bans_auth_file ON autoban_bans(auth_file, active)`)
+	return err
 }
 
 type quotaTriggerManager struct {
@@ -2015,7 +2024,8 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	if !rec.Failed || status != http.StatusTooManyRequests {
 		return nil
 	}
-	authID := firstNonEmptyString(rec.AuthID, rec.AuthIndex, rec.Source)
+	authFile, authFileMTime := authFileStateForRecord(rec)
+	authID := invalidAuthIDForRecord(rec, authFile)
 	if authID == "" {
 		return nil
 	}
@@ -2027,8 +2037,8 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
   last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
-  released_at, release_reason
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, '')
+  auth_file, auth_file_mtime, released_at, release_reason
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 0, '')
 ON CONFLICT(auth_id) DO UPDATE SET
   auth_index=excluded.auth_index,
   source=excluded.source,
@@ -2043,10 +2053,12 @@ ON CONFLICT(auth_id) DO UPDATE SET
   primary_reset_at=excluded.primary_reset_at,
   secondary_used_percent=excluded.secondary_used_percent,
   secondary_reset_at=excluded.secondary_reset_at,
+  auth_file=excluded.auth_file,
+  auth_file_mtime=excluded.auth_file_mtime,
   released_at=0,
   release_reason=''`,
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
-		primaryPct, primaryReset, secondaryPct, secondaryReset,
+		primaryPct, primaryReset, secondaryPct, secondaryReset, authFile, authFileMTime,
 	)
 	return err
 }
@@ -2196,7 +2208,7 @@ func queryActiveAutobanReleaseRows(ctx context.Context, db *sql.DB) ([]autobanRo
 	}
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code,
-primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
+primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at, auth_file, auth_file_mtime
 FROM autoban_bans
 WHERE active=1`)
 	if err != nil {
@@ -2211,7 +2223,7 @@ WHERE active=1`)
 		var pr, sr sql.NullInt64
 		if err := rows.Scan(
 			&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.Window, &row.Reason,
-			&row.BannedAt, &row.ResetAt, &active, &row.LastStatusCode, &pp, &pr, &sp, &sr,
+			&row.BannedAt, &row.ResetAt, &active, &row.LastStatusCode, &pp, &pr, &sp, &sr, &row.AuthFile, &row.AuthFileMTime,
 		); err != nil {
 			return nil, err
 		}
@@ -2302,6 +2314,13 @@ func (s *store) runQuotaTriggerRound(ctx context.Context, cfg pluginConfig) (int
 		return 0, 0, 0, 0, err
 	}
 	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if err := clearReplacedAutobans(ctx, db); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	configuredAccounts := readConfiguredAuthAccounts()
+	if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
 		return 0, 0, 0, 0, err
 	}
 	now := time.Now().Unix()
@@ -3073,6 +3092,25 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{Handled: false}, err
 	}
 	now := time.Now().Unix()
+	if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	if err := expireAutobans(ctx, db, now); err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	if err := clearReplacedAutobans(ctx, db); err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	configuredAccounts := readConfiguredAuthAccounts()
+	if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
 	bans, err := queryActiveAutobans(ctx, db, now)
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
@@ -3088,16 +3126,62 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	effectiveBans := mergeEffectiveAutobans(bans, invalids)
-	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
+	available, filtered, banFilteredCandidates, matchedBanIndexes := filterCodexSchedulerCandidates(req.Candidates, effectiveBans)
+	recordSchedulerFilteringDiagnostics(effectiveBans, banFilteredCandidates, matchedBanIndexes)
+	if filtered && len(available) == 0 {
+		globalCodexAuthSource.invalidate()
+		if err := clearReplacedInvalidAuths(ctx, db); err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		if err := clearReplacedAutobans(ctx, db); err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		configuredAccounts = readConfiguredAuthAccounts()
+		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		bans, err = queryActiveAutobans(ctx, db, now)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		invalids, err = queryActiveInvalidAuths(ctx, db)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		effectiveBans = mergeEffectiveAutobans(bans, invalids)
+		available, filtered, banFilteredCandidates, matchedBanIndexes = filterCodexSchedulerCandidates(req.Candidates, effectiveBans)
+		recordSchedulerFilteringDiagnostics(effectiveBans, banFilteredCandidates, matchedBanIndexes)
+	}
+	if !filtered && !protectionCfg.AccountProtectionEnabled {
+		return schedulerPickResponse{Handled: false}, nil
+	}
+	if len(available) == 0 {
+		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
+	}
+	rotationKey := schedulerRotationKey(req, "codex")
+	affinityKey := schedulerAffinityKey(req, "codex")
+	if protectionCfg.AccountProtectionEnabled {
+		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg, rotationKey, affinityKey)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+	}
+	chosen := pickSchedulerCandidate(rotationKey, affinityKey, available)
+	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+}
+
+func filterCodexSchedulerCandidates(candidates []schedulerAuthCandidate, bans []autobanRow) ([]schedulerAuthCandidate, bool, int, map[int]bool) {
+	available := make([]schedulerAuthCandidate, 0, len(candidates))
 	filtered := false
 	banFilteredCandidates := 0
 	matchedBanIndexes := map[int]bool{}
-	for _, candidate := range req.Candidates {
+	for _, candidate := range candidates {
 		if !strings.EqualFold(candidate.Provider, "codex") {
 			available = append(available, candidate)
 			continue
 		}
-		if matched, indexes := candidateMatchesActiveBanIndexes(candidate, effectiveBans); matched {
+		if matched, indexes := candidateMatchesActiveBanIndexes(candidate, bans); matched {
 			filtered = true
 			banFilteredCandidates++
 			for _, index := range indexes {
@@ -3107,24 +3191,14 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		}
 		available = append(available, candidate)
 	}
-	if banFilteredCandidates > 0 {
-		globalSchedulerDiagnostics.record(len(effectiveBans), banFilteredCandidates, maxInt(0, len(effectiveBans)-len(matchedBanIndexes)))
+	return available, filtered, banFilteredCandidates, matchedBanIndexes
+}
+
+func recordSchedulerFilteringDiagnostics(bans []autobanRow, filteredCandidates int, matchedBanIndexes map[int]bool) {
+	if filteredCandidates <= 0 {
+		return
 	}
-	if !filtered && !protectionCfg.AccountProtectionEnabled {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	if len(available) == 0 {
-		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
-	}
-	if protectionCfg.AccountProtectionEnabled {
-		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg, schedulerRotationKey(req, "codex"))
-		if err != nil {
-			return schedulerPickResponse{Handled: false}, err
-		}
-		return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
-	}
-	chosen := globalSchedulerRotation.pick(schedulerRotationKey(req, "codex"), available)
-	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+	globalSchedulerDiagnostics.record(len(bans), filteredCandidates, maxInt(0, len(bans)-len(matchedBanIndexes)))
 }
 
 func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
@@ -3228,6 +3302,7 @@ func reconcileAutobansWithQuotaSnapshots(ctx context.Context, db *sql.DB, now in
 			AuthIndex: ban.AuthIndex,
 			Source:    ban.Source,
 			Provider:  ban.Provider,
+			AuthFile:  ban.AuthFile,
 		}
 	}
 	primarySnapshots := queryLatestAccountWindowQuotaSnapshots(ctx, db, accounts, 0, "primary")
@@ -3265,6 +3340,8 @@ WHERE active=1 AND auth_id=?`, nullFloatPtr(primary.Percent), nullIntPtr(primary
 }
 
 func backfillAutobansFromUsage(ctx context.Context, db *sql.DB, now int64) error {
+	configured := readConfiguredAuthAccounts()
+	authSourceAuthoritative := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
 WITH latest AS (
   SELECT
@@ -3303,19 +3380,26 @@ LIMIT 1000`, now, now)
 		if err := rows.Scan(&authID, &authIndex, &source, &provider, &requestedAt, &status, &pp, &pr, &sp, &sr); err != nil {
 			return err
 		}
-		key := firstNonEmptyString(authID, authIndex, source)
+		rec := usageRecord{
+			Provider:  provider,
+			AuthID:    authID,
+			AuthIndex: authIndex,
+			Source:    source,
+		}
+		if recordReferencesMissingCurrentAuthFile(rec, configured, authSourceAuthoritative) {
+			continue
+		}
+		authFile, authFileMTime := authFileStateForRecord(rec)
+		if authFile != "" && authFileMTime > requestedAt && configuredRecordIdentityChanged(rec, authFile, configured) {
+			continue
+		}
+		key := invalidAuthIDForRecord(rec, authFile)
 		if key == "" {
 			continue
 		}
 		resetAt, window, reason := classifyStoredCodexBan(pp, pr, sp, sr, now)
 		if resetAt <= now {
 			continue
-		}
-		rec := usageRecord{
-			Provider:  provider,
-			AuthID:    authID,
-			AuthIndex: authIndex,
-			Source:    source,
 		}
 		if hasLaterSuccessfulUsage(ctx, db, rec, requestedAt) {
 			continue
@@ -3324,8 +3408,8 @@ LIMIT 1000`, now, now)
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
   last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
-  released_at, release_reason
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, '')
+  auth_file, auth_file_mtime, released_at, release_reason
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 0, '')
 ON CONFLICT(auth_id) DO UPDATE SET
   auth_index=excluded.auth_index,
   source=excluded.source,
@@ -3343,12 +3427,14 @@ ON CONFLICT(auth_id) DO UPDATE SET
   primary_reset_at=excluded.primary_reset_at,
   secondary_used_percent=excluded.secondary_used_percent,
   secondary_reset_at=excluded.secondary_reset_at,
+  auth_file=excluded.auth_file,
+  auth_file_mtime=excluded.auth_file_mtime,
   released_at=CASE WHEN excluded.banned_at > COALESCE(autoban_bans.released_at,0) THEN 0 ELSE autoban_bans.released_at END,
   release_reason=CASE WHEN excluded.banned_at > COALESCE(autoban_bans.released_at,0) THEN '' ELSE autoban_bans.release_reason END
 WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
   AND (COALESCE(autoban_bans.released_at,0)=0 OR excluded.banned_at > COALESCE(autoban_bans.released_at,0) OR autoban_bans.active=1)`,
 			key, authIndex, source, provider, window, reason, requestedAt, resetAt, status,
-			nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp), nullIntPtr(sr), now,
+			nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp), nullIntPtr(sr), authFile, authFileMTime, now,
 		)
 		if err != nil {
 			return err
@@ -3359,7 +3445,7 @@ WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
 
 func backfillWorkspaceDeactivatedAuthsFromUsage(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredAuthAccounts()
-	authDirReadable := configuredAuthDirectoryReadable()
+	authDirReadable := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
 WITH latest AS (
   SELECT
@@ -3412,7 +3498,7 @@ LIMIT 1000`)
 
 func backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredAuthAccounts()
-	authDirReadable := configuredAuthDirectoryReadable()
+	authDirReadable := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
 WITH latest AS (
   SELECT
@@ -3630,41 +3716,140 @@ func clearReplacedInvalidAuths(ctx context.Context, db *sql.DB) error {
 	if len(configured) == 0 {
 		return nil
 	}
-	emailCounts := configuredEmailCounts(configured)
-	for _, cfg := range configured {
-		if cfg.AuthFileMTime <= 0 {
+	invalids, err := queryActiveInvalidAuths(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, invalid := range invalids {
+		baseline := invalid.InvalidatedAt
+		state := autobanRow{
+			AuthID:    invalid.AuthID,
+			AuthIndex: invalid.AuthIndex,
+			Source:    invalid.Source,
+			AuthFile:  invalid.AuthFile,
+		}
+		replaced := false
+		for _, cfg := range configured {
+			if cfg.AuthFileMTime <= baseline || !configuredAccountMatchesAutobanFile(cfg, state) {
+				continue
+			}
+			replaced = true
+			break
+		}
+		if !replaced {
 			continue
 		}
 		_, err := db.ExecContext(ctx, `
 UPDATE invalid_auths
 SET active=0
-WHERE active=1
-AND auth_file <> ''
-AND auth_file = ?
-AND ? > invalidated_at`, cfg.AuthFile, cfg.AuthFileMTime)
+WHERE active=1 AND auth_id=?`, invalid.AuthID)
 		if err != nil {
 			return err
 		}
-		for _, alias := range configuredAccountMatchAliases(cfg, emailCounts) {
-			if alias == "" {
+	}
+	return nil
+}
+
+func clearReplacedAutobans(ctx context.Context, db *sql.DB) error {
+	configured := readConfiguredAuthAccounts()
+	if len(configured) == 0 {
+		return nil
+	}
+	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	for _, ban := range bans {
+		baseline := ban.AuthFileMTime
+		if baseline <= 0 {
+			baseline = ban.BannedAt
+		}
+		for _, cfg := range configured {
+			if cfg.AuthFileMTime <= baseline || !autobanAccountIdentityChanged(cfg, ban) {
+				continue
+			}
+			if !configuredAccountMatchesAutobanFile(cfg, ban) {
 				continue
 			}
 			_, err := db.ExecContext(ctx, `
-UPDATE invalid_auths
-SET active=0
-WHERE active=1
-AND ? > invalidated_at
-AND (
-  lower(auth_id)=?
-  OR lower(auth_index)=?
-  OR lower(source)=?
-)`, cfg.AuthFileMTime, alias, alias, alias)
+UPDATE autoban_bans
+SET active=0,
+  released_at=?,
+  release_reason='auth file replaced'
+WHERE active=1 AND auth_id=?`, now, ban.AuthID)
 			if err != nil {
 				return err
 			}
+			break
 		}
 	}
 	return nil
+}
+
+func configuredAccountMatchesAutobanFile(cfg configuredAccount, ban autobanRow) bool {
+	left := normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex, cfg.AuthID)
+	right := fileBackedCleanupAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
+	if len(right) == 0 {
+		right = strictAuthStateAliasesForValues(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
+	}
+	for _, l := range left {
+		for _, r := range right {
+			if l != "" && l == r {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func autobanAccountIdentityChanged(cfg configuredAccount, ban autobanRow) bool {
+	current := nonFileAccountIdentityAliases(cfg.Email, cfg.ChatGPTAccountID)
+	previous := nonFileAccountIdentityAliases(ban.Source, ban.AuthID)
+	return knownAccountIdentityChanged(current, previous)
+}
+
+func configuredRecordIdentityChanged(rec usageRecord, authFile string, configured []configuredAccount) bool {
+	state := autobanRow{AuthID: rec.AuthID, AuthIndex: rec.AuthIndex, Source: rec.Source, AuthFile: authFile}
+	previous := nonFileAccountIdentityAliases(rec.Source, rec.AuthID)
+	for _, cfg := range configured {
+		if !configuredAccountMatchesAutobanFile(cfg, state) {
+			continue
+		}
+		current := nonFileAccountIdentityAliases(cfg.Email, cfg.ChatGPTAccountID)
+		return knownAccountIdentityChanged(current, previous)
+	}
+	return false
+}
+
+func knownAccountIdentityChanged(current, previous []string) bool {
+	if len(current) == 0 || len(previous) == 0 {
+		return false
+	}
+	for _, left := range current {
+		for _, right := range previous {
+			if left == right {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func nonFileAccountIdentityAliases(values ...string) []string {
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || fileNameIfJSON(value) != "" || looksOpaqueAccountKey(value) {
+			continue
+		}
+		switch strings.ToLower(value) {
+		case "file", "memory", "oauth", "codex":
+			continue
+		}
+		out = append(out, normalizeAccountAlias(value))
+	}
+	return uniqueNonEmptyAliases(out)
 }
 
 func clearMissingConfiguredAuthState(ctx context.Context, db *sql.DB, configured []configuredAccount, authDirReadable bool) error {
