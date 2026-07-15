@@ -24,16 +24,49 @@ type accountProtectionManager struct {
 var globalAccountProtection accountProtectionManager
 
 type protectionCandidate struct {
-	Candidate schedulerAuthCandidate
-	Aliases   []string
-	AuthID    string
-	AuthIndex string
-	Source    string
-	PlanType  string
-	InFlight  int
-	Limit     int
-	Tokens    int64
-	Threshold int64
+	Candidate   schedulerAuthCandidate
+	SelectionID string
+	Aliases     []string
+	AuthID      string
+	AuthIndex   string
+	Source      string
+	PlanType    string
+	InFlight    int
+	Limit       int
+	Tokens      int64
+	Threshold   int64
+}
+
+func assignProtectionSelectionIDs(states []protectionCandidate) []protectionCandidate {
+	out := append([]protectionCandidate(nil), states...)
+	counts := make(map[string]int, len(out))
+	for _, state := range out {
+		counts[state.Candidate.ID]++
+	}
+	seen := make(map[string]int, len(out))
+	for i := range out {
+		base := out[i].Candidate.ID
+		if counts[base] <= 1 {
+			out[i].SelectionID = base
+			continue
+		}
+		identity := schedulerCandidateIdentity(out[i].Candidate)
+		suffix := normalizeAccountAlias(firstNonEmptyString(
+			fileNameIfJSON(identity.AuthFile), identity.AuthIndex, out[i].AuthIndex,
+			identity.Source, out[i].Source,
+		))
+		if suffix == "" {
+			suffix = strconv.Itoa(i)
+		}
+		key := base + "\x00" + suffix
+		occurrence := seen[key]
+		seen[key] = occurrence + 1
+		if occurrence > 0 {
+			key += "\x00" + strconv.Itoa(occurrence)
+		}
+		out[i].SelectionID = key
+	}
+	return out
 }
 
 func (m *accountProtectionManager) configure(cfg pluginConfig) {
@@ -228,6 +261,7 @@ VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chos
 }
 
 func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) protectionCandidate {
+	states = assignProtectionSelectionIDs(states)
 	if bound, ok := boundProtectedCandidate(states, affinityKey); ok && bound.InFlight < bound.Limit {
 		return bound
 	}
@@ -266,11 +300,9 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinit
 func boundProtectedCandidate(states []protectionCandidate, affinityKey string) (protectionCandidate, bool) {
 	candidates := make([]schedulerAuthCandidate, 0, len(states))
 	byID := make(map[string]protectionCandidate, len(states))
-	for i, state := range states {
+	for _, state := range states {
 		candidate := state.Candidate
-		// Multiple auth files may share one workspace ID. Decorate the temporary
-		// rotation identity so no protection state is overwritten in the map.
-		candidate.ID = candidate.ID + "\x00" + strconv.Itoa(i)
+		candidate.ID = state.SelectionID
 		candidates = append(candidates, candidate)
 		byID[candidate.ID] = state
 	}
@@ -285,12 +317,9 @@ func boundProtectedCandidate(states []protectionCandidate, affinityKey string) (
 func rotateProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) protectionCandidate {
 	candidates := make([]schedulerAuthCandidate, 0, len(states))
 	byID := make(map[string]protectionCandidate, len(states))
-	for i, state := range states {
+	for _, state := range states {
 		candidate := state.Candidate
-		// Keep candidates with the same CPA-visible ID distinct while selecting.
-		// The ordering is stable for one scheduler candidate list, so affinity can
-		// safely bind to this temporary identity and still return the original ID.
-		candidate.ID = candidate.ID + "\x00" + strconv.Itoa(i)
+		candidate.ID = state.SelectionID
 		candidates = append(candidates, candidate)
 		byID[candidate.ID] = state
 	}

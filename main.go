@@ -3092,15 +3092,6 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{Handled: false}, err
 	}
 	now := time.Now().Unix()
-	if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := expireAutobans(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
 	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
 		return schedulerPickResponse{Handled: false}, err
 	}

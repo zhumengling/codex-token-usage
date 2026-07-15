@@ -314,3 +314,27 @@ func TestProtectionRotationHandlesDuplicateCandidateIDs(t *testing.T) {
 		t.Fatalf("duplicate-ID rotation chose %q twice", first.AuthIndex)
 	}
 }
+
+func TestProtectionAffinityKeepsStableDuplicateIdentityAcrossEligibilityChanges(t *testing.T) {
+	globalSchedulerRotation.reset()
+	globalSchedulerAffinity.reset()
+	t.Cleanup(func() {
+		globalSchedulerRotation.reset()
+		globalSchedulerAffinity.reset()
+	})
+	states := []protectionCandidate{
+		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "a.json"}}, AuthIndex: "a", InFlight: 1, Limit: 1, Threshold: 100},
+		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "b.json"}}, AuthIndex: "b", Limit: 1, Threshold: 100},
+	}
+	const affinityKey = "duplicate-affinity"
+	first := chooseProtectedCandidate(states, "duplicate-stable", affinityKey)
+	if first.AuthIndex != "b" {
+		t.Fatalf("first duplicate-ID pick = %q, want b", first.AuthIndex)
+	}
+	states[0].InFlight = 0
+	states[1].Tokens = 100
+	second := chooseProtectedCandidate(states, "duplicate-stable", affinityKey)
+	if second.AuthIndex != "b" {
+		t.Fatalf("bound duplicate-ID pick = %q, want b after eligibility changes", second.AuthIndex)
+	}
+}
