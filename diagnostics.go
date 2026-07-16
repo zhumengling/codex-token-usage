@@ -478,7 +478,7 @@ func buildAlerts(data map[string]any) []dashboardAlert {
 	}
 	if diagnostics, ok := data["diagnostics"].(diagnosticsSummary); ok {
 		if !diagnostics.ModelPrices.Exists || diagnostics.ModelPrices.Stale || diagnostics.ModelPrices.LoadedPrices == 0 || diagnostics.ModelPrices.LastError != "" {
-			alerts = append(alerts, dashboardAlert{ID: "model-prices", Severity: "warning", Type: "model_prices", Scope: "system", Target: "model_prices.json", Message: "模型价格文件需要检查", Detail: firstNonEmptyString(diagnostics.ModelPrices.LastError, "文件缺失、过期或没有可用价格"), CreatedAt: now, Active: true})
+			alerts = append(alerts, dashboardAlert{ID: "model-prices", Severity: "warning", Type: "model_prices", Scope: "system", Target: modelPriceCacheFileName, Message: "模型价格缓存需要检查", Detail: firstNonEmptyString(diagnostics.ModelPrices.LastError, "文件缺失、过期或没有可用价格"), CreatedAt: now, Active: true})
 		}
 		if diagnostics.Database.UsageEvents > 0 && diagnostics.Database.LatestEventAgeSecs > 6*3600 {
 			alerts = append(alerts, dashboardAlert{ID: "stale-usage", Severity: "info", Type: "stale_data", Scope: "system", Target: "usage_events", Message: "长时间没有新的 usage 事件", Detail: "最近事件 " + diagnostics.Database.LatestEventAt, CreatedAt: now, Active: true})

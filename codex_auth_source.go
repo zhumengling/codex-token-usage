@@ -520,10 +520,11 @@ func mergeConfiguredAccountMetadata(accounts, metadata []configuredAccount) []co
 			}
 		}
 	}
+	emailCounts := configuredEmailCounts(metadata)
 	for i := range accounts {
 		var detail configuredAccount
 		found := false
-		for _, alias := range configuredAliases(accounts[i]) {
+		for _, alias := range configuredAccountMatchAliases(accounts[i], emailCounts) {
 			if item, ok := index[alias]; ok {
 				detail = item
 				found = true

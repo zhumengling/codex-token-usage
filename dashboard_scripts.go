@@ -2000,8 +2000,11 @@ function fmt(n){return Number(n||0).toLocaleString()}
 function compact(n){n=Number(n||0); if(n>=1e9)return(n/1e9).toFixed(2)+'B'; if(n>=1e6)return(n/1e6).toFixed(2)+'M'; if(n>=1e3)return(n/1e3).toFixed(1)+'K'; return String(Math.round(n))}
 function money(n){n=Number(n||0); return new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:n<1?4:2,maximumFractionDigits:n<1?4:2}).format(n).replace(/^US\$/,'$')}
 function ratio(part,total){return total>0?part/total*100:0}
-function cacheTokens(r){return (r.cached_tokens||0)+(r.cache_read_tokens||0)+(r.cache_creation_tokens||0)}
-function cacheRate(r){return ratio(r.cached_tokens||0,r.input_tokens||0)}
+function cacheTokens(r){
+  const cached=Number(r.cached_tokens||0),read=Number(r.cache_read_tokens||0),creation=Number(r.cache_creation_tokens||0);
+  return Math.max(cached,read+creation);
+}
+function cacheRate(r){return ratio(cacheTokens(r),r.input_tokens||0)}
 function pct(v){return v===undefined||v===null||v===''?'—':Number(v).toFixed(1)+'%'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,s=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]))}
 function td(v,cls='',col=''){return '<td class="'+cls+'"'+(col?' data-col="'+esc(col)+'"':'')+'>'+v+'</td>'}

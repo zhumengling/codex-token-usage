@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.33`
+Current version: `0.1.34`
 
 ## Features
 
@@ -21,6 +21,8 @@ Current version: `0.1.33`
 - Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
 - Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
 - Account-protection and error filtering preserve CPA round-robin rotation within the highest-priority candidate tier.
+- Configured accounts with no real requests display zero quota even when background health probes have captured quota headers.
+- Overlapping cache totals and cache-read details are normalized before display, preventing duplicate cache Token counts.
 
 ## Install Manually
 
@@ -121,7 +123,7 @@ https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_
 The downloaded file is stored under the current CPA user's data directory:
 
 ```text
-$HOME/.cli-proxy-api/plugins/codex-token-usage/model_prices.json
+$HOME/.cli-proxy-api/plugins/codex-token-usage/model_prices.cache
 ```
 
 The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay smaller and prices can be refreshed without rebuilding the plugin.
@@ -132,7 +134,7 @@ To override the location, set:
 CPA_MODEL_PRICE_FILE=/path/to/model_prices.json
 ```
 
-`CPA_TOKEN_USAGE_DIR` overrides the shared plugin data directory used by both `usage.db` and, unless `CPA_MODEL_PRICE_FILE` is set, `model_prices.json`. `CPA_CONFIG_PATH` (or the legacy `CPA_CONFIG_FILE`) overrides the CPA config path. Otherwise the plugin follows CPA's `-config` / `--config` process argument. Without either override, the canonical `$HOME/.cli-proxy-api/config.yaml` is preferred when present, followed by an existing `$HOME/config.yaml` or `config.yaml` in the process working directory; the final fallback remains `$HOME/.cli-proxy-api/config.yaml`.
+`CPA_TOKEN_USAGE_DIR` overrides the shared plugin data directory used by both `usage.db` and, unless `CPA_MODEL_PRICE_FILE` is set, `model_prices.cache`. The cache content is JSON, but the non-JSON extension prevents CPA from treating it as an authentication file. Existing plugin-owned `model_prices.json` files are migrated automatically. `CPA_CONFIG_PATH` (or the legacy `CPA_CONFIG_FILE`) overrides the CPA config path. Otherwise the plugin follows CPA's `-config` / `--config` process argument. Without either override, the canonical `$HOME/.cli-proxy-api/config.yaml` is preferred when present, followed by an existing `$HOME/config.yaml` or `config.yaml` in the process working directory; the final fallback remains `$HOME/.cli-proxy-api/config.yaml`.
 
 ## Data Safety
 
@@ -152,11 +154,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.33_linux_amd64.zip
-codex-token-usage_0.1.33_linux_arm64.zip
-codex-token-usage_0.1.33_windows_amd64.zip
-codex-token-usage_0.1.33_darwin_amd64.zip
-codex-token-usage_0.1.33_darwin_arm64.zip
+codex-token-usage_0.1.34_linux_amd64.zip
+codex-token-usage_0.1.34_linux_arm64.zip
+codex-token-usage_0.1.34_windows_amd64.zip
+codex-token-usage_0.1.34_darwin_amd64.zip
+codex-token-usage_0.1.34_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -174,7 +176,7 @@ checksums.txt
 - `401`: the auth JSON is invalid and will not be used until replaced or removed.
 - `429`: the account is temporarily auto-banned until the observed reset time.
 - Provider not visible: confirm the endpoint still exists in CPA config and refresh the dashboard.
-- Price missing: check `model_prices.json` status in the summary JSON and the model price update error if present.
+- Price missing: check `model_prices.cache` status in the summary JSON and the model price update error if present.
 
 ## License
 

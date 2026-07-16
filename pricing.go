@@ -74,6 +74,7 @@ func defaultModelPrices() map[string]modelPrice {
 }
 
 func readModelPricesFromFile() map[string]modelPrice {
+	_ = migrateLegacyModelPriceFile()
 	globalModelPriceUpdater.ensureFresh()
 	path := modelPriceFilePath()
 	raw, err := os.ReadFile(path)

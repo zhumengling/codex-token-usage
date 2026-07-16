@@ -54,7 +54,7 @@ func TestDefaultPathsUseCurrentUserHome(t *testing.T) {
 	if info, err := os.Stat(dataDir); err != nil || !info.IsDir() {
 		t.Fatalf("plugin data directory was not created: info=%v err=%v", info, err)
 	}
-	if want := filepath.Join(dataDir, "model_prices.json"); modelPriceFilePath() != want {
+	if want := filepath.Join(dataDir, modelPriceCacheFileName); modelPriceFilePath() != want {
 		t.Fatalf("modelPriceFilePath() = %q, want %q", modelPriceFilePath(), want)
 	}
 	if want := filepath.Join(home, ".cli-proxy-api", "config.yaml"); configuredConfigPath() != want {
@@ -116,7 +116,7 @@ func TestDefaultModelPricePathFollowsPluginDataOverride(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", dataDir)
 	t.Setenv("CPA_MODEL_PRICE_FILE", "")
 
-	if want := filepath.Join(dataDir, "model_prices.json"); modelPriceFilePath() != want {
+	if want := filepath.Join(dataDir, modelPriceCacheFileName); modelPriceFilePath() != want {
 		t.Fatalf("modelPriceFilePath() = %q, want %q", modelPriceFilePath(), want)
 	}
 }

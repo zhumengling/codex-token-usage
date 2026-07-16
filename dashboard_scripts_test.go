@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestDashboardCacheTokensDoesNotDoubleCountOverlappingFields(t *testing.T) {
+	markers := []string{
+		`const cached=Number(r.cached_tokens||0),read=Number(r.cache_read_tokens||0),creation=Number(r.cache_creation_tokens||0);`,
+		`return Math.max(cached,read+creation);`,
+		`function cacheRate(r){return ratio(cacheTokens(r),r.input_tokens||0)}`,
+	}
+	for _, marker := range markers {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard cache normalization missing %q", marker)
+		}
+	}
+	if strings.Contains(dashboardScripts, `(r.cached_tokens||0)+(r.cache_read_tokens||0)+(r.cache_creation_tokens||0)`) {
+		t.Fatal("dashboard still double-counts overlapping cache fields")
+	}
+}
+
 func TestPoolTabSwitchReappliesLocale(t *testing.T) {
 	start := strings.Index(dashboardScripts, "function switchPage(page){")
 	if start < 0 {

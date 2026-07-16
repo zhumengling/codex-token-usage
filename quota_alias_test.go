@@ -30,10 +30,10 @@ func TestAccountQuotaAliasSetsExcludeSharedWorkspaceIdentity(t *testing.T) {
 			t.Fatalf("account %d retained shared workspace alias: %+v", index, aliases)
 		}
 	}
-	if !containsAlias(sets[0], "codex-a@example.com-k12.json") || !containsAlias(sets[0], "a@example.com") {
+	if !containsAlias(sets[0], "codex-a@example.com-k12.json") || containsAlias(sets[0], "a@example.com") {
 		t.Fatalf("account A lost unique aliases: %+v", sets[0])
 	}
-	if !containsAlias(sets[1], "codex-b@example.com-k12.json") || !containsAlias(sets[1], "b@example.com") {
+	if !containsAlias(sets[1], "codex-b@example.com-k12.json") || containsAlias(sets[1], "b@example.com") {
 		t.Fatalf("account B lost unique aliases: %+v", sets[1])
 	}
 	index := accountQuotaAliasIndex(accounts)

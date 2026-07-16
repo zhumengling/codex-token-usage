@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.33"
+	pluginVersion    = "0.1.34"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -520,10 +520,10 @@ func pluginConfigFields() []configField {
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
 		{Name: "单账号超时秒数", Type: "number", Description: "单个账号触发请求超时时间，单位秒。默认 20。"},
 		{Name: "单账号最小冷却分钟", Type: "number", Description: "同一账号两次触发的最小冷却时间，单位分钟。默认 10。"},
-		{Name: "自动更新模型价格表", Type: "boolean", Description: "是否自动下载并更新 model_prices.json。默认开启。"},
-		{Name: "模型价格更新间隔小时", Type: "number", Description: "model_prices.json 自动检查间隔，单位小时。默认 6。"},
+		{Name: "自动更新模型价格表", Type: "boolean", Description: "是否自动下载并更新模型价格缓存。默认开启。"},
+		{Name: "模型价格更新间隔小时", Type: "number", Description: "模型价格缓存自动检查间隔，单位小时。默认 6。"},
 		{Name: "模型价格表地址", Type: "string", Description: "模型价格 JSON 下载地址。默认使用 LiteLLM 官方价格表。"},
-		{Name: "模型价格更新超时秒数", Type: "number", Description: "下载 model_prices.json 的超时时间，单位秒。默认 20。"},
+		{Name: "模型价格更新超时秒数", Type: "number", Description: "下载模型价格缓存的超时时间，单位秒。默认 20。"},
 		{Name: "用量保留天数", Type: "number", Description: "usage_events 保留天数，单位天。默认 90。"},
 		{Name: "额度触发记录保留天数", Type: "number", Description: "quota_trigger_runs 保留天数，单位天。默认 30。"},
 		{Name: "请求明细保留天数", Type: "number", Description: "请求明细保留天数，当前随 usage_events 保守保留。默认 30。"},
@@ -1928,6 +1928,7 @@ func ensureQuotaTriggerRunColumns(ctx context.Context, db *sql.DB) error {
 		{"secondary_used_tokens", "INTEGER"},
 		{"secondary_remaining_tokens", "INTEGER"},
 		{"secondary_limit_tokens", "INTEGER"},
+		{"auth_file_mtime", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	existing := map[string]bool{}
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(quota_trigger_runs)`)
@@ -3141,12 +3142,12 @@ func recordQuotaTriggerRun(ctx context.Context, db *sql.DB, run quotaTriggerRun)
 	normalizeInt64Ptr(run.SecondaryResetAt)
 	_, err := db.ExecContext(ctx, `
 INSERT INTO quota_trigger_runs (
-  auth_id, auth_index, source, provider, auth_file, mode, status, http_status, error,
+  auth_id, auth_index, source, provider, auth_file, auth_file_mtime, mode, status, http_status, error,
   started_at, finished_at, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
   primary_used_tokens, primary_remaining_tokens, primary_limit_tokens,
   secondary_used_tokens, secondary_remaining_tokens, secondary_limit_tokens
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		trim(run.AuthID), trim(run.AuthIndex), trim(run.Source), trim(run.Provider), trim(run.AuthFile),
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		trim(run.AuthID), trim(run.AuthIndex), trim(run.Source), trim(run.Provider), trim(run.AuthFile), run.AuthFileMTime,
 		trim(run.Mode), trim(run.Status), run.HTTPStatus, trim(run.Error), run.StartedAt, run.FinishedAt,
 		run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt,
 		run.PrimaryUsedTokens, run.PrimaryRemaining, run.PrimaryLimit, run.SecondaryUsedTokens, run.SecondaryRemaining, run.SecondaryLimit,
@@ -3195,17 +3196,18 @@ func applyQuotaTriggerAccountState(ctx context.Context, db *sql.DB, run quotaTri
 func quotaTriggerRunFromAccount(account triggerAuthAccount, mode, status string, httpStatus int, message string) quotaTriggerRun {
 	now := time.Now().Unix()
 	return quotaTriggerRun{
-		AuthID:     account.AuthID,
-		AuthIndex:  account.AuthIndex,
-		Source:     account.Source,
-		Provider:   firstNonEmptyString(account.Provider, "codex"),
-		AuthFile:   account.AuthFile,
-		Mode:       mode,
-		Status:     status,
-		HTTPStatus: httpStatus,
-		Error:      sanitizeTriggerError(message),
-		StartedAt:  now,
-		FinishedAt: now,
+		AuthID:        account.AuthID,
+		AuthIndex:     account.AuthIndex,
+		Source:        account.Source,
+		Provider:      firstNonEmptyString(account.Provider, "codex"),
+		AuthFile:      account.AuthFile,
+		AuthFileMTime: account.AuthFileMTime,
+		Mode:          mode,
+		Status:        status,
+		HTTPStatus:    httpStatus,
+		Error:         sanitizeTriggerError(message),
+		StartedAt:     now,
+		FinishedAt:    now,
 	}
 }
 

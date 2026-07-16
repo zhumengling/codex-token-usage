@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,7 @@ type modelPriceUpdateManager struct {
 }
 
 func (m *modelPriceUpdateManager) configure(cfg pluginConfig) {
+	migrationErr := migrateLegacyModelPriceFile()
 	m.mu.Lock()
 	if m.cancel != nil {
 		m.cancel()
@@ -48,6 +50,9 @@ func (m *modelPriceUpdateManager) configure(cfg pluginConfig) {
 	m.state.Path = modelPriceFilePath()
 	m.state.IntervalHours = cfg.ModelPriceUpdateIntervalHours
 	m.state.TimeoutSeconds = cfg.ModelPriceUpdateTimeoutSeconds
+	if migrationErr != nil {
+		m.state.LastError = sanitizeTriggerError(migrationErr)
+	}
 	m.mu.Unlock()
 	if !cfg.ModelPriceAutoUpdateEnabled {
 		return
@@ -69,6 +74,7 @@ func (m *modelPriceUpdateManager) stop() {
 }
 
 func (m *modelPriceUpdateManager) status() modelPriceUpdateState {
+	_ = migrateLegacyModelPriceFile()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	state := m.state
@@ -91,6 +97,7 @@ func (m *modelPriceUpdateManager) status() modelPriceUpdateState {
 }
 
 func (m *modelPriceUpdateManager) ensureFresh() {
+	_ = migrateLegacyModelPriceFile()
 	m.mu.Lock()
 	cfg := m.cfg
 	m.mu.Unlock()
@@ -101,6 +108,47 @@ func (m *modelPriceUpdateManager) ensureFresh() {
 		return
 	}
 	go m.update(context.Background(), cfg)
+}
+
+func migrateLegacyModelPriceFile() error {
+	legacyPath := legacyModelPriceFilePath()
+	newPath := modelPriceFilePath()
+	if legacyPath == "" || newPath == "" || filepath.Clean(legacyPath) == filepath.Clean(newPath) {
+		return nil
+	}
+	legacyInfo, err := os.Stat(legacyPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect legacy model price file: %w", err)
+	}
+	if legacyInfo.IsDir() {
+		return fmt.Errorf("legacy model price path is a directory: %s", legacyPath)
+	}
+	if newInfo, statErr := os.Stat(newPath); statErr == nil {
+		if newInfo.IsDir() {
+			return fmt.Errorf("model price cache path is a directory: %s", newPath)
+		}
+		if newInfo.Size() > 0 {
+			if err := os.Remove(legacyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove migrated legacy model price file: %w", err)
+			}
+			return nil
+		}
+		if err := os.Remove(newPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove empty model price cache: %w", err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect model price cache: %w", statErr)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
+		return fmt.Errorf("create model price cache directory: %w", err)
+	}
+	if err := os.Rename(legacyPath, newPath); err != nil {
+		return fmt.Errorf("migrate legacy model price file: %w", err)
+	}
+	return nil
 }
 
 func (m *modelPriceUpdateManager) loop(ctx context.Context, cfg pluginConfig) {

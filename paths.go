@@ -8,7 +8,9 @@ import (
 )
 
 const (
-	cliProxyDataDirName = ".cli-proxy-api"
+	cliProxyDataDirName          = ".cli-proxy-api"
+	modelPriceCacheFileName      = "model_prices.cache"
+	legacyModelPriceJSONFileName = "model_prices.json"
 )
 
 var (
@@ -66,7 +68,18 @@ func modelPriceFilePath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(dir, "model_prices.json")
+	return filepath.Join(dir, modelPriceCacheFileName)
+}
+
+func legacyModelPriceFilePath() string {
+	if strings.TrimSpace(os.Getenv("CPA_MODEL_PRICE_FILE")) != "" {
+		return ""
+	}
+	dir, err := pluginDataDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, legacyModelPriceJSONFileName)
 }
 
 func configuredConfigPath() string {

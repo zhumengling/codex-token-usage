@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS quota_trigger_runs (
   source TEXT NOT NULL DEFAULT '',
   provider TEXT NOT NULL DEFAULT '',
   auth_file TEXT NOT NULL DEFAULT '',
+  auth_file_mtime INTEGER NOT NULL DEFAULT 0,
   mode TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT '',
   http_status INTEGER NOT NULL DEFAULT 0,

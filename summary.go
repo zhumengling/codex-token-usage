@@ -1090,6 +1090,7 @@ type accountRow struct {
 	Email                           string   `json:"email,omitempty"`
 	Name                            string   `json:"name,omitempty"`
 	AuthFile                        string   `json:"auth_file,omitempty"`
+	AuthFileMTime                   int64    `json:"-"`
 	ChatGPTAccountID                string   `json:"chatgpt_account_id,omitempty"`
 	Configured                      bool     `json:"configured"`
 	Disabled                        bool     `json:"disabled,omitempty"`
@@ -1209,6 +1210,7 @@ type quotaTriggerRun struct {
 	Source               string
 	Provider             string
 	AuthFile             string
+	AuthFileMTime        int64
 	Mode                 string
 	Status               string
 	HTTPStatus           int
@@ -1229,15 +1231,16 @@ type quotaTriggerRun struct {
 }
 
 type quotaTriggerAccountStatus struct {
-	AuthID     string
-	AuthIndex  string
-	Source     string
-	AuthFile   string
-	Mode       string
-	Status     string
-	HTTPStatus int
-	Error      string
-	FinishedAt int64
+	AuthID        string
+	AuthIndex     string
+	Source        string
+	AuthFile      string
+	AuthFileMTime int64
+	Mode          string
+	Status        string
+	HTTPStatus    int
+	Error         string
+	FinishedAt    int64
 }
 
 type providerRow struct {
@@ -2154,6 +2157,7 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 			Email:              cfg.Email,
 			Name:               cfg.Name,
 			AuthFile:           cfg.AuthFile,
+			AuthFileMTime:      cfg.AuthFileMTime,
 			ChatGPTAccountID:   cfg.ChatGPTAccountID,
 			Configured:         true,
 			Disabled:           cfg.Disabled,
@@ -2252,6 +2256,9 @@ func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
 	row.Email = firstNonEmptyString(row.Email, cfg.Email)
 	row.Name = firstNonEmptyString(row.Name, cfg.Name)
 	row.AuthFile = firstNonEmptyString(row.AuthFile, cfg.AuthFile)
+	if row.AuthFileMTime == 0 {
+		row.AuthFileMTime = cfg.AuthFileMTime
+	}
 	row.ChatGPTAccountID = firstNonEmptyString(row.ChatGPTAccountID, cfg.ChatGPTAccountID)
 	row.Provider = firstNonEmptyString(row.Provider, cfg.Provider, "codex")
 	if row.Source == "" || looksOpaqueAccountKey(row.Source) {
@@ -2397,11 +2404,15 @@ func looksOpaqueAccountKey(value string) bool {
 }
 
 type quotaWindowSnapshot struct {
-	Percent    sql.NullFloat64
-	ResetAt    sql.NullInt64
-	Source     string
-	ObservedAt int64
-	ID         int64
+	Percent       sql.NullFloat64
+	ResetAt       sql.NullInt64
+	Source        string
+	ObservedAt    int64
+	ID            int64
+	AuthIndex     string
+	AuthID        string
+	AuthFile      string
+	AuthFileMTime int64
 }
 
 func queryLatestAccountWindowQuota(ctx context.Context, db *sql.DB, account accountRow, since int64, window string) quotaWindowSnapshot {
@@ -2414,7 +2425,7 @@ func queryLatestAccountWindowQuotaSnapshots(ctx context.Context, db *sql.DB, acc
 	if len(accounts) == 0 {
 		return out
 	}
-	index := accountQuotaAliasIndex(accounts)
+	index := newQuotaAccountIdentityIndex(accounts)
 	percentColumn := "primary_used_percent"
 	resetColumn := "primary_reset_at"
 	if window == "secondary" {
@@ -2422,15 +2433,15 @@ func queryLatestAccountWindowQuotaSnapshots(ctx context.Context, db *sql.DB, acc
 		resetColumn = "secondary_reset_at"
 	}
 	query := `
-SELECT source_type, id, observed_at, auth_index, auth_id, source, auth_file, ` + percentColumn + `, ` + resetColumn + `
+SELECT source_type, id, observed_at, auth_index, auth_id, source, auth_file, auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `
 FROM (
-  SELECT 'usage' AS source_type, id, requested_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, '' AS auth_file, ` + percentColumn + `, ` + resetColumn + `
+  SELECT 'usage' AS source_type, id, requested_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, '' AS auth_file, 0 AS auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `
   FROM usage_events
   WHERE requested_at >= ?
   AND (` + trustedUsageQuotaSnapshotSQL() + `)
   AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
   UNION ALL
-  SELECT 'trigger' AS source_type, id, finished_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, lower(auth_file) AS auth_file, ` + percentColumn + `, ` + resetColumn + `
+  SELECT 'trigger' AS source_type, id, finished_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, lower(auth_file) AS auth_file, auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `
   FROM quota_trigger_runs
   WHERE finished_at >= ? AND status='success' AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
 ) snapshots
@@ -2443,8 +2454,8 @@ ORDER BY observed_at DESC, id DESC`
 	now := time.Now().Unix()
 	for rows.Next() {
 		var snapshot quotaWindowSnapshot
-		var authIndex, authID, source, authFile string
-		if err := rows.Scan(&snapshot.Source, &snapshot.ID, &snapshot.ObservedAt, &authIndex, &authID, &source, &authFile, &snapshot.Percent, &snapshot.ResetAt); err != nil {
+		var source string
+		if err := rows.Scan(&snapshot.Source, &snapshot.ID, &snapshot.ObservedAt, &snapshot.AuthIndex, &snapshot.AuthID, &source, &snapshot.AuthFile, &snapshot.AuthFileMTime, &snapshot.Percent, &snapshot.ResetAt); err != nil {
 			continue
 		}
 		if snapshot.ResetAt.Valid {
@@ -2453,16 +2464,88 @@ ORDER BY observed_at DESC, id DESC`
 				continue
 			}
 		}
-		for _, alias := range normalizeAccountAliases(authIndex, authID, source, authFile) {
-			for _, accountIndex := range index[alias] {
-				if _, exists := out[accountIndex]; exists {
-					continue
-				}
-				out[accountIndex] = snapshot
-			}
+		accountIndex, ok := index.match(accounts, snapshot)
+		if !ok {
+			continue
+		}
+		if _, exists := out[accountIndex]; !exists {
+			out[accountIndex] = snapshot
 		}
 	}
 	return out
+}
+
+type quotaAccountIdentityIndex struct {
+	stable map[string][]int
+	files  map[string][]int
+}
+
+func newQuotaAccountIdentityIndex(accounts []accountRow) quotaAccountIdentityIndex {
+	index := quotaAccountIdentityIndex{
+		stable: make(map[string][]int, len(accounts)*3),
+		files:  make(map[string][]int, len(accounts)*2),
+	}
+	for i := range accounts {
+		for _, alias := range stableQuotaIdentityAliases(accounts[i].AuthIndex, accounts[i].AuthID, accounts[i].ChatGPTAccountID) {
+			index.stable[alias] = append(index.stable[alias], i)
+		}
+		for _, alias := range strictFileIdentityAliases(accounts[i].AuthFile) {
+			index.files[alias] = append(index.files[alias], i)
+		}
+	}
+	return index
+}
+
+func (index quotaAccountIdentityIndex) match(accounts []accountRow, snapshot quotaWindowSnapshot) (int, bool) {
+	if matched, ok := uniqueQuotaIdentityMatch(index.stable, stableQuotaIdentityAliases(snapshot.AuthIndex, snapshot.AuthID)); ok {
+		return matched, true
+	}
+	matched, ok := uniqueQuotaIdentityMatch(index.files, strictFileIdentityAliases(snapshot.AuthFile, snapshot.AuthIndex, snapshot.AuthID))
+	if !ok || matched < 0 || matched >= len(accounts) {
+		return 0, false
+	}
+	account := accounts[matched]
+	switch snapshot.Source {
+	case "trigger":
+		if snapshot.AuthFileMTime <= 0 || account.AuthFileMTime <= 0 || snapshot.AuthFileMTime != account.AuthFileMTime {
+			return 0, false
+		}
+		return matched, true
+	case "usage":
+		if account.Requests <= 0 {
+			return 0, false
+		}
+		return matched, true
+	default:
+		return 0, false
+	}
+}
+
+func uniqueQuotaIdentityMatch(index map[string][]int, aliases []string) (int, bool) {
+	matched := -1
+	for _, alias := range uniqueNonEmptyAliases(aliases) {
+		candidates := index[alias]
+		if len(candidates) != 1 {
+			continue
+		}
+		if matched >= 0 && matched != candidates[0] {
+			return 0, false
+		}
+		matched = candidates[0]
+	}
+	return matched, matched >= 0
+}
+
+func stableQuotaIdentityAliases(values ...string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || strings.Contains(value, "@") || fileNameIfJSON(value) != "" {
+			continue
+		}
+		out = append(out, normalizeAccountAlias(value))
+	}
+	return uniqueNonEmptyAliases(out)
 }
 
 func accountAliasIndex(accounts []accountRow) map[string][]int {
@@ -2500,14 +2583,17 @@ func accountQuotaAliasSets(accounts []accountRow) [][]string {
 	rawAliases := make([][]string, len(accounts))
 	aliasCounts := make(map[string]int, len(accounts)*5)
 	for i := range accounts {
-		rawAliases[i] = uniqueNonEmptyAliases(append(accountAliases(accounts[i]), accounts[i].ChatGPTAccountID))
+		rawAliases[i] = uniqueNonEmptyAliases(append(
+			stableQuotaIdentityAliases(accounts[i].AuthIndex, accounts[i].AuthID, accounts[i].ChatGPTAccountID),
+			strictFileIdentityAliases(accounts[i].AuthFile)...,
+		))
 		for _, alias := range rawAliases[i] {
 			aliasCounts[alias]++
 		}
 	}
 	out := make([][]string, len(accounts))
 	for i := range accounts {
-		aliases := strictFileIdentityAliases(accounts[i].AuthFile)
+		var aliases []string
 		for _, alias := range rawAliases[i] {
 			if aliasCounts[alias] == 1 {
 				aliases = append(aliases, alias)
@@ -3112,6 +3198,10 @@ func applyLatestQuotaSnapshots(ctx context.Context, db *sql.DB, accounts []accou
 		primary := primarySnapshots[i]
 		secondary := secondarySnapshots[i]
 		primary, secondary = moveMonthlyPrimaryQuotaToSecondary(accounts[i], primary, secondary)
+		if accounts[i].Requests <= 0 {
+			primary = quotaWindowSnapshot{}
+			secondary = quotaWindowSnapshot{}
+		}
 		secondaryDurations[i] = secondaryQuotaDuration(accounts[i], secondary.ResetAt)
 		accounts[i].PrimaryUsedPercent = nil
 		accounts[i].PrimaryResetAt = nil
@@ -3164,7 +3254,7 @@ func moveMonthlyPrimaryQuotaToSecondary(account accountRow, primary quotaWindowS
 
 func queryRecentQuotaTriggerRuns(ctx context.Context, db *sql.DB, limit int) ([]quotaTriggerAccountStatus, error) {
 	rows, err := db.QueryContext(ctx, `
-SELECT auth_id, auth_index, source, auth_file, mode, status, http_status, error, finished_at
+SELECT auth_id, auth_index, source, auth_file, auth_file_mtime, mode, status, http_status, error, finished_at
 FROM quota_trigger_runs
 ORDER BY finished_at DESC, id DESC
 LIMIT ?`, limit)
@@ -3175,7 +3265,7 @@ LIMIT ?`, limit)
 	out := make([]quotaTriggerAccountStatus, 0, limit)
 	for rows.Next() {
 		var r quotaTriggerAccountStatus
-		if err := rows.Scan(&r.AuthID, &r.AuthIndex, &r.Source, &r.AuthFile, &r.Mode, &r.Status, &r.HTTPStatus, &r.Error, &r.FinishedAt); err != nil {
+		if err := rows.Scan(&r.AuthID, &r.AuthIndex, &r.Source, &r.AuthFile, &r.AuthFileMTime, &r.Mode, &r.Status, &r.HTTPStatus, &r.Error, &r.FinishedAt); err != nil {
 			return nil, err
 		}
 		r.Error = sanitizeTriggerError(r.Error)
@@ -3188,29 +3278,22 @@ func applyQuotaTriggerStatuses(accounts []accountRow, runs []quotaTriggerAccount
 	if len(accounts) == 0 || len(runs) == 0 {
 		return
 	}
-	index := make(map[string]int, len(accounts)*4)
-	for i := range accounts {
-		for _, alias := range accountAliases(accounts[i]) {
-			if alias != "" {
-				index[alias] = i
-			}
-		}
-	}
+	index := newQuotaAccountIdentityIndex(accounts)
 	seen := map[int]bool{}
 	for _, run := range runs {
-		for _, alias := range normalizeAccountAliases(run.AuthID, run.AuthIndex, run.Source, run.AuthFile) {
-			i, ok := index[alias]
-			if !ok || seen[i] {
-				continue
-			}
-			seen[i] = true
-			accounts[i].QuotaTriggerLastAt = unixTime(run.FinishedAt)
-			accounts[i].QuotaTriggerStatus = run.Status
-			accounts[i].QuotaTriggerMode = run.Mode
-			accounts[i].QuotaTriggerHTTPStatus = run.HTTPStatus
-			accounts[i].QuotaTriggerError = sanitizeTriggerError(run.Error)
-			break
+		i, ok := index.match(accounts, quotaWindowSnapshot{
+			Source: "trigger", AuthID: run.AuthID, AuthIndex: run.AuthIndex,
+			AuthFile: run.AuthFile, AuthFileMTime: run.AuthFileMTime,
+		})
+		if !ok || seen[i] {
+			continue
 		}
+		seen[i] = true
+		accounts[i].QuotaTriggerLastAt = unixTime(run.FinishedAt)
+		accounts[i].QuotaTriggerStatus = run.Status
+		accounts[i].QuotaTriggerMode = run.Mode
+		accounts[i].QuotaTriggerHTTPStatus = run.HTTPStatus
+		accounts[i].QuotaTriggerError = sanitizeTriggerError(run.Error)
 	}
 }
 
@@ -3257,6 +3340,10 @@ func applySecondaryQuotaEstimates(ctx context.Context, db *sql.DB, accounts []ac
 		accounts[i].SecondaryQuotaEstimateMethod = ""
 		accounts[i].QuotaEstimateNote = ""
 		total, remaining := int64(0), int64(0)
+		if accounts[i].Requests <= 0 {
+			applyAccountQuotaSource(&accounts[i])
+			continue
+		}
 		if capacity, ok := capacities[i]; ok {
 			total, remaining = adjustedSecondaryQuotaTriggerCapacity(ctx, db, accounts[i], capacity, quotaAliases[i])
 		}
@@ -3310,9 +3397,9 @@ func latestSecondaryQuotaTriggerCapacities(ctx context.Context, db *sql.DB, acco
 	if len(accounts) == 0 {
 		return out
 	}
-	index := accountQuotaAliasIndex(accounts)
+	index := newQuotaAccountIdentityIndex(accounts)
 	rows, err := db.QueryContext(ctx, `
-SELECT auth_index, auth_id, source, auth_file, secondary_limit_tokens, secondary_remaining_tokens, secondary_reset_at, finished_at
+SELECT auth_index, auth_id, source, auth_file, auth_file_mtime, secondary_limit_tokens, secondary_remaining_tokens, secondary_reset_at, finished_at
 FROM quota_trigger_runs
 WHERE finished_at >= ?
 AND status='success'
@@ -3324,11 +3411,12 @@ ORDER BY finished_at DESC, id DESC`, since)
 	defer rows.Close()
 	now := time.Now().Unix()
 	for rows.Next() {
-		var authIndex, authID, source, authFile string
+		var snapshot quotaWindowSnapshot
+		var source string
 		var limit, remaining sql.NullInt64
 		var reset sql.NullInt64
 		var finishedAt int64
-		if err := rows.Scan(&authIndex, &authID, &source, &authFile, &limit, &remaining, &reset, &finishedAt); err != nil {
+		if err := rows.Scan(&snapshot.AuthIndex, &snapshot.AuthID, &source, &snapshot.AuthFile, &snapshot.AuthFileMTime, &limit, &remaining, &reset, &finishedAt); err != nil {
 			continue
 		}
 		if reset.Valid {
@@ -3346,13 +3434,13 @@ ORDER BY finished_at DESC, id DESC`, since)
 			ResetAt:    reset,
 			FinishedAt: finishedAt,
 		}
-		for _, alias := range normalizeAccountAliases(authIndex, authID, source, authFile) {
-			for _, accountIndex := range index[alias] {
-				if _, exists := out[accountIndex]; exists {
-					continue
-				}
-				out[accountIndex] = capacity
-			}
+		snapshot.Source = "trigger"
+		accountIndex, ok := index.match(accounts, snapshot)
+		if !ok {
+			continue
+		}
+		if _, exists := out[accountIndex]; !exists {
+			out[accountIndex] = capacity
 		}
 	}
 	return out
