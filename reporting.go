@@ -138,7 +138,7 @@ func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, 
 			r.CostUSD = cost
 			r.CostAvailable = true
 			if price, ok := resolveModelPrice(costRow, prices); ok {
-				r.PriceDetail = recentPriceDetail(price)
+				r.PriceDetail = recentPriceDetail(effectiveModelPriceForServiceTier(price, r.Model, r.ServiceTier))
 			}
 		} else if usageTokenInputRequiresPricing(costRow) {
 			r.UnpricedTokens = r.TotalTokens

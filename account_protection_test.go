@@ -121,7 +121,7 @@ func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 	}
 }
 
-func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
+func TestProtectionSaturationRejectsWithoutExceedingHardLimit(t *testing.T) {
 	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
 	cfg := defaultPluginConfig()
@@ -136,18 +136,23 @@ func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at) VALUES ('b', 'b', '', 'free', ?, ?)`, now, now+900); err != nil {
 		t.Fatal(err)
 	}
-	got, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
+	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
 		protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1),
 	}, cfg, "codex\x00test", "")
-	if err != nil {
+	var reject *schedulerRejectError
+	if !errors.As(err, &reject) || reject.Code != "account_protection_saturated" {
+		t.Fatalf("error=%v, want account_protection_saturated", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "b" {
-		t.Fatalf("picked %q, want least-in-flight candidate b", got.ID)
+	if count != 3 {
+		t.Fatalf("reservation count=%d, want no over-limit reservation", count)
 	}
 }
 
-func TestProtectionSaturationUsesPriorityBeforeTokenDemotion(t *testing.T) {
+func TestProtectionSaturationReturnsNoCandidate(t *testing.T) {
 	globalSchedulerRotation.reset()
 	states := []protectionCandidate{
 		{
@@ -165,8 +170,8 @@ func TestProtectionSaturationUsesPriorityBeforeTokenDemotion(t *testing.T) {
 			Threshold: 100,
 		},
 	}
-	if got := chooseProtectedCandidate(states, "test", ""); got.Candidate.ID != "high" {
-		t.Fatalf("picked %q, want higher-priority saturated candidate", got.Candidate.ID)
+	if got, ok := chooseProtectedCandidate(states, "test", ""); ok {
+		t.Fatalf("picked %+v, want no candidate when every hard limit is reached", got)
 	}
 }
 
@@ -176,10 +181,10 @@ func TestProtectionRoundRobinsWithinSamePriority(t *testing.T) {
 		{Candidate: schedulerAuthCandidate{ID: "z-account", Priority: 1}, Limit: 5},
 		{Candidate: schedulerAuthCandidate{ID: "a-account", Priority: 1}, Limit: 5},
 	}
-	if got := chooseProtectedCandidate(states, "test", ""); got.Candidate.ID != "a-account" {
+	if got, ok := chooseProtectedCandidate(states, "test", ""); !ok || got.Candidate.ID != "a-account" {
 		t.Fatalf("first pick = %q, want a-account", got.Candidate.ID)
 	}
-	if got := chooseProtectedCandidate(states, "test", ""); got.Candidate.ID != "z-account" {
+	if got, ok := chooseProtectedCandidate(states, "test", ""); !ok || got.Candidate.ID != "z-account" {
 		t.Fatalf("second pick = %q, want z-account", got.Candidate.ID)
 	}
 }
@@ -400,8 +405,11 @@ func TestProtectionRotationHandlesDuplicateCandidateIDs(t *testing.T) {
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "a.json"}}, AuthIndex: "a", Limit: 5},
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "b.json"}}, AuthIndex: "b", Limit: 5},
 	}
-	first := chooseProtectedCandidate(states, "duplicate", "")
-	second := chooseProtectedCandidate(states, "duplicate", "")
+	first, firstOK := chooseProtectedCandidate(states, "duplicate", "")
+	second, secondOK := chooseProtectedCandidate(states, "duplicate", "")
+	if !firstOK || !secondOK {
+		t.Fatal("duplicate candidates unexpectedly unavailable")
+	}
 	if first.AuthIndex == second.AuthIndex {
 		t.Fatalf("duplicate-ID rotation chose %q twice", first.AuthIndex)
 	}
@@ -419,13 +427,19 @@ func TestProtectionAffinityKeepsStableDuplicateIdentityAcrossEligibilityChanges(
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "b.json"}}, AuthIndex: "b", Limit: 1, Threshold: 100},
 	}
 	const affinityKey = "duplicate-affinity"
-	first := chooseProtectedCandidate(states, "duplicate-stable", affinityKey)
+	first, ok := chooseProtectedCandidate(states, "duplicate-stable", affinityKey)
+	if !ok {
+		t.Fatal("first duplicate-ID candidate unavailable")
+	}
 	if first.AuthIndex != "b" {
 		t.Fatalf("first duplicate-ID pick = %q, want b", first.AuthIndex)
 	}
 	states[0].InFlight = 0
 	states[1].Tokens = 100
-	second := chooseProtectedCandidate(states, "duplicate-stable", affinityKey)
+	second, ok := chooseProtectedCandidate(states, "duplicate-stable", affinityKey)
+	if !ok {
+		t.Fatal("bound duplicate-ID candidate unavailable")
+	}
 	if second.AuthIndex != "b" {
 		t.Fatalf("bound duplicate-ID pick = %q, want b after eligibility changes", second.AuthIndex)
 	}

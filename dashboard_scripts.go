@@ -1596,7 +1596,7 @@ const i18nEn={
   '请求数 / 总 Token / 输出 Token':'Requests / total tokens / output tokens',
   '请求':'Requests',
   'Token 结构':'Token mix',
-  '缓存率 = Cached / Input':'Cache rate = cached / input',
+  '缓存命中率 = Read / 总输入':'Cache hit rate = read / total input',
   '模型排行':'Model ranking',
   '仅 Codex 账号池':'Codex account pool only',
   '仅 xAI 账号池':'xAI account pool only',
@@ -2002,9 +2002,17 @@ function money(n){n=Number(n||0); return new Intl.NumberFormat('en-US',{style:'c
 function ratio(part,total){return total>0?part/total*100:0}
 function cacheTokens(r){
   const cached=Number(r.cached_tokens||0),read=Number(r.cache_read_tokens||0),creation=Number(r.cache_creation_tokens||0);
-  return Math.max(cached,read+creation);
+  return Math.max(cached-read-creation,0)+read;
 }
-function cacheRate(r){return ratio(cacheTokens(r),r.input_tokens||0)}
+function cacheWriteTokens(r){return Math.max(0,Number(r.cache_creation_tokens||0))}
+function cacheInputIncludesDetails(r){
+  const provider=(String(r.provider||'')+' '+String(r.model||'')).toLowerCase();
+  if(provider.includes('claude')||provider.includes('anthropic'))return false;
+  const cached=cacheTokens(r)+cacheWriteTokens(r),input=Math.max(0,Number(r.input_tokens||0)),output=Math.max(0,Number(r.output_tokens||0)),total=Math.max(0,Number(r.total_tokens||0));
+  return !(total>0&&cached>0&&total-input-output>=cached);
+}
+function cacheInputTotal(r){const input=Math.max(0,Number(r.input_tokens||0)),cache=cacheTokens(r)+cacheWriteTokens(r);return cacheInputIncludesDetails(r)?Math.max(input,cache):input+cache}
+function cacheRate(r){return ratio(cacheTokens(r),cacheInputTotal(r))}
 function pct(v){return v===undefined||v===null||v===''?'—':Number(v).toFixed(1)+'%'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,s=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]))}
 function td(v,cls='',col=''){return '<td class="'+cls+'"'+(col?' data-col="'+esc(col)+'"':'')+'>'+v+'</td>'}
@@ -2535,7 +2543,7 @@ function renderRecent(target,rows,mode){
   document.getElementById(target).innerHTML=rows.map(r=>{
     const who=mode==='provider'?firstText(r.provider,r.source,r.auth_index,'unknown'):firstText(r.auth_index,r.source,'unknown');
     const model=firstText(r.alias,r.model,'-');
-    const cache=cacheTokens(r);
+    const cache=cacheTokens(r),cacheWrite=cacheWriteTokens(r);
     const price=r.cost_available||Number(r.cost_usd||0)>0?'<span class="cost-pill">'+money(r.cost_usd)+'</span>':'<span class="cost-weak">缺价格</span>';
     const statusClass=r.failed?'danger':((Number(r.status_code||200)>=400)?'warn':'ok');
     const detail=[tierText(r.service_tier),r.price_detail||'缺价格'].filter(Boolean).join(' · ');
@@ -2543,7 +2551,7 @@ function renderRecent(target,rows,mode){
     return '<tr>'+
       td('<div class="recent-model"><div class="recent-primary"><span class="model-chip" title="'+esc(firstText(r.model,model))+'">'+esc(model)+'</span></div><span class="recent-sub" title="'+esc(who+' · '+(r.time||'-'))+'">'+esc(who)+' · '+esc(r.time||'-')+'</span></div>','recent-model')+
       td('<div class="recent-badges"><span class="latency-pill '+latencyTone(r.latency_ms)+'">'+fmtLatencyMs(r.latency_ms)+'</span><span class="latency-pill '+latencyTone(r.ttft_ms)+'">'+fmtLatencyMs(r.ttft_ms)+'</span></div><span class="token-sub">流 · '+esc(throughput(r))+'</span>')+
-      td('<span class="token-main">'+fmt(r.input_tokens)+' / '+fmt(r.output_tokens)+'</span><span class="token-sub">缓存 ↓ '+compact(cache)+(r.reasoning_tokens?(' · 推理 '+compact(r.reasoning_tokens)):'')+'</span>','num')+
+      td('<span class="token-main">'+fmt(r.input_tokens)+' / '+fmt(r.output_tokens)+'</span><span class="token-sub">缓存 ↓ '+compact(cache)+(cacheWrite?(' · 写入 ↑ '+compact(cacheWrite)):'')+(r.reasoning_tokens?(' · 推理 '+compact(r.reasoning_tokens)):'')+'</span>','num')+
       td(price,'num')+
       td('<span class="detail-main">'+esc(detail)+'</span><span class="detail-sub">'+reasoning+'<span class="status-pill '+statusClass+'">'+esc(requestStatusText(r))+'</span></span>')+
     '</tr>';

@@ -873,7 +873,7 @@ func modelExportRows(rows []modelRow) []map[string]string {
 			"total_tokens":   strconv.FormatInt(r.TotalTokens, 10),
 			"cost_usd":       fmt.Sprintf("%.6f", r.CostUSD),
 			"avg_latency_ms": fmt.Sprintf("%.0f", r.AverageLatencyMs),
-			"cache_rate":     fmt.Sprintf("%.2f", cacheRateBackend(r.InputTokens, r.CachedTokens, r.CacheReadTokens)),
+			"cache_rate":     fmt.Sprintf("%.2f", cacheRateBackend(r.Provider, r.Model, r.TotalTokens, r.InputTokens, r.OutputTokens, r.CachedTokens, r.CacheReadTokens, r.CacheCreationTokens)),
 		})
 	}
 	return out
@@ -940,15 +940,18 @@ func successRateBackend(requests, failed int64) float64 {
 	return float64(requests-failed) * 100 / float64(requests)
 }
 
-func cacheRateBackend(input, cached, cacheRead int64) float64 {
-	cache := cached
-	if cacheRead > cache {
-		cache = cacheRead
+func cacheRateBackend(provider, model string, total, input, output, cached, cacheRead, cacheCreation int64) float64 {
+	cache := normalizeCacheTokens(cached, cacheRead, cacheCreation)
+	input = maxInt64(input, 0)
+	if cacheTokensIncludedInInput(provider, model, total, input, output, cache) {
+		input = maxInt64(input, cache.Total)
+	} else {
+		input += cache.Total
 	}
 	if input <= 0 {
 		return 0
 	}
-	return float64(cache) * 100 / float64(input)
+	return float64(cache.Read) * 100 / float64(input)
 }
 
 func maxInt(a, b int) int {

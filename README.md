@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.34`
+Current version: `0.1.35`
 
 ## Features
 
@@ -22,7 +22,8 @@ Current version: `0.1.34`
 - Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
 - Account-protection and error filtering preserve CPA round-robin rotation within the highest-priority candidate tier.
 - Configured accounts with no real requests display zero quota even when background health probes have captured quota headers.
-- Overlapping cache totals and cache-read details are normalized before display, preventing duplicate cache Token counts.
+- Provider-aware cache read/write normalization keeps OpenAI-compatible and Anthropic-style usage, cache hit rates, and cost estimates consistent.
+- Summary cache keys are canonicalized and bounded in memory and SQLite for long-running installations.
 
 ## Install Manually
 
@@ -154,11 +155,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.34_linux_amd64.zip
-codex-token-usage_0.1.34_linux_arm64.zip
-codex-token-usage_0.1.34_windows_amd64.zip
-codex-token-usage_0.1.34_darwin_amd64.zip
-codex-token-usage_0.1.34_darwin_arm64.zip
+codex-token-usage_0.1.35_linux_amd64.zip
+codex-token-usage_0.1.35_linux_arm64.zip
+codex-token-usage_0.1.35_windows_amd64.zip
+codex-token-usage_0.1.35_darwin_amd64.zip
+codex-token-usage_0.1.35_darwin_arm64.zip
 checksums.txt
 ```
 

@@ -19,6 +19,19 @@ type modelPrice struct {
 	CacheSet       bool
 	CacheReadSet   bool
 	CacheCreateSet bool
+	Priority       modelTierPrice
+	Flex           modelTierPrice
+}
+
+type modelTierPrice struct {
+	Prompt         float64
+	Completion     float64
+	CacheRead      float64
+	CacheCreation  float64
+	PromptSet      bool
+	CompletionSet  bool
+	CacheReadSet   bool
+	CacheCreateSet bool
 }
 
 type costTokenRow struct {
@@ -137,6 +150,8 @@ func modelPriceFromJSON(entry map[string]any) (modelPrice, bool) {
 		price.CacheCreation = v
 		price.CacheCreateSet = true
 	}
+	price.Priority = modelTierPriceFromJSON(entry, "priority")
+	price.Flex = modelTierPriceFromJSON(entry, "flex")
 	if price.Prompt <= 0 && price.Completion <= 0 {
 		return modelPrice{}, false
 	}
@@ -384,23 +399,19 @@ func costForTokens(row costTokenRow, prices map[string]modelPrice) (float64, boo
 	}
 	inputTokens := maxInt64(row.InputTokens, 0)
 	outputTokens := maxInt64(row.OutputTokens, 0)
-	cachedTokens := maxInt64(row.CachedTokens, 0)
-	cacheReadTokens := maxInt64(row.CacheReadTokens, 0)
-	cacheCreationTokens := maxInt64(row.CacheCreationTokens, 0)
-	residualCachedTokens := cachedTokens
-	if cacheReadTokens > 0 || cacheCreationTokens > 0 {
-		residualCachedTokens = maxInt64(cachedTokens-cacheReadTokens-cacheCreationTokens, 0)
+	cache := normalizeCacheTokens(row.CachedTokens, row.CacheReadTokens, row.CacheCreationTokens)
+	promptTokens := inputTokens
+	if cacheTokensIncludedInInput(row.Provider, row.Model, row.TotalTokens, inputTokens, outputTokens, cache) {
+		promptTokens = maxInt64(inputTokens-cache.Total, 0)
 	}
-	promptTokens := maxInt64(inputTokens-cachedTokens, 0)
-	cachePrice := effectiveCachePrice(price)
+	price = effectiveModelPriceForServiceTier(price, row.Model, row.ServiceTier)
 	cacheReadPrice := effectiveCacheReadPrice(price)
 	cacheCreationPrice := effectiveCacheCreationPrice(price)
 	cost := float64(promptTokens)*price.Prompt/1_000_000.0 +
 		float64(outputTokens)*price.Completion/1_000_000.0 +
-		float64(residualCachedTokens)*cachePrice/1_000_000.0 +
-		float64(cacheReadTokens)*cacheReadPrice/1_000_000.0 +
-		float64(cacheCreationTokens)*cacheCreationPrice/1_000_000.0
-	return cost * serviceTierMultiplier(row.Model, row.ServiceTier), true
+		float64(cache.Read)*cacheReadPrice/1_000_000.0 +
+		float64(cache.Creation)*cacheCreationPrice/1_000_000.0
+	return cost, true
 }
 
 func resolveModelPrice(row costTokenRow, prices map[string]modelPrice) (modelPrice, bool) {
@@ -527,6 +538,62 @@ func effectiveCacheCreationPrice(price modelPrice) float64 {
 		return price.CacheCreation
 	}
 	return price.Prompt
+}
+
+func modelTierPriceFromJSON(entry map[string]any, tier string) modelTierPrice {
+	var price modelTierPrice
+	price.Prompt, price.PromptSet = perTokenTierPrice(entry, "input_cost_per_token_"+tier)
+	price.Completion, price.CompletionSet = perTokenTierPrice(entry, "output_cost_per_token_"+tier)
+	price.CacheRead, price.CacheReadSet = perTokenTierPrice(entry, "cache_read_input_token_cost_"+tier)
+	price.CacheCreation, price.CacheCreateSet = perTokenTierPrice(entry, "cache_creation_input_token_cost_"+tier)
+	return price
+}
+
+func perTokenTierPrice(entry map[string]any, key string) (float64, bool) {
+	value, ok := firstPresentFloat(entry, key)
+	if !ok {
+		return 0, false
+	}
+	return perTokenToPerMillion(value), true
+}
+
+func effectiveModelPriceForServiceTier(price modelPrice, modelName, serviceTier string) modelPrice {
+	tier := strings.ToLower(strings.TrimSpace(serviceTier))
+	var override modelTierPrice
+	switch tier {
+	case "priority", "fast":
+		override = price.Priority
+	case "flex":
+		override = price.Flex
+	default:
+		return price
+	}
+	multiplier := serviceTierMultiplier(modelName, serviceTier)
+	basePrompt := price.Prompt
+	baseCompletion := price.Completion
+	baseCache := effectiveCachePrice(price)
+	baseCacheRead := effectiveCacheReadPrice(price)
+	baseCacheCreation := effectiveCacheCreationPrice(price)
+	cacheMultiplier := multiplier
+	if override.PromptSet && basePrompt > 0 {
+		cacheMultiplier = override.Prompt / basePrompt
+	}
+	price.Prompt = tierPriceValue(override.Prompt, override.PromptSet, basePrompt, multiplier)
+	price.Completion = tierPriceValue(override.Completion, override.CompletionSet, baseCompletion, multiplier)
+	price.Cache = tierPriceValue(override.CacheRead, override.CacheReadSet, baseCache, cacheMultiplier)
+	price.CacheRead = tierPriceValue(override.CacheRead, override.CacheReadSet, baseCacheRead, cacheMultiplier)
+	price.CacheCreation = tierPriceValue(override.CacheCreation, override.CacheCreateSet, baseCacheCreation, cacheMultiplier)
+	price.CacheSet = true
+	price.CacheReadSet = true
+	price.CacheCreateSet = true
+	return price
+}
+
+func tierPriceValue(value float64, set bool, base float64, multiplier float64) float64 {
+	if set {
+		return value
+	}
+	return base * multiplier
 }
 
 func recentPriceDetail(price modelPrice) string {

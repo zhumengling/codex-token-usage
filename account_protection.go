@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -278,7 +279,14 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		state.InFlight, state.Tokens = snapshot.metrics(state.Aliases)
 		states = append(states, state)
 	}
-	chosen := chooseProtectedCandidate(states, rotationKey, affinityKey)
+	chosen, ok := chooseProtectedCandidate(states, rotationKey, affinityKey)
+	if !ok {
+		return schedulerAuthCandidate{}, &schedulerRejectError{
+			Code:       "account_protection_saturated",
+			Message:    "all Codex auth candidates reached their account-protection concurrency limit",
+			HTTPStatus: http.StatusServiceUnavailable,
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `
 INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at)
 VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
@@ -290,10 +298,14 @@ VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chos
 	return chosen.Candidate, nil
 }
 
-func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) protectionCandidate {
+func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) (protectionCandidate, bool) {
+	if len(states) == 0 {
+		return protectionCandidate{}, false
+	}
 	states = assignProtectionSelectionIDs(states)
-	if bound, ok := boundProtectedCandidate(states, affinityKey); ok && bound.InFlight < bound.Limit {
-		return bound
+	bound, hasBinding := boundProtectedCandidate(states, affinityKey)
+	if hasBinding && bound.InFlight < bound.Limit {
+		return bound, true
 	}
 	eligible := make([]protectionCandidate, 0, len(states))
 	for _, state := range states {
@@ -303,7 +315,7 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinit
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal", affinityKey)
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal", affinityKey, !hasBinding), true
 	}
 	for _, state := range states {
 		if state.InFlight < state.Limit {
@@ -311,20 +323,9 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinit
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted", affinityKey)
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted", affinityKey, !hasBinding), true
 	}
-	minInFlight := states[0].InFlight
-	for _, state := range states[1:] {
-		if state.InFlight < minInFlight {
-			minInFlight = state.InFlight
-		}
-	}
-	for _, state := range states {
-		if state.InFlight == minInFlight {
-			eligible = append(eligible, state)
-		}
-	}
-	return rotateProtectedCandidate(eligible, rotationKey+"\x00saturated", affinityKey)
+	return protectionCandidate{}, false
 }
 
 func boundProtectedCandidate(states []protectionCandidate, affinityKey string) (protectionCandidate, bool) {
@@ -344,7 +345,7 @@ func boundProtectedCandidate(states []protectionCandidate, affinityKey string) (
 	return state, ok
 }
 
-func rotateProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) protectionCandidate {
+func rotateProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string, bindAffinity bool) protectionCandidate {
 	candidates := make([]schedulerAuthCandidate, 0, len(states))
 	byID := make(map[string]protectionCandidate, len(states))
 	for _, state := range states {
@@ -353,7 +354,12 @@ func rotateProtectedCandidate(states []protectionCandidate, rotationKey, affinit
 		candidates = append(candidates, candidate)
 		byID[candidate.ID] = state
 	}
-	chosen := pickSchedulerCandidate(rotationKey, affinityKey, candidates)
+	var chosen schedulerAuthCandidate
+	if bindAffinity {
+		chosen = pickSchedulerCandidate(rotationKey, affinityKey, candidates)
+	} else {
+		chosen = globalSchedulerRotation.pick(rotationKey, candidates)
+	}
 	return byID[chosen.ID]
 }
 

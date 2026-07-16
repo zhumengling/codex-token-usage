@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.34"
+	pluginVersion    = "0.1.35"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -2143,13 +2143,7 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if rec.RequestedAt.IsZero() {
 		rec.RequestedAt = time.Now()
 	}
-	total := rec.Detail.TotalTokens
-	if total == 0 {
-		total = rec.Detail.InputTokens + rec.Detail.OutputTokens + rec.Detail.ReasoningTokens
-	}
-	if total == 0 {
-		total = rec.Detail.InputTokens + rec.Detail.OutputTokens + rec.Detail.ReasoningTokens + rec.Detail.CachedTokens
-	}
+	total := fallbackUsageTotal(rec)
 	primaryPct := headerFloat(rec.ResponseHeaders, "x-codex-primary-used-percent")
 	secondaryPct := headerFloat(rec.ResponseHeaders, "x-codex-secondary-used-percent")
 	primaryReset := headerInt(rec.ResponseHeaders, "x-codex-primary-reset-at")

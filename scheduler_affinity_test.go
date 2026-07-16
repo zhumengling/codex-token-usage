@@ -138,6 +138,25 @@ func TestProtectionTokenDemotionDoesNotMoveExistingSession(t *testing.T) {
 	}
 }
 
+func TestProtectionTemporaryOverflowDoesNotReplacePrimaryAffinity(t *testing.T) {
+	resetSchedulerSelectionState(t)
+	const affinityKey = "temporary-overflow"
+	globalSchedulerAffinity.bind(affinityKey, "a")
+	states := []protectionCandidate{
+		{Candidate: schedulerAuthCandidate{ID: "a", Priority: 1}, InFlight: 1, Limit: 1},
+		{Candidate: schedulerAuthCandidate{ID: "b", Priority: 1}, InFlight: 0, Limit: 1},
+	}
+	overflow, ok := chooseProtectedCandidate(states, "overflow", affinityKey)
+	if !ok || overflow.Candidate.ID != "b" {
+		t.Fatalf("overflow pick=%+v/%v, want temporary candidate b", overflow, ok)
+	}
+	states[0].InFlight = 0
+	primary, ok := chooseProtectedCandidate(states, "overflow", affinityKey)
+	if !ok || primary.Candidate.ID != "a" {
+		t.Fatalf("recovered pick=%+v/%v, want original affinity a", primary, ok)
+	}
+}
+
 func TestSchedulerAffinityExpiresStaleBinding(t *testing.T) {
 	resetSchedulerSelectionState(t)
 	request := affinityTestRequest("expired-session")

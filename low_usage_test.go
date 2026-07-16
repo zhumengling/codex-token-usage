@@ -18,6 +18,73 @@ func newTestStore(t *testing.T) *store {
 	return s
 }
 
+func TestSummaryCacheKeyCanonicalizesAndClamps(t *testing.T) {
+	tests := []struct {
+		in   summaryCacheKey
+		want summaryCacheKey
+	}{
+		{in: summaryCacheKey{Window: "24h\\", Limit: 50}, want: summaryCacheKey{Window: "24h", Limit: 50}},
+		{in: summaryCacheKey{Window: " TODAY ", Limit: 10}, want: summaryCacheKey{Window: "today", Limit: 10}},
+		{in: summaryCacheKey{Window: "all", Limit: 9000}, want: summaryCacheKey{Window: "all", Limit: 5000}},
+		{in: summaryCacheKey{}, want: summaryCacheKey{Window: "24h", Limit: 50}},
+	}
+	for _, test := range tests {
+		if got := normalizeSummaryCacheKey(test.in); got != test.want {
+			t.Fatalf("normalizeSummaryCacheKey(%+v)=%+v, want %+v", test.in, got, test.want)
+		}
+	}
+}
+
+func TestSummaryMemoryCacheIsBounded(t *testing.T) {
+	m := &summaryPrecomputeManager{}
+	now := time.Now()
+	for i := 1; i <= summaryMemoryMaxEntries+20; i++ {
+		m.rememberMemory(summaryCacheKey{Window: "24h", Limit: i}, summaryCacheEntry{
+			data:     map[string]any{"limit": i},
+			cachedAt: now.Add(time.Duration(i) * time.Millisecond),
+		})
+	}
+	if got := len(m.entries); got != summaryMemoryMaxEntries {
+		t.Fatalf("memory cache entries=%d, want %d", got, summaryMemoryMaxEntries)
+	}
+}
+
+func TestSummarySQLiteCacheIsCanonicalAndBounded(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	for i := 1; i <= summaryStorageMaxEntries+20; i++ {
+		if err := s.saveSummaryCacheEntry(ctx, summaryCacheKey{Window: "24h", Limit: i}, summaryCacheEntry{
+			data:     map[string]any{"limit": i},
+			cachedAt: time.Now().Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, _, err := s.open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM summary_cache`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != summaryStorageMaxEntries {
+		t.Fatalf("SQLite cache entries=%d, want %d", count, summaryStorageMaxEntries)
+	}
+	if err := s.saveSummaryCacheEntry(ctx, summaryCacheKey{Window: "bad-window", Limit: 50}, summaryCacheEntry{
+		data: map[string]any{"ok": true}, cachedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var window string
+	if err := db.QueryRow(`SELECT window FROM summary_cache WHERE cache_key='24h|50'`).Scan(&window); err != nil {
+		t.Fatal(err)
+	}
+	if window != "24h" {
+		t.Fatalf("stored window=%q, want canonical 24h", window)
+	}
+}
+
 func TestSummarySyncRefreshesAfterUsageRevisionChange(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

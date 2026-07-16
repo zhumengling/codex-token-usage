@@ -8,8 +8,11 @@ import (
 func TestDashboardCacheTokensDoesNotDoubleCountOverlappingFields(t *testing.T) {
 	markers := []string{
 		`const cached=Number(r.cached_tokens||0),read=Number(r.cache_read_tokens||0),creation=Number(r.cache_creation_tokens||0);`,
-		`return Math.max(cached,read+creation);`,
-		`function cacheRate(r){return ratio(cacheTokens(r),r.input_tokens||0)}`,
+		`return Math.max(cached-read-creation,0)+read;`,
+		`function cacheWriteTokens(r){return Math.max(0,Number(r.cache_creation_tokens||0))}`,
+		`cacheInputIncludesDetails(r)?Math.max(input,cache):input+cache`,
+		`function cacheRate(r){return ratio(cacheTokens(r),cacheInputTotal(r))}`,
+		`provider.includes('claude')||provider.includes('anthropic')`,
 	}
 	for _, marker := range markers {
 		if !strings.Contains(dashboardScripts, marker) {

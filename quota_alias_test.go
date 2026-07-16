@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+)
 
 func TestAccountQuotaAliasSetsExcludeSharedWorkspaceIdentity(t *testing.T) {
 	accounts := []accountRow{
@@ -53,6 +58,27 @@ func TestAccountQuotaAliasSetsKeepUniqueAccountIdentity(t *testing.T) {
 	sets := accountQuotaAliasSets(accounts)
 	if len(sets) != 1 || !containsAlias(sets[0], "unique-account-id") {
 		t.Fatalf("unique account identity should be retained: %+v", sets)
+	}
+}
+
+func TestAccountWindowTokensDeduplicatesEventsAcrossAliasChunks(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	aliases := make([]string, 0, 251)
+	for i := 0; i < 250; i++ {
+		aliases = append(aliases, fmt.Sprintf("alias-%03d", i))
+	}
+	aliases = append(aliases, "zz-auth")
+	if _, err := db.Exec(`
+INSERT INTO usage_events (requested_at, provider, auth_index, auth_id, total_tokens)
+VALUES (?, 'codex', 'alias-000', 'zz-auth', 123)`, now); err != nil {
+		t.Fatal(err)
+	}
+	got := queryAccountWindowTokensBatch(context.Background(), db, []accountTokenWindow{{
+		Start: now - 10, End: now + 10, Aliases: aliases,
+	}})
+	if len(got) != 1 || got[0] != 123 {
+		t.Fatalf("window tokens=%v, want [123] without cross-chunk duplication", got)
 	}
 }
 

@@ -21,6 +21,13 @@ type summaryCacheKey struct {
 	Limit  int
 }
 
+const (
+	summaryMemoryMaxEntries     = 128
+	summaryActiveMaxEntries     = 128
+	summaryRefreshingMaxEntries = 64
+	summaryStorageMaxEntries    = 128
+)
+
 type summaryPrecomputeInfo struct {
 	Enabled      bool   `json:"enabled"`
 	Hit          bool   `json:"hit"`
@@ -87,6 +94,9 @@ func (m *summaryPrecomputeManager) configure(cfg pluginConfig) {
 		m.active = map[summaryCacheKey]time.Time{}
 	}
 	if !cfg.SummaryPrecomputeEnabled {
+		m.entries = map[summaryCacheKey]summaryCacheEntry{}
+		m.refreshing = map[summaryCacheKey]bool{}
+		m.active = map[summaryCacheKey]time.Time{}
 		m.mu.Unlock()
 		return
 	}
@@ -200,7 +210,9 @@ func (m *summaryPrecomputeManager) markActive(key summaryCacheKey) {
 	if m.active == nil {
 		m.active = map[summaryCacheKey]time.Time{}
 	}
-	m.active[key] = time.Now()
+	now := time.Now()
+	m.active[key] = now
+	m.pruneActiveLocked(now, m.configLocked())
 	m.mu.Unlock()
 }
 
@@ -241,16 +253,16 @@ func (m *summaryPrecomputeManager) summary(ctx context.Context, store *store, wi
 	requestStarted := time.Now()
 	cfg := m.config()
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
-	m.markActive(key)
 	if !cfg.SummaryPrecomputeEnabled {
-		data, err := store.summary(ctx, window, limit)
+		data, err := store.summary(ctx, key.Window, key.Limit)
 		if err == nil {
 			data = cloneSummaryMap(data)
-			data["precompute"] = summaryPrecomputeInfo{Enabled: false, Window: window, Limit: limit, Reason: "disabled"}
+			data["precompute"] = summaryPrecomputeInfo{Enabled: false, Window: key.Window, Limit: key.Limit, Reason: "disabled"}
 			attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
 		}
 		return data, err
 	}
+	m.markActive(key)
 	revision, err := store.currentRevision(ctx)
 	if err != nil {
 		return nil, err
@@ -297,8 +309,8 @@ func (m *summaryPrecomputeManager) summaryFresh(ctx context.Context, store *stor
 	requestStarted := time.Now()
 	cfg := m.config()
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
-	m.markActive(key)
 	if cfg.SummaryPrecomputeEnabled {
+		m.markActive(key)
 		revision, err := store.currentRevision(ctx)
 		if err != nil {
 			return nil, err
@@ -315,7 +327,9 @@ func (m *summaryPrecomputeManager) summaryFresh(ctx context.Context, store *stor
 func (m *summaryPrecomputeManager) summarySync(ctx context.Context, store *store, window string, limit int) (map[string]any, error) {
 	cfg := m.config()
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
-	m.markActive(key)
+	if cfg.SummaryPrecomputeEnabled {
+		m.markActive(key)
+	}
 	return m.summarySyncWithStarted(ctx, store, cfg, key, time.Now())
 }
 
@@ -369,6 +383,10 @@ func (m *summaryPrecomputeManager) refreshAsyncMode(store *store, cfg pluginConf
 		m.refreshing = map[summaryCacheKey]bool{}
 	}
 	if m.refreshing[key] {
+		m.mu.Unlock()
+		return
+	}
+	if len(m.refreshing) >= summaryRefreshingMaxEntries {
 		m.mu.Unlock()
 		return
 	}
@@ -476,7 +494,58 @@ func (m *summaryPrecomputeManager) rememberMemory(key summaryCacheKey, entry sum
 		m.entries = map[summaryCacheKey]summaryCacheEntry{}
 	}
 	m.entries[key] = entry
+	m.pruneEntriesLocked(time.Now(), m.configLocked())
 	m.mu.Unlock()
+}
+
+func (m *summaryPrecomputeManager) pruneEntriesLocked(now time.Time, cfg pluginConfig) {
+	cutoff := now.Add(-summaryStaleMaxAge(cfg))
+	for key, entry := range m.entries {
+		if !entry.cachedAt.IsZero() && entry.cachedAt.Before(cutoff) {
+			delete(m.entries, key)
+		}
+	}
+	for len(m.entries) > summaryMemoryMaxEntries {
+		var oldestKey summaryCacheKey
+		var oldestAt time.Time
+		found := false
+		for key, entry := range m.entries {
+			if !found || entry.cachedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = entry.cachedAt
+				found = true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(m.entries, oldestKey)
+	}
+}
+
+func (m *summaryPrecomputeManager) pruneActiveLocked(now time.Time, cfg pluginConfig) {
+	cutoff := now.Add(-time.Duration(maxInt(cfg.SummaryPrecomputeActiveWindowTTLSeconds, 30)) * time.Second)
+	for key, lastSeen := range m.active {
+		if lastSeen.Before(cutoff) {
+			delete(m.active, key)
+		}
+	}
+	for len(m.active) > summaryActiveMaxEntries {
+		var oldestKey summaryCacheKey
+		var oldestAt time.Time
+		found := false
+		for key, lastSeen := range m.active {
+			if !found || lastSeen.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = lastSeen
+				found = true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(m.active, oldestKey)
+	}
 }
 
 func summaryCacheTTL(cfg pluginConfig) time.Duration {
@@ -569,10 +638,28 @@ ON CONFLICT(cache_key) DO UPDATE SET
   cached_at=excluded.cached_at,
   duration_ms=excluded.duration_ms,
   revision=excluded.revision,
-  last_error=excluded.last_error,
-  data_json=excluded.data_json`,
+			last_error=excluded.last_error,
+			data_json=excluded.data_json`,
 			summaryCacheStorageKey(key), key.Window, key.Limit, entry.cachedAt.Unix(), entry.durationMs, entry.revision, entry.err, string(payload),
 		)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if _, err = db.ExecContext(ctx, `
+DELETE FROM summary_cache
+WHERE window NOT IN ('today','24h','7d','30d','all')
+   OR limit_count < 1
+   OR limit_count > 5000`); err != nil {
+			return struct{}{}, err
+		}
+		_, err = db.ExecContext(ctx, `
+DELETE FROM summary_cache
+WHERE cache_key IN (
+  SELECT cache_key
+  FROM summary_cache
+  ORDER BY cached_at DESC, cache_key DESC
+  LIMIT -1 OFFSET ?
+)`, summaryStorageMaxEntries)
 		return struct{}{}, err
 	})
 	return err
@@ -595,12 +682,22 @@ func (m *summaryPrecomputeManager) configLocked() pluginConfig {
 }
 
 func normalizeSummaryCacheKey(key summaryCacheKey) summaryCacheKey {
-	key.Window = strings.ToLower(strings.TrimSpace(key.Window))
-	if key.Window == "" {
+	switch strings.ToLower(strings.TrimSpace(key.Window)) {
+	case "today":
+		key.Window = "today"
+	case "7d":
+		key.Window = "7d"
+	case "30d":
+		key.Window = "30d"
+	case "all":
+		key.Window = "all"
+	default:
 		key.Window = "24h"
 	}
 	if key.Limit <= 0 {
 		key.Limit = 50
+	} else if key.Limit > 5000 {
+		key.Limit = 5000
 	}
 	return key
 }
@@ -2770,6 +2867,8 @@ func queryAccountWindowTokensBatch(ctx context.Context, db *sql.DB, windows []ac
 	for alias := range aliasToWindows {
 		aliases = append(aliases, alias)
 	}
+	sort.Strings(aliases)
+	matchedEvents := make(map[int64]map[int]bool)
 	const chunkSize = 250
 	for start := 0; start < len(aliases); start += chunkSize {
 		end := start + chunkSize
@@ -2786,7 +2885,7 @@ func queryAccountWindowTokensBatch(ctx context.Context, db *sql.DB, windows []ac
 			}
 		}
 		rows, err := db.QueryContext(ctx, `
-SELECT requested_at, total_tokens, lower(auth_index), lower(auth_id), lower(source)
+SELECT id, requested_at, total_tokens, lower(auth_index), lower(auth_id), lower(source)
 FROM usage_events
 WHERE requested_at >= ? AND requested_at <= ?
 AND (
@@ -2798,9 +2897,9 @@ AND (
 			continue
 		}
 		for rows.Next() {
-			var ts, tokens int64
+			var eventID, ts, tokens int64
 			var authIndex, authID, source string
-			if err := rows.Scan(&ts, &tokens, &authIndex, &authID, &source); err != nil {
+			if err := rows.Scan(&eventID, &ts, &tokens, &authIndex, &authID, &source); err != nil {
 				continue
 			}
 			matched := map[int]bool{}
@@ -2813,8 +2912,15 @@ AND (
 					if ts < window.Start || ts > window.End {
 						continue
 					}
+					if matchedEvents[eventID] == nil {
+						matchedEvents[eventID] = map[int]bool{}
+					}
+					if matchedEvents[eventID][windowIndex] {
+						continue
+					}
 					out[windowIndex] += tokens
 					matched[windowIndex] = true
+					matchedEvents[eventID][windowIndex] = true
 				}
 			}
 		}
