@@ -110,8 +110,7 @@ func (m *codexAuthSourceManager) refreshHostInventory() error {
 }
 
 func configuredCodexHostAuthEntry(entry hostAuthFileEntry) (configuredAccount, bool) {
-	provider := normalizeAuthProvider(firstNonEmptyString(entry.Provider, entry.Type), firstNonEmptyString(entry.Name, entry.Path, entry.AuthIndex))
-	if !isCodexAuthProvider(provider) {
+	if pluginOwnedHostAuthEntry(entry) || !explicitCodexHostProvider(entry.Provider, entry.Type) {
 		return configuredAccount{}, false
 	}
 	email := firstNonEmptyString(entry.Email, entry.Account)
@@ -144,6 +143,57 @@ func configuredCodexHostAuthEntry(entry hostAuthFileEntry) (configuredAccount, b
 		RuntimeMessage:     sanitizeTriggerError(entry.StatusMessage),
 		RuntimeUnavailable: entry.Unavailable,
 	}, true
+}
+
+func explicitCodexHostProvider(values ...string) bool {
+	for _, value := range values {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "codex", "openai", "chatgpt":
+			return true
+		}
+	}
+	return false
+}
+
+func pluginOwnedHostAuthEntry(entry hostAuthFileEntry) bool {
+	for _, value := range []string{entry.Path, entry.Name, entry.ID, entry.AuthIndex} {
+		if pluginOwnedDataPath(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func pluginOwnedDataPath(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	normalized := strings.ToLower(filepath.ToSlash(filepath.Clean(value)))
+	marker := "/plugins/" + strings.ToLower(pluginID) + "/"
+	if strings.Contains(normalized, marker) || strings.HasPrefix(normalized, "plugins/"+strings.ToLower(pluginID)+"/") {
+		return true
+	}
+	if strings.ToLower(filepath.Base(value)) != "model_prices.json" {
+		return false
+	}
+	dir, err := pluginDataDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	absValue, err := filepath.Abs(value)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absDir, absValue)
+	if err != nil || rel == "." || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func codexHostAuthSourceKind(entry hostAuthFileEntry, authFile string) string {

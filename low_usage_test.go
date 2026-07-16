@@ -238,6 +238,43 @@ func TestQuotaTriggerWarningLabelAndConfigCompatibility(t *testing.T) {
 	}
 }
 
+func TestAccountProtectionWarningLabelIsLastConfigGroupAndKeepsCompatibility(t *testing.T) {
+	const warningName = "开启账号保护调度（可能会影响缓存）"
+	wantLastGroup := []string{
+		warningName,
+		"Free 并发上限",
+		"Plus 并发上限",
+		"K12 并发上限",
+		"Team 并发上限",
+		"Pro 并发上限",
+		"Free 5 分钟 Token 上限",
+		"Plus 5 分钟 Token 上限",
+		"K12 5 分钟 Token 上限",
+		"Team 5 分钟 Token 上限",
+		"Pro 5 分钟 Token 上限",
+		"账号保护 Token 窗口秒数",
+		"账号保护预约超时秒数",
+	}
+	fields := pluginConfigFields()
+	if len(fields) < len(wantLastGroup) {
+		t.Fatalf("plugin config fields = %d, want at least %d", len(fields), len(wantLastGroup))
+	}
+	lastGroup := fields[len(fields)-len(wantLastGroup):]
+	for i, want := range wantLastGroup {
+		if lastGroup[i].Name != want {
+			t.Fatalf("last config group field %d = %q, want %q", i, lastGroup[i].Name, want)
+		}
+	}
+	for _, key := range []string{"account_protection_enabled", warningName, "开启账号保护调度"} {
+		cfg := defaultPluginConfig()
+		cfg.AccountProtectionEnabled = false
+		cfg = parsePluginConfigYAML([]byte(key+": true\n"), cfg)
+		if !cfg.AccountProtectionEnabled {
+			t.Fatalf("account protection config key %q was not accepted", key)
+		}
+	}
+}
+
 func TestConfiguredAuthFilesCacheInvalidatesOnFileChange(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CPA_AUTH_DIR", dir)

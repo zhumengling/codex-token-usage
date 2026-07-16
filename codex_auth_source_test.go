@@ -60,6 +60,61 @@ func TestCodexHostAuthSourceShowsUnusedAccountsInSummary(t *testing.T) {
 	}
 }
 
+func TestCodexHostAuthSourceRejectsUnknownAndPluginDataJSON(t *testing.T) {
+	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		pluginDir, err := pluginDataDir()
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{
+			{ID: "account.json", AuthIndex: "account-index", Name: "account.json", Provider: "codex", Email: "account@example.com"},
+			{ID: "plugins/codex-token-usage/model_prices.json", AuthIndex: "prices-index", Name: "model_prices.json", Path: filepath.Join(pluginDir, "model_prices.json"), Provider: "unknown", Source: "file"},
+			{ID: "codex-looking.json", AuthIndex: "unknown-index", Name: "codex-looking.json", Provider: "unknown", Source: "file"},
+		}})
+	})
+	s := newTestStore(t)
+	data, err := s.summaryOnce(context.Background(), "24h", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 || accounts[0].AuthID != "account.json" {
+		t.Fatalf("accounts = %+v, want only the explicit Codex credential", accounts)
+	}
+	status := globalCodexAuthSource.status()
+	if status.Accounts != 1 {
+		t.Fatalf("Codex auth source status = %+v, want one account", status)
+	}
+}
+
+func TestConfiguredCodexHostAuthEntryRequiresExplicitProviderAndRejectsPluginPath(t *testing.T) {
+	pluginDir := filepath.Join(t.TempDir(), "plugins", pluginID)
+	t.Setenv("CPA_TOKEN_USAGE_DIR", pluginDir)
+	tests := []struct {
+		name  string
+		entry hostAuthFileEntry
+		want  bool
+	}{
+		{name: "codex", entry: hostAuthFileEntry{Name: "account.json", Provider: "codex"}, want: true},
+		{name: "openai alias", entry: hostAuthFileEntry{Name: "account.json", Provider: "openai"}, want: true},
+		{name: "unknown", entry: hostAuthFileEntry{Name: "codex-looking.json", Provider: "unknown"}},
+		{name: "empty provider", entry: hostAuthFileEntry{Name: "codex-looking.json"}},
+		{name: "plugin data path", entry: hostAuthFileEntry{Name: "model_prices.json", Path: filepath.Join(pluginDir, "model_prices.json"), Provider: "codex"}},
+		{name: "relative plugin data path", entry: hostAuthFileEntry{ID: "plugins/codex-token-usage/model_prices.json", Provider: "codex"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, got := configuredCodexHostAuthEntry(test.entry)
+			if got != test.want {
+				t.Fatalf("configuredCodexHostAuthEntry(%+v) accepted=%v, want %v", test.entry, got, test.want)
+			}
+		})
+	}
+}
+
 func TestCodexHostAuthSourceKeepsInventoryButOnlyReturnsFileAccounts(t *testing.T) {
 	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
 		if method != "host.auth.list" {

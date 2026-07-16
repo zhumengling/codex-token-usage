@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.32"
+	pluginVersion    = "0.1.33"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -514,19 +514,6 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 func pluginConfigFields() []configField {
 	return []configField{
-		{Name: "开启账号保护调度", Type: "boolean", Description: "按套餐并发保护和 Token 软降级。默认关闭。"},
-		{Name: "Free 并发上限", Type: "number", Description: "Free 账号最大同时在途请求数。默认 2。"},
-		{Name: "Plus 并发上限", Type: "number", Description: "Plus 或未知套餐账号最大同时在途请求数。默认 5。"},
-		{Name: "K12 并发上限", Type: "number", Description: "K12 账号最大同时在途请求数。默认 5。"},
-		{Name: "Team 并发上限", Type: "number", Description: "Team 账号最大同时在途请求数。默认 5。"},
-		{Name: "Pro 并发上限", Type: "number", Description: "Pro 账号最大同时在途请求数。默认 10。"},
-		{Name: "Free 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 2000000。"},
-		{Name: "Plus 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
-		{Name: "K12 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
-		{Name: "Team 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
-		{Name: "Pro 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 12000000。"},
-		{Name: "账号保护 Token 窗口秒数", Type: "number", Description: "滑动 Token 统计窗口。默认 300 秒。"},
-		{Name: "账号保护预约超时秒数", Type: "number", Description: "没有完成回调时自动释放并发名额。默认 900 秒。"},
 		{Name: "开启定时额度触发（不建议账号多的情况下开启）", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。探测结果会参与 401、402、403、429 状态管理。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
 		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
@@ -546,6 +533,19 @@ func pluginConfigFields() []configField {
 		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "summary 缓存直接复用秒数；revision 变化时会先返回短期旧缓存并异步刷新。默认 30。"},
 		{Name: "summary_maintenance_interval_seconds", Type: "number", Description: "后台状态维护间隔，单位秒；无数据变化会跳过。默认 180。"},
 		{Name: "summary_precompute_active_window_ttl_seconds", Type: "number", Description: "窗口被访问后保留为活跃预计算窗口的时间。默认 120。"},
+		{Name: "开启账号保护调度（可能会影响缓存）", Type: "boolean", Description: "按套餐并发保护和 Token 软降级；接管账号选择时可能降低长会话缓存命中率。默认关闭。"},
+		{Name: "Free 并发上限", Type: "number", Description: "Free 账号最大同时在途请求数。默认 2。"},
+		{Name: "Plus 并发上限", Type: "number", Description: "Plus 或未知套餐账号最大同时在途请求数。默认 5。"},
+		{Name: "K12 并发上限", Type: "number", Description: "K12 账号最大同时在途请求数。默认 5。"},
+		{Name: "Team 并发上限", Type: "number", Description: "Team 账号最大同时在途请求数。默认 5。"},
+		{Name: "Pro 并发上限", Type: "number", Description: "Pro 账号最大同时在途请求数。默认 10。"},
+		{Name: "Free 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 2000000。"},
+		{Name: "Plus 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
+		{Name: "K12 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
+		{Name: "Team 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
+		{Name: "Pro 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 12000000。"},
+		{Name: "账号保护 Token 窗口秒数", Type: "number", Description: "滑动 Token 统计窗口。默认 300 秒。"},
+		{Name: "账号保护预约超时秒数", Type: "number", Description: "没有完成回调时自动释放并发名额。默认 900 秒。"},
 	}
 }
 
@@ -1061,7 +1061,7 @@ func lifecycleConfigYAML(raw json.RawMessage) ([]byte, error) {
 
 func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	values := yamlScalars(string(raw))
-	if value, ok := configValue(values, "account_protection_enabled", "开启账号保护调度"); ok {
+	if value, ok := configValue(values, "account_protection_enabled", "开启账号保护调度（可能会影响缓存）", "开启账号保护调度"); ok {
 		cfg.AccountProtectionEnabled = parseBoolString(value, cfg.AccountProtectionEnabled)
 	}
 	if value, ok := configValue(values, "account_protection_free_concurrency", "Free 并发上限"); ok {

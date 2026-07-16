@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.32`
+Current version: `0.1.33`
 
 ## Features
 
@@ -53,7 +53,16 @@ plugins:
       单账号超时秒数: 20
       单账号最小冷却分钟: 10
 
-      开启账号保护调度: false
+      自动更新模型价格表: true
+      模型价格更新间隔小时: 6
+      模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+      模型价格更新超时秒数: 20
+
+      用量保留天数: 90
+      额度触发记录保留天数: 30
+      请求明细保留天数: 30
+
+      开启账号保护调度（可能会影响缓存）: false
       Free 并发上限: 2
       Plus 并发上限: 5
       K12 并发上限: 5
@@ -66,15 +75,6 @@ plugins:
       Pro 5 分钟 Token 上限: 12000000
       账号保护 Token 窗口秒数: 300
       账号保护预约超时秒数: 900
-
-      自动更新模型价格表: true
-      模型价格更新间隔小时: 6
-      模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-      模型价格更新超时秒数: 20
-
-      用量保留天数: 90
-      额度触发记录保留天数: 30
-      请求明细保留天数: 30
 ```
 
 English config keys are also accepted:
@@ -86,6 +86,13 @@ quota_trigger_mode: probe
 quota_trigger_max_concurrency: 1
 quota_trigger_timeout_seconds: 20
 quota_trigger_min_account_cooldown_minutes: 10
+model_price_auto_update_enabled: true
+model_price_update_interval_hours: 6
+model_price_update_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+model_price_update_timeout_seconds: 20
+usage_retention_days: 90
+quota_trigger_retention_days: 30
+request_detail_retention_days: 30
 account_protection_enabled: false
 account_protection_free_concurrency: 2
 account_protection_plus_concurrency: 5
@@ -99,13 +106,6 @@ account_protection_team_token_limit: 8000000
 account_protection_pro_token_limit: 12000000
 account_protection_token_window_seconds: 300
 account_protection_reservation_ttl_seconds: 900
-model_price_auto_update_enabled: true
-model_price_update_interval_hours: 6
-model_price_update_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-model_price_update_timeout_seconds: 20
-usage_retention_days: 90
-quota_trigger_retention_days: 30
-request_detail_retention_days: 30
 ```
 
 Quota trigger defaults to off and is not recommended for large account pools. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. Probe results are account-health inputs: 401 and 402 update invalid-auth state, 403 follows the same repeated-failure threshold as normal traffic, 429 creates an auto-ban, and a successful probe clears recovered state. Accounts already restricted by 401, 402, 403, or 429 remain eligible for health rechecks after the configured cooldown, including when an older quota snapshot is still full. The legacy Chinese key `开启定时额度触发` and the legacy `quota` mode remain accepted for compatibility.
@@ -152,11 +152,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.32_linux_amd64.zip
-codex-token-usage_0.1.32_linux_arm64.zip
-codex-token-usage_0.1.32_windows_amd64.zip
-codex-token-usage_0.1.32_darwin_amd64.zip
-codex-token-usage_0.1.32_darwin_arm64.zip
+codex-token-usage_0.1.33_linux_amd64.zip
+codex-token-usage_0.1.33_linux_arm64.zip
+codex-token-usage_0.1.33_windows_amd64.zip
+codex-token-usage_0.1.33_darwin_amd64.zip
+codex-token-usage_0.1.33_darwin_arm64.zip
 checksums.txt
 ```
 
