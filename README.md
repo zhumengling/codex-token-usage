@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.31`
+Current version: `0.1.32`
 
 ## Features
 
@@ -46,7 +46,7 @@ plugins:
       enabled: true
       priority: 120
 
-      开启定时额度触发: false
+      开启定时额度触发（不建议账号多的情况下开启）: false
       触发间隔分钟: 10
       触发模式: probe
       最大并发账号数: 1
@@ -108,7 +108,7 @@ quota_trigger_retention_days: 30
 request_detail_retention_days: 30
 ```
 
-Quota trigger defaults to off. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. The legacy `quota` value is accepted for compatibility and normalized to `probe`; scheduled triggers no longer only read cached quota state.
+Quota trigger defaults to off and is not recommended for large account pools. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. Probe results are account-health inputs: 401 and 402 update invalid-auth state, 403 follows the same repeated-failure threshold as normal traffic, 429 creates an auto-ban, and a successful probe clears recovered state. Accounts already restricted by 401, 402, 403, or 429 remain eligible for health rechecks after the configured cooldown, including when an older quota snapshot is still full. The legacy Chinese key `开启定时额度触发` and the legacy `quota` mode remain accepted for compatibility.
 
 ## Model Price Table
 
@@ -118,10 +118,10 @@ The plugin includes a small built-in fallback price table. By default it also do
 https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 ```
 
-The downloaded file is stored at:
+The downloaded file is stored under the current CPA user's data directory:
 
 ```text
-/root/plugins/codex-token-usage/model_prices.json
+$HOME/.cli-proxy-api/plugins/codex-token-usage/model_prices.json
 ```
 
 The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay smaller and prices can be refreshed without rebuilding the plugin.
@@ -131,6 +131,8 @@ To override the location, set:
 ```bash
 CPA_MODEL_PRICE_FILE=/path/to/model_prices.json
 ```
+
+`CPA_TOKEN_USAGE_DIR` overrides the shared plugin data directory used by both `usage.db` and, unless `CPA_MODEL_PRICE_FILE` is set, `model_prices.json`. `CPA_CONFIG_PATH` (or the legacy `CPA_CONFIG_FILE`) overrides the CPA config path. Otherwise the plugin follows CPA's `-config` / `--config` process argument. Without either override, the canonical `$HOME/.cli-proxy-api/config.yaml` is preferred when present, followed by an existing `$HOME/config.yaml` or `config.yaml` in the process working directory; the final fallback remains `$HOME/.cli-proxy-api/config.yaml`.
 
 ## Data Safety
 
@@ -150,11 +152,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.31_linux_amd64.zip
-codex-token-usage_0.1.31_linux_arm64.zip
-codex-token-usage_0.1.31_windows_amd64.zip
-codex-token-usage_0.1.31_darwin_amd64.zip
-codex-token-usage_0.1.31_darwin_arm64.zip
+codex-token-usage_0.1.32_linux_amd64.zip
+codex-token-usage_0.1.32_linux_arm64.zip
+codex-token-usage_0.1.32_windows_amd64.zip
+codex-token-usage_0.1.32_darwin_amd64.zip
+codex-token-usage_0.1.32_darwin_arm64.zip
 checksums.txt
 ```
 

@@ -33,8 +33,8 @@ func TestParseAuthImportCardContent(t *testing.T) {
 			"access_token":       token,
 			"chatgpt_account_id": "account-k12",
 			"chatgpt_user_id":    "user-k12",
-			"email":               "student@example.com",
-			"plan_type":           "k12",
+			"email":              "student@example.com",
+			"plan_type":          "k12",
 		},
 		"extra": map[string]any{"no_rt": true},
 	}

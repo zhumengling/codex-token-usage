@@ -793,6 +793,8 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	}
 	configuredAccounts := readConfiguredAuthAccounts()
 	authDirReadable := globalCodexAuthSource.authoritative()
+	hostAuthInventory, hostAuthInventoryErr := readCodexHostAuthInventory()
+	hostAuthInventoryAuthoritative := hostAuthInventoryErr == nil
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
 	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
 	if globalAccountProtection.enabled() {
@@ -823,10 +825,12 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
-	invalidAuths = filterMissingInvalidAuthRows(invalidAuths, configuredAccounts, authDirReadable)
+	invalidAuths = classifyInvalidAuthRows(invalidAuths, hostAuthInventory)
+	invalidAuths = filterMissingInvalidAuthRows(invalidAuths, hostAuthInventory, hostAuthInventoryAuthoritative)
 	applyInvalidAuths(accounts, invalidAuths)
 	workspaceDeactivatedAuths := filterWorkspaceDeactivatedAuths(invalidAuths)
 	unauthorizedInvalidAuths := filterUnauthorizedInvalidAuths(invalidAuths)
+	forbiddenInvalidAuths := filterForbiddenInvalidAuths(invalidAuths)
 	externalUseAlerts, err := queryExternalUseAlerts(ctx, db, externalUseScanSince(since, now))
 	if err != nil {
 		return nil, err
@@ -940,6 +944,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		"xai_states":                  xaiStates,
 		"autobans":                    autobans,
 		"invalid_auths":               unauthorizedInvalidAuths,
+		"forbidden_auths":             forbiddenInvalidAuths,
 		"workspace_deactivated_auths": workspaceDeactivatedAuths,
 		"external_use_alerts":         externalUseAlerts,
 		"quota_trigger":               globalQuotaTrigger.status(),
@@ -985,30 +990,41 @@ func filterMissingInvalidAuthRows(rows []invalidAuthRow, configured []configured
 	if !authDirReadable || len(rows) == 0 {
 		return rows
 	}
-	aliases := configuredAliasSet(configured)
-	strictAliases := configuredStrictAliasSet(configured)
+	identityIndex := newCodexAuthIdentityIndex(configured)
 	out := rows[:0]
 	for _, row := range rows {
-		cleanupAliases := fileBackedCleanupAliases(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
-		if len(cleanupAliases) > 0 {
-			if aliasesContainAny(strictAliases, cleanupAliases...) {
-				out = append(out, row)
-			}
-			continue
-		}
-		rowStrictAliases := strictAuthStateAliasesForValues(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
-		if len(rowStrictAliases) > 0 {
-			if aliasesContainAny(strictAliases, rowStrictAliases...) {
-				out = append(out, row)
-			}
-			continue
-		}
-		if !fileBackedAuthState(row.AuthID, row.AuthIndex, row.Source, row.AuthFile) || aliasesContainAny(aliases, row.AuthID, row.AuthIndex, row.Source, row.AuthFile) {
+		if _, ok := identityIndex.match(row); ok {
 			out = append(out, row)
 			continue
 		}
+		// CPA intentionally hides disabled runtime-only credentials from
+		// host.auth.list. Their absence is therefore not proof that the stored
+		// 401 is stale; keep the explicit runtime record actionable until the
+		// user disables/resolves it or a later successful request clears it.
+		if inferInvalidAuthSourceKind(row) == authSourceKindRuntimeOnly {
+			out = append(out, row)
+		}
 	}
 	return out
+}
+
+func classifyInvalidAuthRows(rows []invalidAuthRow, inventory []configuredAccount) []invalidAuthRow {
+	identityIndex := newCodexAuthIdentityIndex(inventory)
+	for i := range rows {
+		if match, ok := identityIndex.match(rows[i]); ok {
+			rows[i].AuthSourceKind = normalizeAuthSourceKind(match.AuthSourceKind)
+			continue
+		}
+		rows[i].AuthSourceKind = inferInvalidAuthSourceKind(rows[i])
+	}
+	return rows
+}
+
+func inferInvalidAuthSourceKind(row invalidAuthRow) string {
+	if kind := strings.ToLower(strings.TrimSpace(row.AuthSourceKind)); kind == authSourceKindFile || kind == authSourceKindRuntimeOnly {
+		return kind
+	}
+	return authSourceKindLegacy
 }
 
 func providerRecentLimit(limit int) int {
@@ -1081,6 +1097,7 @@ type accountRow struct {
 	InvalidAuth                     bool     `json:"invalid_auth,omitempty"`
 	InvalidAuthAt                   string   `json:"invalid_auth_at,omitempty"`
 	InvalidAuthReason               string   `json:"invalid_auth_reason,omitempty"`
+	InvalidAuthStatusCode           int      `json:"invalid_auth_status_code,omitempty"`
 	WorkspaceDeactivated            bool     `json:"workspace_deactivated,omitempty"`
 	WorkspaceDeactivatedAt          string   `json:"workspace_deactivated_at,omitempty"`
 	WorkspaceDeactivatedReason      string   `json:"workspace_deactivated_reason,omitempty"`
@@ -1166,6 +1183,7 @@ type configuredAccount struct {
 	Name               string
 	AuthFile           string
 	AuthFileMTime      int64
+	AuthSourceKind     string
 	Disabled           bool
 	Expired            bool
 	PlanType           string
@@ -1207,6 +1225,7 @@ type quotaTriggerRun struct {
 	SecondaryUsedTokens  *int64
 	SecondaryRemaining   *int64
 	SecondaryLimit       *int64
+	ResponseHeaders      map[string][]string
 }
 
 type quotaTriggerAccountStatus struct {
@@ -1367,6 +1386,7 @@ type invalidAuthRow struct {
 	LastStatusCode    int    `json:"last_status_code"`
 	AuthFile          string `json:"auth_file,omitempty"`
 	AuthFileMTime     int64  `json:"auth_file_mtime,omitempty"`
+	AuthSourceKind    string `json:"auth_source_kind"`
 }
 
 type externalUseAlert struct {
@@ -1600,20 +1620,21 @@ func readConfiguredAuthFiles() []configuredAccount {
 			xaiTier = classifyXAITierDocument(doc)
 		}
 		out = append(out, configuredAccount{
-			AuthIndex:     authFile,
-			AuthID:        email,
-			Source:        source,
-			Provider:      firstNonEmptyString(authType, "codex"),
-			Email:         email,
-			Name:          name,
-			AuthFile:      authFile,
-			AuthFileMTime: info.ModTime().Unix(),
-			Disabled:      boolFromAny(doc["disabled"]),
-			Expired:       boolFromAny(doc["expired"]),
-			PlanType:      firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
-			XAITier:       xaiTier.Tier,
-			XAITierSource: xaiTier.Source,
-			XAITierDetail: xaiTier.Detail,
+			AuthIndex:      authFile,
+			AuthID:         email,
+			Source:         source,
+			Provider:       firstNonEmptyString(authType, "codex"),
+			Email:          email,
+			Name:           name,
+			AuthFile:       authFile,
+			AuthFileMTime:  info.ModTime().Unix(),
+			AuthSourceKind: authSourceKindFile,
+			Disabled:       boolFromAny(doc["disabled"]),
+			Expired:        boolFromAny(doc["expired"]),
+			PlanType:       firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
+			XAITier:        xaiTier.Tier,
+			XAITierSource:  xaiTier.Source,
+			XAITierDetail:  xaiTier.Detail,
 			AccessToken: firstNonEmptyString(
 				stringFromAny(doc["access_token"]),
 				stringFromAny(doc["accessToken"]),
@@ -1734,7 +1755,7 @@ func resolveConfiguredAuthDir(path string) string {
 	if !strings.HasPrefix(path, "~") {
 		return filepath.Clean(path)
 	}
-	home, err := os.UserHomeDir()
+	home, err := currentUserHomeDir()
 	if err != nil {
 		return ""
 	}
@@ -1744,21 +1765,6 @@ func resolveConfiguredAuthDir(path string) string {
 	}
 	remainder = strings.ReplaceAll(remainder, "\\", "/")
 	return filepath.Clean(filepath.Join(home, filepath.FromSlash(remainder)))
-}
-
-func configuredConfigPath() string {
-	if path := strings.TrimSpace(os.Getenv("CPA_CONFIG_PATH")); path != "" {
-		return path
-	}
-	if path := strings.TrimSpace(os.Getenv("CPA_CONFIG_FILE")); path != "" {
-		return path
-	}
-	for _, path := range []string{"/root/config.yaml", "/root/.cli-proxy-api/config.yaml"} {
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-	return "/root/config.yaml"
 }
 
 func readConfiguredProviderNames() []string {
@@ -3015,47 +3021,20 @@ func applyInvalidAuths(accounts []accountRow, invalids []invalidAuthRow) {
 	if len(invalids) == 0 || len(accounts) == 0 {
 		return
 	}
-	index := make(map[string]int, len(accounts)*4)
-	strictIndex := make(map[string]int, len(accounts)*2)
+	inventory := make([]configuredAccount, len(accounts))
 	for i := range accounts {
-		for _, alias := range accountAliases(accounts[i]) {
-			if alias != "" {
-				index[alias] = i
-			}
-		}
-		for _, alias := range normalizeAccountAliases(accounts[i].AuthFile, accounts[i].AuthIndex) {
-			if alias != "" {
-				if _, exists := strictIndex[alias]; !exists {
-					strictIndex[alias] = i
-				}
-			}
+		inventory[i] = configuredAccount{
+			AuthID:    accounts[i].AuthID,
+			AuthIndex: accounts[i].AuthIndex,
+			AuthFile:  accounts[i].AuthFile,
+			Source:    accounts[i].Source,
+			Email:     accounts[i].Email,
 		}
 	}
+	identityIndex := newCodexAuthIdentityIndex(inventory)
 	for _, invalid := range invalids {
-		matched := false
-		strictAliases := strictAuthStateAliasesForValues(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
-		for _, alias := range strictAliases {
-			i, ok := strictIndex[alias]
-			if !ok {
-				continue
-			}
+		if i, ok := identityIndex.matchIndex(invalid); ok {
 			applyInvalidAuthToAccount(&accounts[i], invalid)
-			matched = true
-			break
-		}
-		if matched {
-			continue
-		}
-		if len(strictAliases) > 0 {
-			continue
-		}
-		for _, alias := range normalizeAccountAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
-			i, ok := index[alias]
-			if !ok {
-				continue
-			}
-			applyInvalidAuthToAccount(&accounts[i], invalid)
-			break
 		}
 	}
 }
@@ -3072,6 +3051,7 @@ func applyInvalidAuthToAccount(account *accountRow, invalid invalidAuthRow) {
 		account.InvalidAuth = true
 		account.InvalidAuthAt = invalid.InvalidatedAtText
 		account.InvalidAuthReason = invalid.Reason
+		account.InvalidAuthStatusCode = invalid.LastStatusCode
 	}
 }
 
@@ -3088,7 +3068,20 @@ func filterUnauthorizedInvalidAuths(rows []invalidAuthRow) []invalidAuthRow {
 	}
 	out := make([]invalidAuthRow, 0, len(rows))
 	for _, row := range rows {
-		if !invalidAuthIsWorkspaceDeactivated(row) {
+		if row.LastStatusCode == http.StatusUnauthorized {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func filterForbiddenInvalidAuths(rows []invalidAuthRow) []invalidAuthRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]invalidAuthRow, 0, len(rows))
+	for _, row := range rows {
+		if row.LastStatusCode == http.StatusForbidden {
 			out = append(out, row)
 		}
 	}

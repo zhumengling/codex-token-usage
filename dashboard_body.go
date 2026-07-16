@@ -123,7 +123,7 @@ const dashboardBody = `</style>
 </div>
 <div id="invalid-auth-modal" class="modal-backdrop" hidden>
   <div class="modal-panel invalid-auth-panel" role="dialog" aria-modal="true" aria-labelledby="invalid-auth-title">
-    <div class="modal-head"><div class="modal-title-actions"><h2 id="invalid-auth-title">管理 401 失效账号</h2><button id="invalid-auth-delete-all" class="ghost danger-ghost compact-danger" type="button">删除所有 401 账号</button></div><button id="invalid-auth-close" class="icon-button ghost" type="button" aria-label="关闭 401 管理">×</button></div>
+    <div class="modal-head"><div class="modal-title-actions"><h2 id="invalid-auth-title">管理 401 失效账号</h2><button id="invalid-auth-delete-all" class="ghost danger-ghost compact-danger" type="button">处理所有 401 账号</button></div><button id="invalid-auth-close" class="icon-button ghost" type="button" aria-label="关闭 401 管理">×</button></div>
     <div class="modal-body">
       <div class="invalid-auth-toolbar"><span id="invalid-auth-summary">已选 0 / 共 0 个</span><button id="invalid-auth-refresh" class="ghost" type="button">刷新</button></div>
       <div id="invalid-auth-oauth-url" class="modal-note" hidden></div>
@@ -133,7 +133,7 @@ const dashboardBody = `</style>
     </div>
     <div class="modal-actions">
       <button id="invalid-auth-select-page" class="ghost" type="button">全选当前页</button>
-      <button id="invalid-auth-delete-selected" class="ghost danger-ghost" type="button">删除选中</button>
+      <button id="invalid-auth-delete-selected" class="ghost danger-ghost" type="button">处理选中</button>
       <button id="invalid-auth-close-bottom" class="ghost" type="button">关闭</button>
     </div>
   </div>

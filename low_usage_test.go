@@ -216,6 +216,28 @@ summary_precompute_active_window_ttl_seconds: 900
 	}
 }
 
+func TestQuotaTriggerWarningLabelAndConfigCompatibility(t *testing.T) {
+	const warningName = "开启定时额度触发（不建议账号多的情况下开启）"
+	found := false
+	for _, field := range pluginConfigFields() {
+		if field.Name == warningName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("plugin config fields do not contain %q", warningName)
+	}
+	for _, key := range []string{"quota_trigger_enabled", warningName, "开启定时额度触发"} {
+		cfg := defaultPluginConfig()
+		cfg.QuotaTriggerEnabled = false
+		cfg = parsePluginConfigYAML([]byte(key+": true\n"), cfg)
+		if !cfg.QuotaTriggerEnabled {
+			t.Fatalf("quota trigger config key %q was not accepted", key)
+		}
+	}
+}
+
 func TestConfiguredAuthFilesCacheInvalidatesOnFileChange(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CPA_AUTH_DIR", dir)

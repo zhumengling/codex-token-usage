@@ -42,6 +42,12 @@ func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
 	}
 }
 
+func TestCodexPoolDataCarriesForbiddenAuths(t *testing.T) {
+	if !strings.Contains(dashboardScripts, "forbidden_auths:data.forbidden_auths||[]") {
+		t.Fatal("Codex pool data must carry standalone 403 auth records into insights")
+	}
+}
+
 func TestInvalidAuthManagementUsesUnfilteredCountsAndPartialDeleteResults(t *testing.T) {
 	for _, marker := range []string{
 		"const allInvalidRows=",
@@ -66,6 +72,42 @@ func TestNonStandardAuthImportUIUsesPluginHostSaveFlow(t *testing.T) {
 	} {
 		if !strings.Contains(dashboardBody+dashboardScripts, marker) && !strings.Contains(dashboardBody+dashboardScripts+dashboardStyles, marker) {
 			t.Fatalf("auth import UI marker %q not found", marker)
+		}
+	}
+}
+
+func TestInvalidAuthManagementSeparatesSourcesAndResolvesStableIDs(t *testing.T) {
+	for _, marker := range []string{
+		"invalid-auths/resolve",
+		"/v0/management/auth-files/status",
+		"auth_source_kind",
+		"runtime_only",
+		"sameStableAuthIdentity",
+		"Object.freeze(selected.map",
+		"data-invalid-runtime-disable",
+		"file_deleted",
+		"file_absent",
+		"runtime_disabled",
+		"replacement_kept",
+		"invalidAuthFileIdentityChanged",
+		"invalid_auth_status_code",
+		"forbidden_auths",
+		"isCredentialStateBan",
+		"403 拒绝",
+		"renderOpenManagementModals",
+		"原本不存在",
+		"替换文件已保留",
+		"临时禁用",
+		"已经解除",
+		"不可处理",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("401 stable cleanup marker %q not found", marker)
+		}
+	}
+	for _, marker := range []string{"处理所有 401 账号", "处理选中"} {
+		if !strings.Contains(dashboardBody, marker) {
+			t.Fatalf("401 management UI marker %q not found", marker)
 		}
 	}
 }

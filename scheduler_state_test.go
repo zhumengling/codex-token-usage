@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -100,6 +103,14 @@ func TestSchedulerStateRefreshDoesNotOverwriteConcurrentRestriction(t *testing.T
 }
 
 func TestCodexRestrictionWritesMarkSchedulerState(t *testing.T) {
+	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+			ID: "invalid-account", AuthIndex: "invalid-index", Name: "invalid-account.json", Provider: "codex",
+		}}})
+	})
 	resetSchedulerStateForTest()
 	t.Cleanup(resetSchedulerStateForTest)
 	s := newTestStore(t)
@@ -112,6 +123,7 @@ func TestCodexRestrictionWritesMarkSchedulerState(t *testing.T) {
 	if err := recordInvalidAuthIfNeeded(context.Background(), db, usageRecord{
 		Provider:    "codex",
 		AuthID:      "invalid-account",
+		AuthIndex:   "invalid-index",
 		RequestedAt: time.Now(),
 	}, http.StatusUnauthorized); err != nil {
 		t.Fatal(err)
@@ -136,8 +148,25 @@ func TestCodexRestrictionWritesMarkSchedulerState(t *testing.T) {
 }
 
 func TestQuotaProbeRestrictionWritesMarkSchedulerState(t *testing.T) {
-	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
+	tests := []struct {
+		status int
+		runs   int
+	}{
+		{status: http.StatusUnauthorized, runs: 1},
+		{status: http.StatusPaymentRequired, runs: 1},
+		{status: http.StatusForbidden, runs: forbiddenInvalidAuthThreshold},
+		{status: http.StatusTooManyRequests, runs: 1},
+	}
+	for _, test := range tests {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
+				if method != "host.auth.list" {
+					return nil, os.ErrNotExist
+				}
+				return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+					ID: "probe-account", AuthIndex: "stable-probe-index", Name: "probe-account.json", Provider: "codex", Source: "file",
+				}}})
+			})
 			resetSchedulerStateForTest()
 			t.Cleanup(resetSchedulerStateForTest)
 			s := newTestStore(t)
@@ -147,7 +176,14 @@ func TestQuotaProbeRestrictionWritesMarkSchedulerState(t *testing.T) {
 			}
 
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(status)
+				if test.status == http.StatusTooManyRequests {
+					w.Header().Set("x-codex-primary-reset-at", "4102444800")
+					w.Header().Set("x-codex-primary-window-minutes", "300")
+				}
+				w.WriteHeader(test.status)
+				if test.status == http.StatusPaymentRequired {
+					_, _ = w.Write([]byte(`{"error":{"code":"payment_required"}}`))
+				}
 			}))
 			t.Cleanup(server.Close)
 			codexResponsesURLOverrideForTest = server.URL
@@ -155,20 +191,179 @@ func TestQuotaProbeRestrictionWritesMarkSchedulerState(t *testing.T) {
 
 			globalSchedulerState.setRestricted("codex", false)
 			cfg := defaultPluginConfig()
-			run := executeQuotaProbeRequest(context.Background(), db, triggerAuthAccount{
-				configuredAccount: configuredAccount{
-					AuthID:    "probe-account",
-					AuthIndex: "probe-account.json",
-					Provider:  "codex",
-					Source:    "probe@example.com",
-				},
-				AccessToken: "test-token",
-			}, cfg)
-			if run.HTTPStatus != status {
-				t.Fatalf("HTTP status=%d, want %d", run.HTTPStatus, status)
+			for i := 0; i < test.runs; i++ {
+				run := executeQuotaProbeRequest(context.Background(), db, triggerAuthAccount{
+					configuredAccount: configuredAccount{
+						AuthID:    "probe-account",
+						AuthIndex: "probe-account.json",
+						Provider:  "codex",
+						Source:    "probe@example.com",
+					},
+					AccessToken: "test-token",
+				}, cfg)
+				if run.HTTPStatus != test.status {
+					t.Fatalf("HTTP status=%d, want %d", run.HTTPStatus, test.status)
+				}
+				if err := recordQuotaTriggerRun(context.Background(), db, run); err != nil {
+					t.Fatal(err)
+				}
+				if err := applyQuotaTriggerAccountState(context.Background(), db, run); err != nil {
+					t.Fatal(err)
+				}
+				if test.status == http.StatusForbidden && i+1 < forbiddenInvalidAuthThreshold && globalSchedulerState.needsDatabase("codex", false) {
+					t.Fatalf("403 probe restricted scheduler after only %d failures", i+1)
+				}
 			}
 			if !globalSchedulerState.needsDatabase("codex", false) {
-				t.Fatalf("quota probe %d write did not restrict the scheduler cache", status)
+				t.Fatalf("quota probe %d write did not restrict the scheduler cache", test.status)
+			}
+			var storedStatus int
+			query := `SELECT last_status_code FROM invalid_auths WHERE active=1 AND auth_id='probe-account'`
+			if test.status == http.StatusTooManyRequests {
+				var resetAt int64
+				var window string
+				if err := db.QueryRow(`SELECT last_status_code,reset_at,window FROM autoban_bans WHERE active=1 AND auth_id='probe-account'`).Scan(&storedStatus, &resetAt, &window); err != nil {
+					t.Fatal(err)
+				}
+				if resetAt != 4102444800 || window != "5h" {
+					t.Fatalf("429 ban reset/window=%d/%q, want 4102444800/5h", resetAt, window)
+				}
+			} else if err := db.QueryRow(query).Scan(&storedStatus); err != nil {
+				t.Fatal(err)
+			}
+			if storedStatus != test.status {
+				t.Fatalf("stored status=%d, want %d", storedStatus, test.status)
+			}
+			bans, err := queryActiveAutobans(context.Background(), db, time.Now().Unix())
+			if err != nil {
+				t.Fatal(err)
+			}
+			invalids, err := queryActiveInvalidAuths(context.Background(), db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			available, filtered, _, _, _ := filterCodexSchedulerCandidates([]schedulerAuthCandidate{
+				{ID: "probe-account", Provider: "codex", Priority: 1, Attributes: map[string]string{
+					"auth_index": "probe-account.json",
+					"auth_file":  "probe-account.json",
+				}},
+				{ID: "healthy-account", Provider: "codex", Priority: 1},
+			}, bans, invalids)
+			if !filtered || len(available) != 1 || available[0].ID != "healthy-account" {
+				t.Fatalf("filtered=%v available=%+v, want only healthy-account", filtered, available)
+			}
+		})
+	}
+}
+
+func TestSuccessfulQuotaProbeClearsRecoveredRestriction(t *testing.T) {
+	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+			ID: "probe-account", AuthIndex: "stable-probe-index", Name: "probe-account.json", Provider: "codex", Source: "file",
+		}}})
+	})
+	resetSchedulerStateForTest()
+	t.Cleanup(resetSchedulerStateForTest)
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordInvalidAuthIfNeeded(context.Background(), db, usageRecord{
+		Provider: "codex", AuthID: "probe-account", AuthIndex: "probe-account.json", RequestedAt: time.Now(),
+	}, http.StatusUnauthorized); err != nil {
+		t.Fatal(err)
+	}
+	run := quotaTriggerRun{
+		AuthID: "probe-account", AuthIndex: "probe-account.json", AuthFile: "probe-account.json", Provider: "codex", Status: "success", HTTPStatus: http.StatusOK,
+		StartedAt: time.Now().Unix(), FinishedAt: time.Now().Unix(),
+	}
+	if err := recordQuotaTriggerRun(context.Background(), db, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyQuotaTriggerAccountState(context.Background(), db, run); err != nil {
+		t.Fatal(err)
+	}
+	var active int
+	if err := db.QueryRow(`SELECT active FROM invalid_auths WHERE auth_id='probe-account'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("successful quota probe left invalid auth active=%d", active)
+	}
+	limited := quotaTriggerRun{
+		AuthID: "probe-account", AuthIndex: "probe-account.json", AuthFile: "probe-account.json", Provider: "codex", Status: "failed", HTTPStatus: http.StatusTooManyRequests,
+		StartedAt: time.Now().Unix(), FinishedAt: time.Now().Unix(),
+	}
+	if err := recordQuotaTriggerRun(context.Background(), db, limited); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyQuotaTriggerAccountState(context.Background(), db, limited); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordQuotaTriggerRun(context.Background(), db, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyQuotaTriggerAccountState(context.Background(), db, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT active FROM autoban_bans WHERE auth_id='probe-account'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("successful quota probe left 429 autoban active=%d", active)
+	}
+}
+
+func TestQuotaProbeRechecksInvalidAccountsDespiteFullQuotaSnapshot(t *testing.T) {
+	authFile := "probe-account.json"
+	for _, status := range []int{http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			s := newTestStore(t)
+			authDir := os.Getenv("CPA_AUTH_DIR")
+			if err := os.MkdirAll(authDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(authDir, authFile), []byte(`{
+  "type": "codex",
+  "email": "probe@example.com",
+  "access_token": "test-token"
+}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			db, _, err := s.open(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().Unix()
+			if _, err := db.Exec(`
+INSERT INTO invalid_auths (
+  auth_id, auth_index, source, provider, reason, invalidated_at, active,
+  last_status_code, auth_file, auth_source_kind
+) VALUES (?, ?, ?, 'codex', 'probe status', ?, 1, ?, ?, ?)`,
+				"probe@example.com", authFile, "probe@example.com", now-7200, status, authFile, authSourceKindFile,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`
+INSERT INTO quota_trigger_runs (
+  auth_id, auth_index, source, provider, auth_file, mode, status, http_status,
+  started_at, finished_at, primary_used_percent, primary_reset_at
+) VALUES (?, ?, ?, 'codex', ?, 'probe', 'success', 200, ?, ?, 100, ?)`,
+				"probe@example.com", authFile, "probe@example.com", authFile, now-7200, now-7200, now+3600,
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			candidates, skipped, err := selectQuotaTriggerCandidates(context.Background(), db, defaultPluginConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if skipped != 0 || len(candidates) != 1 || candidates[0].AuthFile != authFile {
+				t.Fatalf("status=%d skipped=%d candidates=%+v, want one health-recheck candidate", status, skipped, candidates)
 			}
 		})
 	}

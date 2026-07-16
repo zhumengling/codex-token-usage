@@ -1,6 +1,10 @@
 package main
 
-import "errors"
+import (
+	"context"
+	"database/sql"
+	"errors"
+)
 
 var errNoRows = errors.New("no rows")
 
@@ -130,7 +134,8 @@ CREATE TABLE IF NOT EXISTS invalid_auths (
   active INTEGER NOT NULL DEFAULT 1,
   last_status_code INTEGER NOT NULL DEFAULT 401,
   auth_file TEXT NOT NULL DEFAULT '',
-  auth_file_mtime INTEGER NOT NULL DEFAULT 0
+  auth_file_mtime INTEGER NOT NULL DEFAULT 0,
+  auth_source_kind TEXT NOT NULL DEFAULT 'legacy'
 );
 CREATE INDEX IF NOT EXISTS idx_invalid_auths_active ON invalid_auths(active);
 CREATE TABLE IF NOT EXISTS quota_trigger_runs (
@@ -170,3 +175,51 @@ INSERT INTO usage_events (
   cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
   primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+func ensureInvalidAuthColumns(ctx context.Context, db *sql.DB) error {
+	existing := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(invalid_auths)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !existing["auth_source_kind"] {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE invalid_auths ADD COLUMN auth_source_kind TEXT NOT NULL DEFAULT 'legacy'`); err != nil {
+			return err
+		}
+	}
+	if _, err := db.ExecContext(ctx, `
+UPDATE invalid_auths
+SET auth_source_kind = CASE lower(trim(auth_source_kind))
+  WHEN 'file' THEN 'file'
+  WHEN 'runtime_only' THEN 'runtime_only'
+  ELSE 'legacy'
+END
+WHERE auth_source_kind <> CASE lower(trim(auth_source_kind))
+  WHEN 'file' THEN 'file'
+  WHEN 'runtime_only' THEN 'runtime_only'
+  ELSE 'legacy'
+END`); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_invalid_auths_source_kind_active ON invalid_auths(auth_source_kind, active)`)
+	return err
+}

@@ -36,14 +36,6 @@ type modelPriceUpdateManager struct {
 	state  modelPriceUpdateState
 }
 
-func modelPriceFilePath() string {
-	path := strings.TrimSpace(os.Getenv("CPA_MODEL_PRICE_FILE"))
-	if path == "" {
-		path = "/root/plugins/codex-token-usage/model_prices.json"
-	}
-	return path
-}
-
 func (m *modelPriceUpdateManager) configure(cfg pluginConfig) {
 	m.mu.Lock()
 	if m.cancel != nil {

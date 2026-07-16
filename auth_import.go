@@ -20,25 +20,25 @@ type authImportRequest struct {
 }
 
 type authImportItem struct {
-	Index           int      `json:"index"`
-	SourceFormat    string   `json:"source_format"`
-	FileName        string   `json:"file_name"`
-	Email           string   `json:"email,omitempty"`
-	PlanType        string   `json:"plan_type,omitempty"`
-	ExpiresAt       string   `json:"expires_at,omitempty"`
-	HasRefreshToken bool     `json:"has_refresh_token"`
-	Existing        bool     `json:"existing,omitempty"`
-	Warnings        []string `json:"warnings,omitempty"`
+	Index           int            `json:"index"`
+	SourceFormat    string         `json:"source_format"`
+	FileName        string         `json:"file_name"`
+	Email           string         `json:"email,omitempty"`
+	PlanType        string         `json:"plan_type,omitempty"`
+	ExpiresAt       string         `json:"expires_at,omitempty"`
+	HasRefreshToken bool           `json:"has_refresh_token"`
+	Existing        bool           `json:"existing,omitempty"`
+	Warnings        []string       `json:"warnings,omitempty"`
 	AuthJSON        map[string]any `json:"-"`
 }
 
 type authImportResult struct {
-	Detected  int              `json:"detected"`
-	Imported  int              `json:"imported,omitempty"`
-	Skipped   int              `json:"skipped"`
-	Failed    int              `json:"failed,omitempty"`
-	Items     []authImportItem `json:"items"`
-	Errors    []string         `json:"errors,omitempty"`
+	Detected int              `json:"detected"`
+	Imported int              `json:"imported,omitempty"`
+	Skipped  int              `json:"skipped"`
+	Failed   int              `json:"failed,omitempty"`
+	Items    []authImportItem `json:"items"`
+	Errors   []string         `json:"errors,omitempty"`
 }
 
 func handleAuthImportPreview(raw []byte) managementResponse {
