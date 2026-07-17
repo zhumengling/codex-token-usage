@@ -161,12 +161,75 @@ CREATE TABLE IF NOT EXISTS quota_trigger_runs (
   primary_limit_tokens INTEGER,
   secondary_used_tokens INTEGER,
   secondary_remaining_tokens INTEGER,
-  secondary_limit_tokens INTEGER
+  secondary_limit_tokens INTEGER,
+  primary_window_presence TEXT NOT NULL DEFAULT '',
+  primary_limit_window_seconds INTEGER,
+  primary_reset_after_seconds INTEGER,
+  secondary_window_presence TEXT NOT NULL DEFAULT '',
+  secondary_limit_window_seconds INTEGER,
+  secondary_reset_after_seconds INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_account ON quota_trigger_runs(auth_index, auth_id, source, auth_file, finished_at);
 CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_finished_at ON quota_trigger_runs(finished_at);
 CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_status_finished ON quota_trigger_runs(status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_quota_trigger_runs_auth_file_finished ON quota_trigger_runs(auth_file, finished_at);
+CREATE TABLE IF NOT EXISTS quota_activation_jobs (
+  job_id TEXT PRIMARY KEY,
+  job_type TEXT NOT NULL,
+  state TEXT NOT NULL,
+  force INTEGER NOT NULL DEFAULT 0,
+  source_preview_id TEXT NOT NULL DEFAULT '',
+  inventory_revision TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  confirmation_digest TEXT NOT NULL DEFAULT '',
+  confirmation_consumed_at INTEGER NOT NULL DEFAULT 0,
+  total_accounts INTEGER NOT NULL DEFAULT 0,
+  completed_accounts INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_quota_activation_jobs_state ON quota_activation_jobs(job_type, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_quota_activation_jobs_expiry ON quota_activation_jobs(expires_at);
+CREATE TABLE IF NOT EXISTS quota_activation_job_accounts (
+  job_id TEXT NOT NULL,
+  account_key TEXT NOT NULL,
+  auth_id TEXT NOT NULL DEFAULT '',
+  auth_index TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  auth_file TEXT NOT NULL DEFAULT '',
+  auth_file_mtime INTEGER NOT NULL DEFAULT 0,
+  plan_type TEXT NOT NULL DEFAULT '',
+  inventory_fingerprint TEXT NOT NULL DEFAULT '',
+  eligible INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  http_status INTEGER NOT NULL DEFAULT 0,
+  cycle_key TEXT NOT NULL DEFAULT '',
+  before_quota_json TEXT NOT NULL DEFAULT '',
+  after_quota_json TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  started_at INTEGER NOT NULL DEFAULT 0,
+  finished_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(job_id, account_key),
+  FOREIGN KEY(job_id) REFERENCES quota_activation_jobs(job_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_quota_activation_accounts_job_status ON quota_activation_job_accounts(job_id, status);
+CREATE INDEX IF NOT EXISTS idx_quota_activation_accounts_auth ON quota_activation_job_accounts(auth_index, auth_id, auth_file);
+CREATE TABLE IF NOT EXISTS quota_activation_cycles (
+  account_key TEXT NOT NULL,
+  cycle_key TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reserved_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  next_cycle_after INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(account_key, cycle_key)
+);
+CREATE INDEX IF NOT EXISTS idx_quota_activation_cycles_updated ON quota_activation_cycles(updated_at);
 `
 
 const insertSQL = `
@@ -176,6 +239,37 @@ INSERT INTO usage_events (
   cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
   primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+func ensureQuotaActivationColumns(ctx context.Context, db *sql.DB) error {
+	existing := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(quota_activation_cycles)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !existing["next_cycle_after"] {
+		_, err = db.ExecContext(ctx, `ALTER TABLE quota_activation_cycles ADD COLUMN next_cycle_after INTEGER NOT NULL DEFAULT 0`)
+	}
+	return err
+}
 
 func ensureInvalidAuthColumns(ctx context.Context, db *sql.DB) error {
 	existing := map[string]bool{}

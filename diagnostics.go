@@ -212,6 +212,10 @@ func (r *retentionCleaner) run(ctx context.Context, cfg pluginConfig) {
 		r.record(err, usageDeleted, triggerDeleted, before, databaseFileSize(path))
 		return
 	}
+	if _, err := pruneQuotaActivationState(ctx, db, triggerCutoff); err != nil {
+		r.record(err, usageDeleted, triggerDeleted, before, databaseFileSize(path))
+		return
+	}
 	r.record(nil, usageDeleted, triggerDeleted, before, databaseFileSize(path))
 }
 

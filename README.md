@@ -11,7 +11,8 @@ Current version: `0.1.38`
 - Codex 429 auto-ban support with `reset_at` based recovery.
 - 401 invalid-auth protection until the auth JSON file is replaced or removed.
 - Suspicious external quota consumption detection for shared or resold accounts.
-- Optional Codex quota trigger that sends a tiny real Codex request to refresh/start the 5h quota window.
+- Optional periodic Codex quota trigger that sends a tiny real Codex request to refresh/start server-reported quota windows.
+- Authenticated Management UI/API workflow for previewing and activating fresh Codex quota windows exactly once per observed account cycle.
 - Runtime diagnostics and local alerts are exposed in summary JSON for troubleshooting and plugin-store validation.
 - CSV / JSON export support; the dashboard exposes account export buttons and the backend can export accounts, providers, models, and recent requests.
 - Built-in price fallbacks plus automatic LiteLLM model price updates.
@@ -115,6 +116,37 @@ account_protection_reservation_ttl_seconds: 900
 ```
 
 Quota trigger defaults to off and is not recommended for large account pools. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. Probe results are account-health inputs: 401 and 402 update invalid-auth state, 403 follows the same repeated-failure threshold as normal traffic, 429 creates an auto-ban, and a successful probe clears recovered state. Accounts already restricted by 401, 402, 403, or 429 remain eligible for health rechecks after the configured cooldown, including when an older quota snapshot is still full. The legacy Chinese key `开启定时额度触发` and the legacy `quota` mode remain accepted for compatibility.
+
+## One-shot quota-window activation
+
+The dashboard action **Activate quota windows once** is independent of the periodic trigger and works while `quota_trigger_enabled` remains `false`:
+
+1. Preview reads quota without model generation and lists every exact Codex auth record separately, including multiple seats with the same email.
+2. The default decision requires an enabled, unexpired Codex credential with at least one explicitly reported quota window and every reported window completely fresh. An explicitly `null` window is absent and does not block another valid reported window; omitted presence, zero reported windows, contradictory values, positive usage/tokens, or a countdown shorter than the server-reported duration are not fresh eligibility.
+3. Window names are opaque API slots, not duration promises: the UI shows each window's server-reported `limit_window_seconds`, `reset_after_seconds`, presence, usage, and reset time. For example, an account may report a seven-day `primary_window` and an explicitly null `secondary_window`.
+4. After explicit acknowledgement, a confirmed run revalidates the exact auth identity and quota, reserves a stable cycle key, and sends one fixed compact Codex request per selected account. A fresh full-duration window's moving `reset_at` is not part of that key. A later fresh cycle becomes distinct only after a prior post-send snapshot supplied a valid window boundary and that boundary has passed; an ambiguous send without such evidence stays blocked rather than risking a duplicate.
+5. The result reports `verified`, `partial`, `failed_before_send`, `sent_unknown`, or an explainable skip. Verification requires positive usage/tokens or a full-duration-to-shorter-countdown transition for every reported target window. Reset-time movement alone is not evidence, explicitly absent windows do not force `partial`, and ambiguous or partially verified sends are never retried automatically.
+
+The request is the smallest fixed request currently used by this plugin; it is a real request and can consume a small amount of quota. The API does not enforce an exact one-token output, so this feature makes no exact-token-cost claim. Force recovery mode bypasses only the fresh-window decision and requires explicit auth indexes; it never bypasses disabled, expired, provider, identity, credential, unknown-presence, zero-window, contradictory-quota, or quota-read safety checks.
+
+Management routes (all protected by CPA Management authentication) are:
+
+```text
+POST /v0/management/plugins/codex-token-usage/quota-activation/preview
+GET  /v0/management/plugins/codex-token-usage/quota-activation/preview?id=<preview-id>
+POST /v0/management/plugins/codex-token-usage/quota-activation/run
+GET  /v0/management/plugins/codex-token-usage/quota-activation/run?id=<run-id>
+```
+
+Example preview body:
+
+```json
+{"force": false, "auth_indexes": []}
+```
+
+A completed preview returns a short-lived one-time confirmation token. Pass that token, the preview ID, and an explicit subset of preview-eligible auth indexes to the run endpoint. Preview/run state and cycle reservations are persisted in the plugin SQLite database. Credentials, internal auth IDs/file names, authorization headers, cookies, and raw upstream bodies are not returned; credentials, headers, cookies, and raw bodies are not persisted. A periodic trigger round and a one-shot run share an exclusion gate and cannot dispatch concurrently.
+
+Rollback is local: disable/remove this plugin and restart CPA if required. This stops future actions but cannot undo a successful upstream request or its intended quota-window effect.
 
 ## Model Price Table
 

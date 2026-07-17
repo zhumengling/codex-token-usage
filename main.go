@@ -64,6 +64,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -384,6 +385,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	globalQuotaActivation.stop()
 	globalQuotaTrigger.stop()
 	globalModelPriceUpdater.stop()
 	globalRetentionCleaner.stop()
@@ -464,6 +466,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: "POST", Path: "/plugins/codex-token-usage/invalid-auths/resolve", Description: "Resolve deleted, replaced, or runtime-disabled Codex 401 records."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/preview", Description: "Preview non-standard Codex auth JSON imports."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/commit", Description: "Convert and save non-standard Codex auth JSON imports."},
+				{Method: "POST", Path: "/plugins/codex-token-usage/quota-activation/preview", Description: "Preview one-shot Codex quota-window activation eligibility."},
+				{Method: "GET", Path: "/plugins/codex-token-usage/quota-activation/preview", Description: "Poll a quota activation preview."},
+				{Method: "POST", Path: "/plugins/codex-token-usage/quota-activation/run", Description: "Run one confirmed Codex quota-window activation."},
+				{Method: "GET", Path: "/plugins/codex-token-usage/quota-activation/run", Description: "Poll a one-shot quota activation run."},
 			},
 			Resources: []resourceRoute{
 				{Path: "/dashboard", Menu: "Token Usage", Description: "Account token usage dashboard."},
@@ -552,6 +558,9 @@ func pluginConfigFields() []configField {
 }
 
 func handleManagement(req managementRequest) managementResponse {
+	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/quota-activation/") {
+		return handleQuotaActivationManagement(req)
+	}
 	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/dashboard") {
 		return managementResponse{
 			StatusCode: http.StatusOK,
@@ -1035,6 +1044,7 @@ func configurePlugin(request []byte) error {
 		globalSchedulerAffinity.reset()
 	}
 	globalAccountProtection.configure(cfg)
+	globalQuotaActivation.configure(cfg)
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
 	globalRetentionCleaner.configure(cfg)
@@ -1359,6 +1369,9 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if err := ensureQuotaTriggerRunColumns(ctx, db); err != nil {
+		return err
+	}
+	if err := ensureQuotaActivationColumns(ctx, db); err != nil {
 		return err
 	}
 	if err := ensureAutobanBanColumns(ctx, db); err != nil {
@@ -1949,6 +1962,12 @@ func ensureQuotaTriggerRunColumns(ctx context.Context, db *sql.DB) error {
 		{"secondary_used_tokens", "INTEGER"},
 		{"secondary_remaining_tokens", "INTEGER"},
 		{"secondary_limit_tokens", "INTEGER"},
+		{"primary_window_presence", "TEXT NOT NULL DEFAULT ''"},
+		{"primary_limit_window_seconds", "INTEGER"},
+		{"primary_reset_after_seconds", "INTEGER"},
+		{"secondary_window_presence", "TEXT NOT NULL DEFAULT ''"},
+		{"secondary_limit_window_seconds", "INTEGER"},
+		{"secondary_reset_after_seconds", "INTEGER"},
 		{"auth_file_mtime", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	existing := map[string]bool{}
@@ -2235,6 +2254,15 @@ func (m *quotaTriggerManager) runRound(ctx context.Context, cfg pluginConfig) {
 	m.state.LastRunStartedAt = started.Format(time.RFC3339)
 	m.state.LastError = ""
 	m.mu.Unlock()
+
+	if !tryAcquireQuotaProbeGate() {
+		m.mu.Lock()
+		m.state.LastRunAt = time.Now().Format(time.RFC3339)
+		m.state.LastError = "one-shot quota activation is running"
+		m.mu.Unlock()
+		return
+	}
+	defer releaseQuotaProbeGate()
 
 	success, failed, skipped, candidates, err := globalStore.runQuotaTriggerRound(ctx, cfg)
 
@@ -3266,16 +3294,7 @@ func executeQuotaProbeRequest(ctx context.Context, _ *sql.DB, account triggerAut
 	run.HTTPStatus = resp.StatusCode
 	responseHeaders := cloneHeaders(resp.Header)
 	mergeCodexQuotaPayload(responseHeaders, respBody)
-	run.PrimaryUsedPercent = headerFloat(responseHeaders, "x-codex-primary-used-percent")
-	run.PrimaryResetAt = headerInt(responseHeaders, "x-codex-primary-reset-at")
-	run.SecondaryUsedPercent = headerFloat(responseHeaders, "x-codex-secondary-used-percent")
-	run.SecondaryResetAt = headerInt(responseHeaders, "x-codex-secondary-reset-at")
-	run.PrimaryUsedTokens = headerInt(responseHeaders, "x-codex-primary-used-tokens")
-	run.PrimaryRemaining = headerInt(responseHeaders, "x-codex-primary-remaining-tokens")
-	run.PrimaryLimit = headerInt(responseHeaders, "x-codex-primary-limit-tokens")
-	run.SecondaryUsedTokens = headerInt(responseHeaders, "x-codex-secondary-used-tokens")
-	run.SecondaryRemaining = headerInt(responseHeaders, "x-codex-secondary-remaining-tokens")
-	run.SecondaryLimit = headerInt(responseHeaders, "x-codex-secondary-limit-tokens")
+	populateQuotaTriggerRunWindows(&run, responseHeaders)
 	run.ResponseHeaders = responseHeaders
 	run.FinishedAt = time.Now().Unix()
 
@@ -3414,16 +3433,7 @@ func executeQuotaUsageRequest(ctx context.Context, _ *sql.DB, account triggerAut
 	headers := cloneHeaders(resp.Header)
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	mergeCodexQuotaPayload(headers, body)
-	run.PrimaryUsedPercent = headerFloat(headers, "x-codex-primary-used-percent")
-	run.PrimaryResetAt = headerInt(headers, "x-codex-primary-reset-at")
-	run.SecondaryUsedPercent = headerFloat(headers, "x-codex-secondary-used-percent")
-	run.SecondaryResetAt = headerInt(headers, "x-codex-secondary-reset-at")
-	run.PrimaryUsedTokens = headerInt(headers, "x-codex-primary-used-tokens")
-	run.PrimaryRemaining = headerInt(headers, "x-codex-primary-remaining-tokens")
-	run.PrimaryLimit = headerInt(headers, "x-codex-primary-limit-tokens")
-	run.SecondaryUsedTokens = headerInt(headers, "x-codex-secondary-used-tokens")
-	run.SecondaryRemaining = headerInt(headers, "x-codex-secondary-remaining-tokens")
-	run.SecondaryLimit = headerInt(headers, "x-codex-secondary-limit-tokens")
+	populateQuotaTriggerRunWindows(&run, headers)
 	run.ResponseHeaders = headers
 	run.FinishedAt = time.Now().Unix()
 
@@ -3450,6 +3460,28 @@ func executeQuotaUsageRequest(ctx context.Context, _ *sql.DB, account triggerAut
 	return run
 }
 
+func populateQuotaTriggerRunWindows(run *quotaTriggerRun, headers map[string][]string) {
+	if run == nil {
+		return
+	}
+	run.PrimaryUsedPercent = headerFloat(headers, "x-codex-primary-used-percent")
+	run.PrimaryResetAt = headerInt(headers, "x-codex-primary-reset-at")
+	run.SecondaryUsedPercent = headerFloat(headers, "x-codex-secondary-used-percent")
+	run.SecondaryResetAt = headerInt(headers, "x-codex-secondary-reset-at")
+	run.PrimaryUsedTokens = headerInt(headers, "x-codex-primary-used-tokens")
+	run.PrimaryRemaining = headerInt(headers, "x-codex-primary-remaining-tokens")
+	run.PrimaryLimit = headerInt(headers, "x-codex-primary-limit-tokens")
+	run.PrimaryWindowPresence = parseQuotaWindowPresence(headerValue(headers, "x-codex-primary-window-presence"))
+	run.PrimaryLimitWindowSeconds = headerInt(headers, "x-codex-primary-limit-window-seconds")
+	run.PrimaryResetAfterSeconds = headerInt(headers, "x-codex-primary-reset-after-seconds")
+	run.SecondaryUsedTokens = headerInt(headers, "x-codex-secondary-used-tokens")
+	run.SecondaryRemaining = headerInt(headers, "x-codex-secondary-remaining-tokens")
+	run.SecondaryLimit = headerInt(headers, "x-codex-secondary-limit-tokens")
+	run.SecondaryWindowPresence = parseQuotaWindowPresence(headerValue(headers, "x-codex-secondary-window-presence"))
+	run.SecondaryLimitWindowSeconds = headerInt(headers, "x-codex-secondary-limit-window-seconds")
+	run.SecondaryResetAfterSeconds = headerInt(headers, "x-codex-secondary-reset-after-seconds")
+}
+
 func recordQuotaTriggerRun(ctx context.Context, db *sql.DB, run quotaTriggerRun) error {
 	if run.StartedAt <= 0 {
 		run.StartedAt = time.Now().Unix()
@@ -3464,12 +3496,16 @@ INSERT INTO quota_trigger_runs (
   auth_id, auth_index, source, provider, auth_file, auth_file_mtime, mode, status, http_status, error,
   started_at, finished_at, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
   primary_used_tokens, primary_remaining_tokens, primary_limit_tokens,
-  secondary_used_tokens, secondary_remaining_tokens, secondary_limit_tokens
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  secondary_used_tokens, secondary_remaining_tokens, secondary_limit_tokens,
+  primary_window_presence, primary_limit_window_seconds, primary_reset_after_seconds,
+  secondary_window_presence, secondary_limit_window_seconds, secondary_reset_after_seconds
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		trim(run.AuthID), trim(run.AuthIndex), trim(run.Source), trim(run.Provider), trim(run.AuthFile), run.AuthFileMTime,
 		trim(run.Mode), trim(run.Status), run.HTTPStatus, trim(run.Error), run.StartedAt, run.FinishedAt,
 		run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt,
 		run.PrimaryUsedTokens, run.PrimaryRemaining, run.PrimaryLimit, run.SecondaryUsedTokens, run.SecondaryRemaining, run.SecondaryLimit,
+		string(parseQuotaWindowPresence(string(run.PrimaryWindowPresence))), run.PrimaryLimitWindowSeconds, run.PrimaryResetAfterSeconds,
+		string(parseQuotaWindowPresence(string(run.SecondaryWindowPresence))), run.SecondaryLimitWindowSeconds, run.SecondaryResetAfterSeconds,
 	)
 	return err
 }
@@ -3661,29 +3697,165 @@ func mergeCodexQuotaPayload(headers map[string][]string, body []byte) {
 		if len(limit) == 0 {
 			continue
 		}
-		mergeCodexWindowPayload(headers, "primary", mapFromAny(firstAny(limit, "primary_window", "primaryWindow")))
-		mergeCodexWindowPayload(headers, "secondary", mapFromAny(firstAny(limit, "secondary_window", "secondaryWindow")))
+		mergeCodexWindowField(headers, "primary", limit, "primary_window", "primaryWindow")
+		mergeCodexWindowField(headers, "secondary", limit, "secondary_window", "secondaryWindow")
 	}
 }
 
-func mergeCodexWindowPayload(headers map[string][]string, prefix string, window map[string]any) {
-	if len(window) == 0 {
+func mergeCodexWindowField(headers map[string][]string, prefix string, limit map[string]any, keys ...string) {
+	for _, key := range keys {
+		value, present := limit[key]
+		if !present {
+			continue
+		}
+		if value == nil {
+			mergeQuotaWindowPresence(headers, prefix, quotaWindowAbsent)
+			continue
+		}
+		window := mapFromAny(value)
+		parsed := map[string][]string{}
+		if len(window) == 0 || !mergeCodexWindowPayload(parsed, prefix, window) || !mergeQuotaWindowValues(headers, parsed) {
+			mergeQuotaWindowPresence(headers, prefix, quotaWindowUnknown)
+			continue
+		}
+		mergeQuotaWindowPresence(headers, prefix, quotaWindowPresent)
+	}
+}
+
+func mergeQuotaWindowValues(headers, parsed map[string][]string) bool {
+	for key, values := range parsed {
+		if len(values) == 0 {
+			continue
+		}
+		existing := headerValue(headers, key)
+		if existing != "" && !quotaHeaderValuesEqual(existing, values[0]) {
+			return false
+		}
+	}
+	for key, values := range parsed {
+		if len(values) > 0 {
+			setHeaderIfMissing(headers, key, values[0])
+		}
+	}
+	return true
+}
+
+func quotaHeaderValuesEqual(left, right string) bool {
+	if strings.TrimSpace(left) == strings.TrimSpace(right) {
+		return true
+	}
+	leftNumber, leftErr := strconv.ParseFloat(strings.TrimSpace(left), 64)
+	rightNumber, rightErr := strconv.ParseFloat(strings.TrimSpace(right), 64)
+	return leftErr == nil && rightErr == nil && !math.IsNaN(leftNumber) && !math.IsNaN(rightNumber) && leftNumber == rightNumber
+}
+
+func mergeQuotaWindowPresence(headers map[string][]string, prefix string, presence quotaWindowPresence) {
+	key := "x-codex-" + prefix + "-window-presence"
+	raw := headerValue(headers, key)
+	if raw == "" {
+		headers[key] = []string{string(presence)}
 		return
 	}
-	percent := numberStringFromAny(firstAny(window, "used_percent", "usedPercent", "percent", "used"))
-	resetAt := resetAtFromWindow(window)
-	windowSeconds := int64FromAny(firstAny(window, "limit_window_seconds", "limitWindowSeconds", "window_seconds", "windowSeconds"))
-	usedTokens := int64FromAny(firstAny(window, "used_tokens", "usedTokens", "used_token_count", "usedTokenCount", "used_count", "usedCount"))
-	remainingTokens := int64FromAny(firstAny(window, "remaining_tokens", "remainingTokens", "remaining_token_count", "remainingTokenCount", "remaining", "remaining_count", "remainingCount", "available_tokens", "availableTokens"))
-	limitTokens := int64FromAny(firstAny(window, "limit_tokens", "limitTokens", "quota_tokens", "quotaTokens", "total_tokens", "totalTokens", "limit", "quota", "total"))
-	if limitTokens <= 0 && usedTokens > 0 && remainingTokens >= 0 {
+	if parseQuotaWindowPresence(raw) != presence {
+		headers[key] = []string{string(quotaWindowUnknown)}
+	}
+}
+
+func quotaWindowPayloadAliasesConsistent(window map[string]any) bool {
+	if !consistentFiniteNumberAliases(window, "used_percent", "usedPercent", "percent", "used") {
+		return false
+	}
+	for _, keys := range [][]string{
+		{"reset_at", "resetAt"},
+		{"limit_window_seconds", "limitWindowSeconds", "window_seconds", "windowSeconds"},
+		{"reset_after_seconds", "resetAfterSeconds", "reset_in", "resetIn"},
+		{"used_tokens", "usedTokens", "used_token_count", "usedTokenCount", "used_count", "usedCount"},
+		{"remaining_tokens", "remainingTokens", "remaining_token_count", "remainingTokenCount", "remaining", "remaining_count", "remainingCount", "available_tokens", "availableTokens"},
+		{"limit_tokens", "limitTokens", "quota_tokens", "quotaTokens", "total_tokens", "totalTokens", "limit", "quota", "total"},
+	} {
+		if !consistentIntAliases(window, keys...) {
+			return false
+		}
+	}
+	return true
+}
+
+func consistentFiniteNumberAliases(values map[string]any, keys ...string) bool {
+	var expected string
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		text := finiteNumberStringFromAny(value)
+		if text == "" {
+			return false
+		}
+		if expected != "" && !quotaHeaderValuesEqual(expected, text) {
+			return false
+		}
+		expected = text
+	}
+	return true
+}
+
+func consistentIntAliases(values map[string]any, keys ...string) bool {
+	var expected int64
+	found := false
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		number, valid := exactInt64FromAny(value)
+		if !valid || (found && number != expected) {
+			return false
+		}
+		expected = number
+		found = true
+	}
+	return true
+}
+
+func mergeCodexWindowPayload(headers map[string][]string, prefix string, window map[string]any) bool {
+	if len(window) == 0 || !quotaWindowPayloadAliasesConsistent(window) {
+		return false
+	}
+	percentValue, percentPresent := firstPresentAnyIncludingNil(window, "used_percent", "usedPercent", "percent", "used")
+	percent := ""
+	if percentPresent {
+		percent = finiteNumberStringFromAny(percentValue)
+		if percent == "" {
+			return false
+		}
+	}
+	resetAt, resetAtValid := resetAtFromWindow(window)
+	if !resetAtValid {
+		return false
+	}
+	windowSecondsValue, windowSecondsPresent := firstPresentAnyIncludingNil(window, "limit_window_seconds", "limitWindowSeconds", "window_seconds", "windowSeconds")
+	resetAfterValue, resetAfterPresent := firstPresentAnyIncludingNil(window, "reset_after_seconds", "resetAfterSeconds", "reset_in", "resetIn")
+	windowSeconds, windowSecondsValid := exactInt64FromAny(windowSecondsValue)
+	resetAfterSeconds, resetAfterValid := exactInt64FromAny(resetAfterValue)
+	if (windowSecondsPresent && !windowSecondsValid) || (resetAfterPresent && !resetAfterValid) {
+		return false
+	}
+	usedTokensValue, usedTokensPresent := firstPresentAnyIncludingNil(window, "used_tokens", "usedTokens", "used_token_count", "usedTokenCount", "used_count", "usedCount")
+	remainingTokensValue, remainingTokensPresent := firstPresentAnyIncludingNil(window, "remaining_tokens", "remainingTokens", "remaining_token_count", "remainingTokenCount", "remaining", "remaining_count", "remainingCount", "available_tokens", "availableTokens")
+	limitTokensValue, limitTokensPresent := firstPresentAnyIncludingNil(window, "limit_tokens", "limitTokens", "quota_tokens", "quotaTokens", "total_tokens", "totalTokens", "limit", "quota", "total")
+	usedTokens, usedTokensValid := exactInt64FromAny(usedTokensValue)
+	remainingTokens, remainingTokensValid := exactInt64FromAny(remainingTokensValue)
+	limitTokens, limitTokensValid := exactInt64FromAny(limitTokensValue)
+	if (usedTokensPresent && !usedTokensValid) || (remainingTokensPresent && !remainingTokensValid) || (limitTokensPresent && !limitTokensValid) {
+		return false
+	}
+	if !limitTokensPresent && usedTokensPresent && remainingTokensPresent && usedTokens >= 0 && remainingTokens >= 0 && usedTokens <= math.MaxInt64-remainingTokens {
 		limitTokens = usedTokens + remainingTokens
+		limitTokensPresent = limitTokens > 0
 	}
-	if usedTokens <= 0 && limitTokens > 0 && remainingTokens >= 0 {
+	if !usedTokensPresent && limitTokensPresent && remainingTokensPresent && limitTokens > 0 && remainingTokens >= 0 {
 		usedTokens = limitTokens - remainingTokens
-	}
-	if remainingTokens < 0 {
-		remainingTokens = 0
+		usedTokensPresent = usedTokens >= 0
 	}
 	if percent != "" {
 		setHeaderIfMissing(headers, "x-codex-"+prefix+"-used-percent", percent)
@@ -3691,33 +3863,54 @@ func mergeCodexWindowPayload(headers map[string][]string, prefix string, window 
 	if resetAt > 0 {
 		setHeaderIfMissing(headers, "x-codex-"+prefix+"-reset-at", strconv.FormatInt(resetAt, 10))
 	}
-	if windowSeconds > 0 {
-		setHeaderIfMissing(headers, "x-codex-"+prefix+"-window-minutes", strconv.FormatInt(windowSeconds/60, 10))
-	}
-	if usedTokens > 0 {
-		setHeaderIfMissing(headers, "x-codex-"+prefix+"-used-tokens", strconv.FormatInt(usedTokens, 10))
-	}
-	if remainingTokens >= 0 && (limitTokens > 0 || usedTokens > 0) {
-		setHeaderIfMissing(headers, "x-codex-"+prefix+"-remaining-tokens", strconv.FormatInt(remainingTokens, 10))
-	}
-	if limitTokens > 0 {
-		setHeaderIfMissing(headers, "x-codex-"+prefix+"-limit-tokens", strconv.FormatInt(limitTokens, 10))
-	}
-}
-
-func resetAtFromWindow(window map[string]any) int64 {
-	if value := int64FromAny(firstAny(window, "reset_at", "resetAt")); value > 0 {
-		return normalizeUnixSeconds(value)
-	}
-	if value := stringFromAny(firstAny(window, "reset_time", "resetTime")); value != "" {
-		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-			return parsed.Unix()
+	if windowSecondsPresent {
+		setHeaderIfMissing(headers, "x-codex-"+prefix+"-limit-window-seconds", strconv.FormatInt(windowSeconds, 10))
+		if windowSeconds > 0 {
+			setHeaderIfMissing(headers, "x-codex-"+prefix+"-window-minutes", strconv.FormatInt(windowSeconds/60, 10))
 		}
 	}
-	if value := int64FromAny(firstAny(window, "reset_after_seconds", "resetAfterSeconds", "reset_in", "resetIn")); value > 0 {
-		return time.Now().Add(time.Duration(value) * time.Second).Unix()
+	if resetAfterPresent {
+		setHeaderIfMissing(headers, "x-codex-"+prefix+"-reset-after-seconds", strconv.FormatInt(resetAfterSeconds, 10))
 	}
-	return 0
+	if usedTokensPresent && usedTokens >= 0 {
+		setHeaderIfMissing(headers, "x-codex-"+prefix+"-used-tokens", strconv.FormatInt(usedTokens, 10))
+	}
+	if remainingTokensPresent && remainingTokens >= 0 {
+		setHeaderIfMissing(headers, "x-codex-"+prefix+"-remaining-tokens", strconv.FormatInt(remainingTokens, 10))
+	}
+	if limitTokensPresent && limitTokens > 0 {
+		setHeaderIfMissing(headers, "x-codex-"+prefix+"-limit-tokens", strconv.FormatInt(limitTokens, 10))
+	}
+	return true
+}
+
+func resetAtFromWindow(window map[string]any) (int64, bool) {
+	if raw, present := firstPresentAnyIncludingNil(window, "reset_at", "resetAt"); present {
+		value, valid := exactInt64FromAny(raw)
+		if !valid || value <= 0 {
+			return 0, false
+		}
+		return normalizeUnixSeconds(value), true
+	}
+	if raw, present := firstPresentAnyIncludingNil(window, "reset_time", "resetTime"); present {
+		value, ok := raw.(string)
+		if !ok || strings.TrimSpace(value) == "" {
+			return 0, false
+		}
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(value))
+		if err != nil {
+			return 0, false
+		}
+		return parsed.Unix(), true
+	}
+	if raw, present := firstPresentAnyIncludingNil(window, "reset_after_seconds", "resetAfterSeconds", "reset_in", "resetIn"); present {
+		value, valid := exactInt64FromAny(raw)
+		if !valid || value < 0 {
+			return 0, false
+		}
+		return time.Now().Add(time.Duration(value) * time.Second).Unix(), true
+	}
+	return 0, true
 }
 
 func mapFromAny(value any) map[string]any {
@@ -3728,12 +3921,22 @@ func mapFromAny(value any) map[string]any {
 }
 
 func firstAny(m map[string]any, keys ...string) any {
+	value, _ := firstPresentAny(m, keys...)
+	return value
+}
+
+func firstPresentAny(m map[string]any, keys ...string) (any, bool) {
+	value, ok := firstPresentAnyIncludingNil(m, keys...)
+	return value, ok && value != nil
+}
+
+func firstPresentAnyIncludingNil(m map[string]any, keys ...string) (any, bool) {
 	for _, key := range keys {
 		if value, ok := m[key]; ok {
-			return value
+			return value, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 func numberStringFromAny(value any) string {
@@ -3755,23 +3958,43 @@ func numberStringFromAny(value any) string {
 	return ""
 }
 
-func int64FromAny(value any) int64 {
+func finiteNumberStringFromAny(value any) string {
+	text := numberStringFromAny(value)
+	if text == "" {
+		return ""
+	}
+	number, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+		return ""
+	}
+	return text
+}
+
+func exactInt64FromAny(value any) (int64, bool) {
 	switch v := value.(type) {
 	case float64:
-		return int64(v)
+		if math.IsNaN(v) || math.IsInf(v, 0) || math.Trunc(v) != v || v < -9223372036854775808.0 || v >= 9223372036854775808.0 {
+			return 0, false
+		}
+		return int64(v), true
 	case int:
-		return int64(v)
+		return int64(v), true
 	case int64:
-		return v
+		return v, true
 	case json.Number:
-		n, _ := v.Int64()
-		return n
+		n, err := v.Int64()
+		return n, err == nil
 	case string:
-		n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-		return n
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return n, err == nil
 	default:
-		return 0
+		return 0, false
 	}
+}
+
+func int64FromAny(value any) int64 {
+	n, _ := exactInt64FromAny(value)
+	return n
 }
 
 func sanitizeTriggerError(value any) string {
@@ -3788,8 +4011,15 @@ func sanitizeTriggerError(value any) string {
 	if text == "" || text == "{}" || text == "[]" {
 		return ""
 	}
-	for _, marker := range []string{"Bearer ", "access_token", "refresh_token", "id_token"} {
-		if strings.Contains(text, marker) {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"bearer ", "authorization", "cookie", "access_token", "accesstoken", "refresh_token", "refreshtoken", "id_token", "idtoken", "api_key", "management key", "management_key"} {
+		if strings.Contains(lower, marker) {
+			return "trigger failed"
+		}
+	}
+	for _, field := range strings.Fields(text) {
+		field = strings.Trim(field, `"'[](){},;`)
+		if strings.HasPrefix(strings.ToLower(field), "sk-") || (len(field) >= 40 && strings.Count(field, ".") >= 2) {
 			return "trigger failed"
 		}
 	}

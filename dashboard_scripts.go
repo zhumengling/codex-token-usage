@@ -7,6 +7,8 @@ const managementAutobanReleaseApi='/v0/management/plugins/__PLUGIN_ID__/autobans
 const managementInvalidAuthResolveApi='/v0/management/plugins/__PLUGIN_ID__/invalid-auths/resolve';
 const managementAuthImportPreviewApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/preview';
 const managementAuthImportCommitApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/commit';
+const managementQuotaActivationPreviewApi='/v0/management/plugins/__PLUGIN_ID__/quota-activation/preview';
+const managementQuotaActivationRunApi='/v0/management/plugins/__PLUGIN_ID__/quota-activation/run';
 const managementAuthFilesApi='/v0/management/auth-files';
 const managementAuthFileStatusApi='/v0/management/auth-files/status';
 const managementAuthFieldsApi='/v0/management/auth-files/fields';
@@ -30,6 +32,9 @@ const autobanReleaseModal=document.getElementById('autoban-release-modal');
 const autobanReleaseStatusEl=document.getElementById('autoban-release-status');
 const logExportModal=document.getElementById('log-export-modal');
 const logExportStatusEl=document.getElementById('log-export-status-text');
+const quotaActivationModal=document.getElementById('quota-activation-modal');
+const quotaActivationStatusEl=document.getElementById('quota-activation-status');
+const quotaActivationResultsEl=document.getElementById('quota-activation-results');
 const cpaStoragePrefix='enc::v1::';
 const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
@@ -51,6 +56,14 @@ let autobanReleaseSelected=new Set();
 let invalidAuthDeleting=false;
 let workspaceDeactivatedDeleting=false;
 let autobanReleaseBusy=false;
+let quotaActivationBusy=false;
+let quotaActivationPreview=null;
+let quotaActivationRun=null;
+let quotaActivationPollTimer=null;
+let quotaActivationSelected=new Set();
+let quotaActivationPage=1;
+let quotaActivationRenderedJobID='';
+const quotaActivationPageSize=50;
 let activePage='codex';
 let selectedProviders=[];
 let providerSelectionSaved=false;
@@ -68,6 +81,7 @@ initInvalidAuthControl();
 initWorkspaceDeactivatedControl();
 initAutobanReleaseControl();
 initLogExportControl();
+initQuotaActivationControl();
 initUIPreferences();
 applyHostTheme();
 observeHostTheme();
@@ -85,7 +99,7 @@ document.getElementById('account-next').onclick=()=>{accountPage=accountPage+1;r
 document.getElementById('autoban-page-size').onchange=(e)=>{autobanPageSize=Number(e.target.value)||10;safeStorageSet(safeLocalStorage(),'cpa_token_usage_autoban_page_size',String(autobanPageSize));autobanPage=1;renderAutobans(poolData().autobans)};
 document.getElementById('autoban-prev').onclick=()=>{autobanPage=Math.max(1,autobanPage-1);renderAutobans(poolData().autobans)};
 document.getElementById('autoban-next').onclick=()=>{autobanPage=autobanPage+1;renderAutobans(poolData().autobans)};
-  setInterval(()=>{if(!document.hidden&&!loading&&!invalidAuthDeleting&&!workspaceDeactivatedDeleting&&!autobanReleaseBusy&&!document.getElementById('provider-picker').classList.contains('open'))load()},15000);
+  setInterval(()=>{if(!document.hidden&&!loading&&!invalidAuthDeleting&&!workspaceDeactivatedDeleting&&!autobanReleaseBusy&&!quotaActivationBusy&&!document.getElementById('provider-picker').classList.contains('open'))load()},15000);
 function initUIPreferences(){
   const savedWindow=safeStorageGet(safeLocalStorage(),'cpa_token_usage_window'); if(savedWindow&&selectHasValue('window',savedWindow))document.getElementById('window').value=savedWindow;
   const savedSort=safeStorageGet(safeLocalStorage(),'cpa_token_usage_account_sort'); if(savedSort&&selectHasValue('account-sort',savedSort))document.getElementById('account-sort').value=savedSort;
@@ -126,6 +140,166 @@ function initLogExportControl(){
   document.getElementById('log-export-apply').onclick=downloadLogExport;
   logExportModal.addEventListener('click',e=>{if(e.target===logExportModal)closeLogExportModal()});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!logExportModal.hidden)closeLogExportModal()});
+}
+function initQuotaActivationControl(){
+  document.getElementById('quota-activation-open').onclick=openQuotaActivationModal;
+  document.getElementById('quota-activation-close').onclick=closeQuotaActivationModal;
+  document.getElementById('quota-activation-close-bottom').onclick=closeQuotaActivationModal;
+  document.getElementById('quota-activation-preview').onclick=previewQuotaActivation;
+  document.getElementById('quota-activation-run').onclick=runQuotaActivation;
+  document.getElementById('quota-activation-ack').onchange=syncQuotaActivationRunButton;
+  document.getElementById('quota-activation-force').onchange=()=>{
+    document.getElementById('quota-activation-ack').checked=false;
+    quotaActivationSelected.clear();quotaActivationPage=1;
+    if(quotaActivationPreview)renderQuotaActivation(quotaActivationPreview);else syncQuotaActivationRunButton();
+    if(document.getElementById('quota-activation-force').checked)setQuotaActivationStatus('强制恢复模式：请明确勾选账号后重新预览。','warn');
+  };
+  quotaActivationResultsEl.addEventListener('change',e=>{
+    const input=e.target.closest('input[data-activation-auth]');if(!input)return;
+    if(input.checked)quotaActivationSelected.add(input.dataset.activationAuth);else quotaActivationSelected.delete(input.dataset.activationAuth);
+    syncQuotaActivationRunButton();
+  });
+  document.getElementById('quota-activation-prev').onclick=()=>{quotaActivationPage=Math.max(1,quotaActivationPage-1);if(quotaActivationRun||quotaActivationPreview)renderQuotaActivation(quotaActivationRun||quotaActivationPreview)};
+  document.getElementById('quota-activation-next').onclick=()=>{quotaActivationPage++;if(quotaActivationRun||quotaActivationPreview)renderQuotaActivation(quotaActivationRun||quotaActivationPreview)};
+  quotaActivationModal.addEventListener('click',e=>{if(e.target===quotaActivationModal)closeQuotaActivationModal()});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!quotaActivationModal.hidden)closeQuotaActivationModal()});
+}
+function openQuotaActivationModal(){
+  quotaActivationModal.hidden=false;
+  if(!quotaActivationPreview&&!quotaActivationRun)setQuotaActivationStatus('等待预览新鲜账号。','');
+  setTimeout(()=>document.getElementById('quota-activation-preview').focus(),0);
+}
+function closeQuotaActivationModal(){
+  if(quotaActivationBusy)return;
+  quotaActivationModal.hidden=true;
+  if(quotaActivationPollTimer){clearTimeout(quotaActivationPollTimer);quotaActivationPollTimer=null}
+}
+function setQuotaActivationStatus(text,tone){
+  quotaActivationStatusEl.classList.remove('ok','warn','bad');if(tone)quotaActivationStatusEl.classList.add(tone);quotaActivationStatusEl.textContent=tr(text);
+}
+function quotaActivationHeaders(){
+  const key=managementKey();
+  if(!key){showFallbackKeyInput();setQuotaActivationStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');return null}
+  safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
+  return {Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'};
+}
+function selectedQuotaActivationIndexes(){
+  return Array.from(quotaActivationSelected).filter(Boolean);
+}
+async function quotaActivationJSON(url,options={}){
+  const headers=quotaActivationHeaders();if(!headers)throw new Error('management_key_required');
+  const res=await fetch(url,Object.assign({},options,{headers:Object.assign({},headers,options.headers||{})}));
+  let body={};try{body=await res.json()}catch(e){}
+  if(res.status===401)rejectManagementKey(managementKey());
+  if(!res.ok)throw new Error(body.message||body.error||('HTTP '+res.status));
+  return body;
+}
+async function previewQuotaActivation(){
+  if(quotaActivationBusy)return;
+  const force=document.getElementById('quota-activation-force').checked;
+  const selected=selectedQuotaActivationIndexes();
+  const forceDiscovery=force&&!selected.length&&!quotaActivationPreview;
+  if(force&&!selected.length&&!forceDiscovery){setQuotaActivationStatus('强制恢复模式必须先明确勾选账号。','warn');return}
+  quotaActivationBusy=true;quotaActivationPreview=null;quotaActivationRun=null;
+  document.getElementById('quota-activation-ack').checked=false;
+  syncQuotaActivationControls();
+  setQuotaActivationStatus(forceDiscovery?'正在读取账号；完成后请明确选择强制恢复账号。':(force?'正在预览选中的强制恢复账号...':'正在读取额度并预览新鲜账号...'),'');
+  try{
+    const started=await quotaActivationJSON(managementQuotaActivationPreviewApi,{method:'POST',body:JSON.stringify({force:force&&!forceDiscovery,auth_indexes:force&&!forceDiscovery?selected:[]})});
+    await pollQuotaActivation(started.poll_url,'preview');
+  }catch(e){quotaActivationBusy=false;setQuotaActivationStatus('额度启动预览失败：'+e.message,'bad');syncQuotaActivationControls()}
+}
+async function pollQuotaActivation(url,kind){
+  try{
+    const job=await quotaActivationJSON(url);
+    if(kind==='preview'){quotaActivationPreview=job;renderQuotaActivation(job)}else{quotaActivationRun=job;renderQuotaActivation(job)}
+    if(job.state==='queued'||job.state==='running'){
+      setQuotaActivationStatus((kind==='preview'?'预览中：':'执行中：')+Number(job.completed_accounts||0)+' / '+Number(job.total_accounts||0),'');
+      quotaActivationPollTimer=setTimeout(()=>pollQuotaActivation(url,kind),500);
+      return;
+    }
+    quotaActivationBusy=false;syncQuotaActivationControls();
+    if(job.state==='completed'){
+      const forceDiscovery=kind==='preview'&&document.getElementById('quota-activation-force').checked&&!job.force;
+      setQuotaActivationStatus(forceDiscovery?'账号清单已载入；请明确勾选账号后再次预览强制模式。':(kind==='preview'?'预览完成，请核对并确认选中账号。':'一次性执行完成，请核对每个账号的验证结果。'),forceDiscovery?'warn':(kind==='preview'?'ok':(job.failed_accounts?'warn':'ok')));
+    }else setQuotaActivationStatus((kind==='preview'?'预览失败：':'执行失败：')+(job.error||job.state),'bad');
+  }catch(e){quotaActivationBusy=false;setQuotaActivationStatus((kind==='preview'?'额度启动预览失败：':'额度启动执行失败：')+e.message,'bad');syncQuotaActivationControls()}
+}
+function renderQuotaActivation(job){
+  const isRun=job.type==='run';
+  const rows=job.accounts||[];
+  const forceDiscovery=!isRun&&document.getElementById('quota-activation-force').checked&&!job.force;
+  if(quotaActivationRenderedJobID!==job.id){
+    quotaActivationRenderedJobID=job.id;quotaActivationPage=1;quotaActivationSelected.clear();
+  }
+  if(quotaActivationBusy&&!isRun&&!forceDiscovery&&(job.state==='queued'||job.state==='running'||job.state==='completed')){
+    rows.filter(row=>row.eligible).forEach(row=>quotaActivationSelected.add(row.auth_index));
+  }
+  const pageCount=Math.max(1,Math.ceil(rows.length/quotaActivationPageSize));
+  quotaActivationPage=Math.min(Math.max(1,quotaActivationPage),pageCount);
+  const pageRows=rows.slice((quotaActivationPage-1)*quotaActivationPageSize,quotaActivationPage*quotaActivationPageSize);
+  document.getElementById('quota-activation-summary').textContent=(isRun?'执行':'预览')+' '+Number(job.completed_accounts||0)+' / '+Number(job.total_accounts||0)+' · 可执行 '+Number(job.eligible_accounts||0)+' · 跳过 '+Number(job.skipped_accounts||0)+' · 未知 '+Number(job.unknown_accounts||0)+' · 异常 '+Number(job.failed_accounts||0);
+  document.getElementById('quota-activation-page').textContent=quotaActivationPage+' / '+pageCount;
+  document.getElementById('quota-activation-prev').disabled=quotaActivationPage<=1;
+  document.getElementById('quota-activation-next').disabled=quotaActivationPage>=pageCount;
+  quotaActivationResultsEl.innerHTML=pageRows.map(row=>{
+    const checked=!isRun&&quotaActivationSelected.has(row.auth_index)?' checked':'';
+    const disabled=isRun||(!row.eligible&&!forceDiscovery)?' disabled':'';
+    const result=quotaActivationResultText(isRun?firstText(row.status,row.reason):firstText(row.reason,row.status));
+    return '<tr><td><input type="checkbox" data-activation-auth="'+esc(row.auth_index||'')+'"'+checked+disabled+' aria-label="选择账号"></td>'+
+      '<td><span class="quota-activation-account"><b>'+esc(firstText(row.name,row.email,row.source,row.auth_index))+'</b><small>'+esc(row.auth_index||'')+'</small></span></td>'+
+      '<td>'+quotaActivationWindowTransitionHTML(row.before&&row.before.primary,row.after&&row.after.primary)+'</td><td>'+quotaActivationWindowTransitionHTML(row.before&&row.before.secondary,row.after&&row.after.secondary)+'</td>'+
+      '<td class="quota-activation-reason '+((row.status==='sent_unknown'||row.status==='partial'||row.status==='failed_before_send'||row.status==='failed')?'warn':'')+'"><b>'+esc(result||'-')+'</b>'+(row.error?'<br><small>'+esc(row.error)+'</small>':'')+'</td></tr>';
+  }).join('')||'<tr><td colspan="5" class="muted">暂无账号</td></tr>';
+  applyLocale();syncQuotaActivationRunButton();
+}
+function quotaActivationResultText(value){
+  const labels={eligible:'符合条件',not_selected:'未选择',wrong_provider:'Provider 不匹配',disabled:'账号已禁用',expired:'账号已过期',unavailable:'账号不可用',unstable_identity:'账号身份不稳定',missing_credential:'缺少可用凭据',quota_read_failed:'额度读取失败',unknown_quota:'额度存在性未知或数据矛盾',primary_not_fresh:'Primary 上报窗口不新鲜',secondary_not_fresh:'Secondary 上报窗口不新鲜',duplicate_cycle:'本额度周期已发送',inventory_changed:'预览后账号清单已变化',no_longer_eligible:'账号已不再符合条件',preview_not_eligible:'预览时不符合条件',queued:'排队中',revalidating:'重新校验中',reserved:'已保留周期',dispatched:'已发送',verified:'所有上报窗口均已验证',partial:'仅部分上报窗口已验证',failed_before_send:'未获得成功模型响应',sent_unknown:'已发送但验证未知',failed:'失败',skipped:'跳过'};
+  return labels[value]||value||'-';
+}
+function quotaActivationWindowTransitionHTML(before,after){
+  if(!after)return quotaActivationWindowHTML(before);
+  return '<span class="quota-activation-transition">'+quotaActivationWindowHTML(before)+'<b aria-hidden="true">→</b>'+quotaActivationWindowHTML(after)+'</span>';
+}
+function quotaActivationWindowHTML(window){
+  if(!window||!window.presence||window.presence==='unknown')return '<span class="muted">存在性未知</span>';
+  if(window.presence==='absent')return '<span class="muted">明确未上报</span>';
+  if(window.presence!=='present')return '<span class="muted">存在性未知</span>';
+  const pctValue=window.used_percent==null?'?':Number(window.used_percent).toFixed(2)+'%';
+  const tokens=window.used_tokens==null?'':(' · '+Number(window.used_tokens)+' tok');
+  const duration=window.limit_window_seconds==null?'?':quotaActivationDurationText(window.limit_window_seconds);
+  const countdown=window.reset_after_seconds==null?'?':quotaActivationDurationText(window.reset_after_seconds);
+  return '<span class="quota-activation-window"><b>'+esc(pctValue+tokens)+'</b><small>'+esc('周期 '+duration+' · 倒计时 '+countdown)+'</small><small>'+esc(resetText(window.reset_at))+'</small></span>';
+}
+function quotaActivationDurationText(seconds){
+  seconds=Math.max(0,Number(seconds)||0);
+  if(seconds%86400===0)return (seconds/86400)+'d';
+  if(seconds%3600===0)return (seconds/3600)+'h';
+  if(seconds%60===0)return (seconds/60)+'m';
+  return seconds+'s';
+}
+function syncQuotaActivationControls(){
+  document.getElementById('quota-activation-preview').disabled=quotaActivationBusy;
+  document.getElementById('quota-activation-force').disabled=quotaActivationBusy;
+  syncQuotaActivationRunButton();
+}
+function syncQuotaActivationRunButton(){
+  const preview=quotaActivationPreview;
+  const selected=selectedQuotaActivationIndexes();
+  const modeMatches=!!preview&&!!preview.force===document.getElementById('quota-activation-force').checked;
+  document.getElementById('quota-activation-run').disabled=quotaActivationBusy||!preview||!modeMatches||preview.state!=='completed'||!preview.confirmation_token||!selected.length||!document.getElementById('quota-activation-ack').checked;
+}
+async function runQuotaActivation(){
+  if(quotaActivationBusy||!quotaActivationPreview)return;
+  const selected=selectedQuotaActivationIndexes();
+  if(!selected.length||!document.getElementById('quota-activation-ack').checked)return;
+  const warning=quotaActivationPreview.force?'强制模式会对选中账号发送真实 Codex 请求。确认仅执行一次？':'将对选中的新鲜账号发送最小真实 Codex 请求。确认仅执行一次？';
+  if(!window.confirm(tr(warning)))return;
+  quotaActivationBusy=true;syncQuotaActivationControls();setQuotaActivationStatus('正在启动一次性额度请求...','');
+  try{
+    const started=await quotaActivationJSON(managementQuotaActivationRunApi,{method:'POST',body:JSON.stringify({preview_id:quotaActivationPreview.id,confirmation_token:quotaActivationPreview.confirmation_token,auth_indexes:selected})});
+    await pollQuotaActivation(started.poll_url,'run');
+  }catch(e){quotaActivationBusy=false;setQuotaActivationStatus('额度启动执行失败：'+e.message,'bad');syncQuotaActivationControls()}
 }
 function openLogExportModal(){
   populateLogExportFilters();
@@ -1483,6 +1657,96 @@ function providerPageHTML(name){
   '</section>';
 }
 const i18nEn={
+  '一次性启动额度窗口':'Activate quota windows once',
+  '一次性启动 Codex 额度窗口':'Activate Codex quota windows once',
+  '关闭一次性额度启动':'Close one-shot quota activation',
+  '先预览，不会发送模型请求。默认仅选择至少一个明确上报窗口且所有上报窗口均完全新鲜的账号；执行时会发送一个最小真实 Codex 请求，不保证恰好消耗一个 Token。':'Previewing sends no model request. By default, an account is selected only when at least one window is explicitly reported and every reported window is completely fresh. Running sends one minimal real Codex request per account; an exact one-token cost is not guaranteed.',
+  '强制恢复模式（必须明确选择账号，可绕过新鲜窗口检查）':'Force recovery mode (explicit account selection required; bypasses fresh-window checks)',
+  '等待预览新鲜账号。':'Waiting to preview fresh accounts.',
+  '选择':'Select',
+  'Primary 上报窗口（前 → 后）':'Primary reported window (before → after)',
+  'Secondary 上报窗口（前 → 后）':'Secondary reported window (before → after)',
+  '判定 / 结果':'Decision / result',
+  '上一页':'Previous',
+  '下一页':'Next',
+  '我确认执行会消耗少量真实 Codex 额度，并且成功请求无法撤销。':'I understand this consumes a small amount of real Codex quota and a successful request cannot be undone.',
+  '预览新鲜账号':'Preview fresh accounts',
+  '仅执行选中账号一次':'Activate selected accounts once',
+  '强制恢复模式：请明确勾选账号后重新预览。':'Force recovery mode: explicitly select accounts, then preview again.',
+  '强制恢复模式必须先明确勾选账号。':'Force recovery mode requires explicitly selected accounts.',
+  '正在读取账号；完成后请明确选择强制恢复账号。':'Loading accounts; explicitly select force-recovery accounts when complete.',
+  '账号清单已载入；请明确勾选账号后再次预览强制模式。':'Account list loaded. Explicitly select accounts, then preview force mode again.',
+  '正在预览选中的强制恢复账号...':'Previewing selected force-recovery accounts...',
+  '正在读取额度并预览新鲜账号...':'Reading quota and previewing fresh accounts...',
+  '额度启动预览失败：':'Quota activation preview failed: ',
+  '预览中：':'Previewing: ',
+  '执行中：':'Running: ',
+  '预览完成，请核对并确认选中账号。':'Preview complete. Review and confirm the selected accounts.',
+  '一次性执行完成，请核对每个账号的验证结果。':'One-shot run complete. Review each account verification result.',
+  '预览失败：':'Preview failed: ',
+  '执行失败：':'Run failed: ',
+  '额度启动执行失败：':'Quota activation run failed: ',
+  '执行':'Run',
+  '预览':'Preview',
+  '可执行':'eligible',
+  '异常':'issues',
+  '选择账号':'Select account',
+  '未知':'Unknown',
+  '存在性未知':'Presence unknown',
+  '明确未上报':'Explicitly absent',
+  '周期 ':'Duration ',
+  '倒计时 ':'Countdown ',
+  '强制模式会对选中账号发送真实 Codex 请求。确认仅执行一次？':'Force mode sends a real Codex request for each selected account. Confirm one-shot execution?',
+  '将对选中的新鲜账号发送最小真实 Codex 请求。确认仅执行一次？':'Send one minimal real Codex request for each selected fresh account?',
+  '正在启动一次性额度请求...':'Starting one-shot quota requests...',
+  '符合条件':'Eligible',
+  '未选择':'Not selected',
+  'Provider 不匹配':'Wrong provider',
+  '账号已禁用':'Account disabled',
+  '账号已过期':'Account expired',
+  '账号不可用':'Account unavailable',
+  '账号身份不稳定':'Unstable account identity',
+  '缺少可用凭据':'Missing usable credential',
+  '额度读取失败':'Quota read failed',
+  '额度存在性未知或数据矛盾':'Unknown window presence or contradictory quota',
+  'Primary 上报窗口不新鲜':'Reported primary window is not fresh',
+  'Secondary 上报窗口不新鲜':'Reported secondary window is not fresh',
+  '本额度周期已发送':'This quota cycle was already dispatched',
+  '预览后账号清单已变化':'Account inventory changed after preview',
+  '账号已不再符合条件':'Account is no longer eligible',
+  '预览时不符合条件':'Not eligible in preview',
+  '排队中':'Queued',
+  '重新校验中':'Revalidating',
+  '已保留周期':'Reserved',
+  '已发送':'Dispatched',
+  '所有上报窗口均已验证':'All reported windows verified',
+  '仅部分上报窗口已验证':'Only some reported windows verified',
+  '未获得成功模型响应':'No successful model response',
+  '已发送但验证未知':'Sent; verification unknown',
+  'eligible':'Eligible',
+  'not_selected':'Not selected',
+  'wrong_provider':'Wrong provider',
+  'disabled':'Disabled',
+  'expired':'Expired',
+  'unavailable':'Unavailable',
+  'unstable_identity':'Unstable account identity',
+  'missing_credential':'Missing usable credential',
+  'quota_read_failed':'Quota read failed',
+  'unknown_quota':'Unknown window presence or contradictory quota',
+  'primary_not_fresh':'Reported primary window is not fresh',
+  'secondary_not_fresh':'Reported secondary window is not fresh',
+  'duplicate_cycle':'This quota cycle was already dispatched',
+  'inventory_changed':'Account inventory changed after preview',
+  'no_longer_eligible':'Account is no longer eligible',
+  'preview_not_eligible':'Not eligible in preview',
+  'queued':'Queued',
+  'revalidating':'Revalidating',
+  'reserved':'Reserved',
+  'dispatched':'Dispatched',
+  'verified':'All reported windows verified',
+  'partial':'Only some reported windows verified',
+  'failed_before_send':'Failed without a successful model response',
+  'sent_unknown':'Sent; verification unknown',
   '账号 JSON 导入':'Import account JSON',
   '窗口：':'Window: ',
   '数据库：':'DB: ',

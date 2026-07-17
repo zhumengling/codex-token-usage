@@ -131,6 +131,37 @@ func TestInvalidAuthManagementSeparatesSourcesAndResolvesStableIDs(t *testing.T)
 	}
 }
 
+func TestQuotaActivationDashboardRequiresPreviewConfirmationAndBilingualCopy(t *testing.T) {
+	for _, marker := range []string{
+		"一次性启动额度窗口",
+		"managementQuotaActivationPreviewApi",
+		"managementQuotaActivationRunApi",
+		"quotaActivationPreview.confirmation_token",
+		"!!preview.force===document.getElementById('quota-activation-force').checked",
+		"quota-activation-ack",
+		"quotaActivationWindowTransitionHTML(row.before&&row.before.primary,row.after&&row.after.primary)",
+		"quota-activation-pagination",
+		"quotaActivationPageSize=50",
+		"强制恢复模式必须先明确勾选账号。",
+		"不保证恰好消耗一个 Token",
+		"Primary 上报窗口（前 → 后）",
+		"window.limit_window_seconds",
+		"window.reset_after_seconds",
+		"window.presence==='absent'",
+		"'所有上报窗口均已验证':'All reported windows verified'",
+		"'已发送但验证未知':'Sent; verification unknown'",
+	} {
+		if !strings.Contains(dashboardBody+dashboardScripts+dashboardStyles, marker) {
+			t.Fatalf("quota activation UI marker %q not found", marker)
+		}
+	}
+	for _, forbidden := range []string{"access_token", "refresh_token", "Authorization: Bearer"} {
+		if strings.Contains(dashboardBody, forbidden) {
+			t.Fatalf("quota activation HTML contains credential marker %q", forbidden)
+		}
+	}
+}
+
 func TestEnglishLocaleTranslatesDynamicPhrasesBeforeUnits(t *testing.T) {
 	for _, marker := range []string{
 		"'账号 JSON 导入':'Import account JSON'",
