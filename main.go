@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.37"
+	pluginVersion    = "0.1.38"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -1364,6 +1364,9 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 	if err := ensureAutobanBanColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := mergeAutobanIdentityDuplicates(ctx, db); err != nil {
+		return err
+	}
 	if err := ensureInvalidAuthColumns(ctx, db); err != nil {
 		return err
 	}
@@ -2063,6 +2066,100 @@ func ensureAutobanBanColumns(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
+type autobanIdentityMergeRow struct {
+	AuthID               string
+	AuthIndex            string
+	Source               string
+	Provider             string
+	Window               string
+	Reason               string
+	BannedAt             int64
+	ResetAt              int64
+	LastStatusCode       int
+	PrimaryUsedPercent   sql.NullFloat64
+	PrimaryResetAt       sql.NullInt64
+	SecondaryUsedPercent sql.NullFloat64
+	SecondaryResetAt     sql.NullInt64
+	AuthFile             string
+	AuthFileMTime        int64
+}
+
+func mergeAutobanIdentityDuplicates(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT auth_id, auth_index, source, provider, window, reason, banned_at, reset_at,
+last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent,
+secondary_reset_at, auth_file, auth_file_mtime
+FROM autoban_bans
+WHERE active=1`)
+	if err != nil {
+		return err
+	}
+	groups := make(map[string][]autobanIdentityMergeRow)
+	for rows.Next() {
+		var row autobanIdentityMergeRow
+		if err := rows.Scan(
+			&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.Window, &row.Reason,
+			&row.BannedAt, &row.ResetAt, &row.LastStatusCode, &row.PrimaryUsedPercent,
+			&row.PrimaryResetAt, &row.SecondaryUsedPercent, &row.SecondaryResetAt,
+			&row.AuthFile, &row.AuthFileMTime,
+		); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		key := normalizeAccountAlias(canonicalAutobanAuthID(usageRecord{
+			AuthID: row.AuthID, AuthIndex: row.AuthIndex, Source: row.Source, AuthFile: row.AuthFile,
+		}, row.AuthFile))
+		if key != "" {
+			groups[key] = append(groups[key], row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for canonicalID, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		winner := group[0]
+		for _, row := range group[1:] {
+			if row.BannedAt > winner.BannedAt || (row.BannedAt == winner.BannedAt && row.ResetAt > winner.ResetAt) {
+				winner = row
+			}
+		}
+		for _, row := range group {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM autoban_bans WHERE auth_id=?`, row.AuthID); err != nil {
+				return err
+			}
+		}
+		authFile := firstNonEmptyString(fileNameIfJSON(winner.AuthFile), fileNameIfJSON(canonicalID))
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO autoban_bans (
+  auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
+  last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
+  auth_file, auth_file_mtime, released_at, release_reason
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 0, '')`,
+			canonicalID, winner.AuthIndex, winner.Source, winner.Provider, winner.Window, winner.Reason,
+			winner.BannedAt, winner.ResetAt, winner.LastStatusCode,
+			nullFloatPtr(winner.PrimaryUsedPercent), nullIntPtr(winner.PrimaryResetAt),
+			nullFloatPtr(winner.SecondaryUsedPercent), nullIntPtr(winner.SecondaryResetAt),
+			authFile, winner.AuthFileMTime,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 type quotaTriggerManager struct {
 	mu     sync.Mutex
 	cfg    pluginConfig
@@ -2308,8 +2405,22 @@ ON CONFLICT(auth_id) DO UPDATE SET
 }
 
 func invalidAuthIDForRecord(rec usageRecord, authFile string) string {
-	if authFile != "" && shouldUseStrictAuthFileIdentity(rec, authFile) {
-		return authFile
+	return canonicalAutobanAuthID(rec, authFile)
+}
+
+func canonicalAutobanAuthID(rec usageRecord, authFile string) string {
+	if file := fileNameIfJSON(authFile); file != "" {
+		return file
+	}
+	if file := fileNameIfJSON(rec.AuthID); file != "" {
+		return file
+	}
+	// Some quota-trigger records carry the auth filename in AuthIndex, but only
+	// treat it as canonical when AuthFile confirms that this is file-backed.
+	if authFile != "" {
+		if file := fileNameIfJSON(rec.AuthIndex); file != "" {
+			return file
+		}
 	}
 	return firstNonEmptyString(rec.AuthID, rec.AuthIndex, rec.Source)
 }
@@ -2494,7 +2605,14 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 		return nil
 	}
 	authFile, authFileMTime := authFileStateForRecord(rec)
-	authID := invalidAuthIDForRecord(rec, authFile)
+	// Prefer the identity explicitly supplied by the usage source. A resolved
+	// filesystem match alone must not rewrite legacy/runtime-only probe IDs;
+	// quota-trigger records carry AuthFile explicitly and therefore still use
+	// the stable file identity.
+	authID := canonicalAutobanAuthID(rec, rec.AuthFile)
+	if authID == "" {
+		authID = invalidAuthIDForRecord(rec, authFile)
+	}
 	if authID == "" {
 		return nil
 	}
@@ -2544,7 +2662,13 @@ func isCodexAPIKeyUsageRecord(rec usageRecord) bool {
 	if isAPIKeyAuthType(rec.AuthType) {
 		return true
 	}
-	for _, value := range []string{rec.APIKey, rec.AuthID, rec.AuthIndex, rec.Source} {
+	if strings.TrimSpace(rec.AuthID) == "" && strings.TrimSpace(rec.AuthIndex) == "" && strings.TrimSpace(rec.Source) == "" && isCodexAPIKeyIdentity(rec.APIKey) {
+		return true
+	}
+	// APIKey is CPA's request access key and is also populated on OAuth usage
+	// records. It is not an account identity, so never classify a request as an
+	// external API-key endpoint from this field alone.
+	for _, value := range []string{rec.AuthID, rec.AuthIndex, rec.Source} {
 		if isCodexAPIKeyIdentity(value) {
 			return true
 		}
@@ -2557,7 +2681,10 @@ func isCodexAPIKeyUsageRecord(rec usageRecord) bool {
 			continue
 		}
 		key := normalizeAPIKeyIdentity(entry.APIKey)
-		for _, value := range []string{rec.APIKey, rec.AuthID, rec.AuthIndex, rec.Source} {
+		if strings.TrimSpace(rec.AuthID) == "" && strings.TrimSpace(rec.AuthIndex) == "" && strings.TrimSpace(rec.Source) == "" && normalizeAPIKeyIdentity(rec.APIKey) == key {
+			return true
+		}
+		for _, value := range []string{rec.AuthID, rec.AuthIndex, rec.Source} {
 			if normalizeAPIKeyIdentity(value) == key {
 				return true
 			}

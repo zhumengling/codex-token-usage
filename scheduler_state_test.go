@@ -310,7 +310,7 @@ func TestSuccessfulQuotaProbeClearsRecoveredRestriction(t *testing.T) {
 	if err := applyQuotaTriggerAccountState(context.Background(), db, run); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT active FROM autoban_bans WHERE auth_id='probe-account'`).Scan(&active); err != nil {
+	if err := db.QueryRow(`SELECT active FROM autoban_bans WHERE auth_id='probe-account.json'`).Scan(&active); err != nil {
 		t.Fatal(err)
 	}
 	if active != 0 {
