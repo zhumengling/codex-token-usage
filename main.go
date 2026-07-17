@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.36"
+	pluginVersion    = "0.1.37"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -521,7 +521,7 @@ func pluginConfigFields() []configField {
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
 		{Name: "单账号超时秒数", Type: "number", Description: "单个账号触发请求超时时间，单位秒。默认 20。"},
 		{Name: "单账号最小冷却分钟", Type: "number", Description: "同一账号两次触发的最小冷却时间，单位分钟。默认 10。"},
-		{Name: "同一个Session优先固定到同一个账号", Type: "boolean", Description: "是否让插件在接管 Codex 账号调度时保持同一 Session 的账号粘性；关闭后按账号轮询。默认开启。"},
+		{Name: "同一个Session优先固定到同一个账号", Type: "boolean", Description: "是否让插件在接管 Codex/xAI 账号调度时保持同一 Session 的账号粘性；关闭或无法绑定时遵循 CPA routing.strategy。默认开启。"},
 		{Name: "自动更新模型价格表", Type: "boolean", Description: "是否自动下载并更新模型价格缓存。默认开启。"},
 		{Name: "模型价格更新间隔小时", Type: "number", Description: "模型价格缓存自动检查间隔，单位小时。默认 6。"},
 		{Name: "模型价格表地址", Type: "string", Description: "模型价格 JSON 下载地址。默认使用 LiteLLM 官方价格表。"},
@@ -3817,7 +3817,7 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		}
 		return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 	}
-	chosen := pickSchedulerCandidate(rotationKey, affinityKey, available)
+	chosen := pickSchedulerCandidateWithStrategy(rotationKey, affinityKey, currentCPASchedulerStrategy(), available)
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 }
 
@@ -3930,7 +3930,11 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		}
 		return schedulerPickResponse{}, &schedulerRejectError{Code: "auth_unavailable", Message: message, HTTPStatus: http.StatusServiceUnavailable}
 	}
-	chosen := globalSchedulerRotation.pick(schedulerRotationKey(req, "xai"), available)
+	affinityKey := ""
+	if globalAccountProtection.config().SchedulerSessionAffinityEnabled {
+		affinityKey = schedulerAffinityKey(req, "xai")
+	}
+	chosen := pickSchedulerCandidateWithStrategy(schedulerRotationKey(req, "xai"), affinityKey, currentCPASchedulerStrategy(), available)
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 }
 

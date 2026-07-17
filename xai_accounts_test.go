@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -183,5 +185,64 @@ VALUES ('blocked', 'blocked', 'blocked', 'xai', 'free_usage_exhausted', 'test', 
 	var reject *schedulerRejectError
 	if !errors.As(err, &reject) || reject.HTTPStatus != http.StatusServiceUnavailable {
 		t.Fatalf("error=%v, want scheduler reject for all unavailable xAI candidates", err)
+	}
+}
+
+func TestXAISchedulerUsesFillFirstWhenAffinityDisabled(t *testing.T) {
+	resetSchedulerSelectionState(t)
+	oldSource := globalXAIAuthSource
+	oldCaller := hostAuthCaller
+	globalXAIAuthSource = &xaiAuthSourceManager{}
+	hostAuthCaller = func(method string, _ any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{AuthIndex: "blocked", Provider: "xai"}}})
+	}
+	t.Cleanup(func() { globalXAIAuthSource = oldSource; hostAuthCaller = oldCaller })
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("routing:\n  strategy: fill-first\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	t.Setenv("CPA_CONFIG_PATH", configPath)
+	resetCPASchedulerStrategyCache()
+	t.Cleanup(resetCPASchedulerStrategyCache)
+	oldCfg := globalAccountProtection.config()
+	cfg := defaultPluginConfig()
+	cfg.SchedulerSessionAffinityEnabled = false
+	globalAccountProtection.configure(cfg)
+	t.Cleanup(func() { globalAccountProtection.configure(oldCfg) })
+	s := &store{}
+	t.Cleanup(s.close)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if _, err := db.Exec(`
+INSERT INTO xai_account_states (state_key, auth_id, auth_index, provider, state, reason, observed_at, reset_at, active, last_status_code)
+VALUES ('blocked', 'blocked', 'blocked', 'xai', 'rate_limited', 'test', ?, ?, 1, 429)`, now, now+3600); err != nil {
+		t.Fatal(err)
+	}
+	req := schedulerPickRequest{
+		Provider: "xai",
+		Model:    "grok-test",
+		Options:  schedulerOptions{Headers: map[string][]string{"Session-Id": {"ignored-xai-session"}}},
+		Candidates: []schedulerAuthCandidate{
+			{ID: "blocked", Provider: "xai", Priority: 1, Attributes: map[string]string{"auth_index": "blocked"}},
+			{ID: "b", Provider: "xai", Priority: 1, Attributes: map[string]string{"auth_index": "b"}},
+			{ID: "a", Provider: "xai", Priority: 1, Attributes: map[string]string{"auth_index": "a"}},
+		},
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := s.pickAuth(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !resp.Handled || resp.AuthID != "a" {
+			t.Fatalf("xAI fill-first response[%d]=%+v, want a", i, resp)
+		}
 	}
 }

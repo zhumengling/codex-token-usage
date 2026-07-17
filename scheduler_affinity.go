@@ -53,10 +53,14 @@ func schedulerSessionID(req schedulerPickRequest) string {
 }
 
 func pickSchedulerCandidate(rotationKey, affinityKey string, candidates []schedulerAuthCandidate) schedulerAuthCandidate {
+	return pickSchedulerCandidateWithStrategy(rotationKey, affinityKey, cpaSchedulerRoundRobin, candidates)
+}
+
+func pickSchedulerCandidateWithStrategy(rotationKey, affinityKey string, strategy cpaSchedulerStrategy, candidates []schedulerAuthCandidate) schedulerAuthCandidate {
 	if chosen, ok := globalSchedulerAffinity.pick(affinityKey, candidates); ok {
 		return chosen
 	}
-	chosen := globalSchedulerRotation.pick(rotationKey, candidates)
+	chosen := pickSchedulerCandidateByStrategy(rotationKey, strategy, candidates)
 	globalSchedulerAffinity.bind(affinityKey, chosen.ID)
 	return chosen
 }

@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.36`
+Current version: `0.1.37`
 
 ## Features
 
@@ -19,9 +19,9 @@ Current version: `0.1.36`
 - xAI account-pool dashboard for xAI OAuth JSON credentials, with xAI-specific 401/403/429 and free-usage-exhausted states.
 - xAI accounts are read through CPA `host.auth.list/get/get_runtime` when available, with filesystem fallback for older CPA versions; account rows classify Free, Super, and Heavy tiers from auth metadata.
 - Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
-- Optional Codex Session affinity for scheduler requests: the same Session can stay on the same account, or users can disable it to keep round-robin selection.
+- Optional Codex/xAI Session affinity for scheduler requests: the same Session can stay on the same account; without a usable binding, filtered candidates follow CPA `routing.strategy` (`fill-first` or `round-robin`).
 - Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
-- Account-protection and error filtering preserve CPA round-robin rotation within the highest-priority candidate tier.
+- Account-protection and error filtering preserve CPA `fill-first` or `round-robin` selection within the highest-priority candidate tier.
 - Configured accounts with no real requests display zero quota even when background health probes have captured quota headers.
 - Provider-aware cache read/write normalization keeps OpenAI-compatible and Anthropic-style usage, cache hit rates, and cost estimates consistent.
 - Summary cache keys are canonicalized and bounded in memory and SQLite for long-running installations.
@@ -158,11 +158,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.36_linux_amd64.zip
-codex-token-usage_0.1.36_linux_arm64.zip
-codex-token-usage_0.1.36_windows_amd64.zip
-codex-token-usage_0.1.36_darwin_amd64.zip
-codex-token-usage_0.1.36_darwin_arm64.zip
+codex-token-usage_0.1.37_linux_amd64.zip
+codex-token-usage_0.1.37_linux_arm64.zip
+codex-token-usage_0.1.37_windows_amd64.zip
+codex-token-usage_0.1.37_darwin_amd64.zip
+codex-token-usage_0.1.37_darwin_arm64.zip
 checksums.txt
 ```
 

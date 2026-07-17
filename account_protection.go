@@ -279,7 +279,7 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		state.InFlight, state.Tokens = snapshot.metrics(state.Aliases)
 		states = append(states, state)
 	}
-	chosen, ok := chooseProtectedCandidate(states, rotationKey, affinityKey)
+	chosen, ok := chooseProtectedCandidateWithStrategy(states, rotationKey, affinityKey, currentCPASchedulerStrategy())
 	if !ok {
 		return schedulerAuthCandidate{}, &schedulerRejectError{
 			Code:       "account_protection_saturated",
@@ -299,6 +299,10 @@ VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chos
 }
 
 func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string) (protectionCandidate, bool) {
+	return chooseProtectedCandidateWithStrategy(states, rotationKey, affinityKey, cpaSchedulerRoundRobin)
+}
+
+func chooseProtectedCandidateWithStrategy(states []protectionCandidate, rotationKey, affinityKey string, strategy cpaSchedulerStrategy) (protectionCandidate, bool) {
 	if len(states) == 0 {
 		return protectionCandidate{}, false
 	}
@@ -315,7 +319,7 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinit
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal", affinityKey, !hasBinding), true
+		return rotateProtectedCandidateWithStrategy(eligible, rotationKey+"\x00normal", affinityKey, !hasBinding, strategy), true
 	}
 	for _, state := range states {
 		if state.InFlight < state.Limit {
@@ -323,7 +327,7 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey, affinit
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted", affinityKey, !hasBinding), true
+		return rotateProtectedCandidateWithStrategy(eligible, rotationKey+"\x00demoted", affinityKey, !hasBinding, strategy), true
 	}
 	return protectionCandidate{}, false
 }
@@ -346,6 +350,10 @@ func boundProtectedCandidate(states []protectionCandidate, affinityKey string) (
 }
 
 func rotateProtectedCandidate(states []protectionCandidate, rotationKey, affinityKey string, bindAffinity bool) protectionCandidate {
+	return rotateProtectedCandidateWithStrategy(states, rotationKey, affinityKey, bindAffinity, cpaSchedulerRoundRobin)
+}
+
+func rotateProtectedCandidateWithStrategy(states []protectionCandidate, rotationKey, affinityKey string, bindAffinity bool, strategy cpaSchedulerStrategy) protectionCandidate {
 	candidates := make([]schedulerAuthCandidate, 0, len(states))
 	byID := make(map[string]protectionCandidate, len(states))
 	for _, state := range states {
@@ -356,9 +364,9 @@ func rotateProtectedCandidate(states []protectionCandidate, rotationKey, affinit
 	}
 	var chosen schedulerAuthCandidate
 	if bindAffinity {
-		chosen = pickSchedulerCandidate(rotationKey, affinityKey, candidates)
+		chosen = pickSchedulerCandidateWithStrategy(rotationKey, affinityKey, strategy, candidates)
 	} else {
-		chosen = globalSchedulerRotation.pick(rotationKey, candidates)
+		chosen = pickSchedulerCandidateByStrategy(rotationKey, strategy, candidates)
 	}
 	return byID[chosen.ID]
 }
