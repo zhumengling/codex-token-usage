@@ -226,3 +226,43 @@ VALUES ('blocked', 'blocked', 'codex', '5h', 'test', ?, ?, 1, 429)`, now, now+36
 		t.Fatalf("new-session response = %+v; want b", third)
 	}
 }
+
+func TestCodexSchedulerCanDisableSessionAffinity(t *testing.T) {
+	resetSchedulerSelectionState(t)
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_CONFIG_PATH", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	oldCfg := globalAccountProtection.config()
+	cfg := defaultPluginConfig()
+	cfg.SchedulerSessionAffinityEnabled = false
+	globalAccountProtection.configure(cfg)
+	t.Cleanup(func() { globalAccountProtection.configure(oldCfg) })
+	s := &store{}
+	t.Cleanup(s.close)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if _, err := db.Exec(`
+INSERT INTO autoban_bans (auth_id, auth_index, provider, window, reason, banned_at, reset_at, active, last_status_code)
+VALUES ('blocked', 'blocked', 'codex', '5h', 'test', ?, ?, 1, 429)`, now, now+3600); err != nil {
+		t.Fatal(err)
+	}
+	request := affinityTestRequest("round-robin-session")
+	request.Candidates = []schedulerAuthCandidate{
+		{ID: "blocked", Provider: "codex", Priority: 1, Attributes: map[string]string{"auth_index": "blocked"}},
+		{ID: "a", Provider: "codex", Priority: 1, Attributes: map[string]string{"auth_index": "a"}},
+		{ID: "b", Provider: "codex", Priority: 1, Attributes: map[string]string{"auth_index": "b"}},
+	}
+	first, err := s.pickAuth(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.pickAuth(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Handled || !second.Handled || first.AuthID != "a" || second.AuthID != "b" {
+		t.Fatalf("disabled-affinity responses = %+v, %+v; want a, b", first, second)
+	}
+}

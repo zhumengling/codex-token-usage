@@ -172,6 +172,11 @@ ORDER BY reset_at DESC`, now)
 			return nil, err
 		}
 		r.Active = active != 0
+		// External codex-api-key endpoints are reported under Provider /
+		// 接入点 and must never be rendered as account autobans.
+		if isCodexAPIKeyAutoban(r) {
+			continue
+		}
 		r.BannedAtText = unixTime(r.BannedAt)
 		r.ResetAtText = unixTime(r.ResetAt)
 		if r.ResetAt > now {
@@ -202,6 +207,14 @@ func mergeEffectiveAutobans(bans []autobanRow, invalids []invalidAuthRow) []auto
 	out = append(out, bans...)
 	for _, invalid := range invalids {
 		if !invalid.Active {
+			continue
+		}
+		if isCodexAPIKeyUsageRecord(usageRecord{
+			Provider:  invalid.Provider,
+			AuthID:    invalid.AuthID,
+			AuthIndex: invalid.AuthIndex,
+			Source:    invalid.Source,
+		}) {
 			continue
 		}
 		out = append(out, invalidAuthAsAutoban(invalid))

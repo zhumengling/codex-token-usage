@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.35`
+Current version: `0.1.36`
 
 ## Features
 
@@ -19,6 +19,7 @@ Current version: `0.1.35`
 - xAI account-pool dashboard for xAI OAuth JSON credentials, with xAI-specific 401/403/429 and free-usage-exhausted states.
 - xAI accounts are read through CPA `host.auth.list/get/get_runtime` when available, with filesystem fallback for older CPA versions; account rows classify Free, Super, and Heavy tiers from auth metadata.
 - Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
+- Optional Codex Session affinity for scheduler requests: the same Session can stay on the same account, or users can disable it to keep round-robin selection.
 - Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
 - Account-protection and error filtering preserve CPA round-robin rotation within the highest-priority candidate tier.
 - Configured accounts with no real requests display zero quota even when background health probes have captured quota headers.
@@ -56,6 +57,7 @@ plugins:
       单账号超时秒数: 20
       单账号最小冷却分钟: 10
 
+      同一个Session优先固定到同一个账号: true
       自动更新模型价格表: true
       模型价格更新间隔小时: 6
       模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
@@ -89,6 +91,7 @@ quota_trigger_mode: probe
 quota_trigger_max_concurrency: 1
 quota_trigger_timeout_seconds: 20
 quota_trigger_min_account_cooldown_minutes: 10
+scheduler_session_affinity_enabled: true
 model_price_auto_update_enabled: true
 model_price_update_interval_hours: 6
 model_price_update_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
@@ -155,11 +158,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.35_linux_amd64.zip
-codex-token-usage_0.1.35_linux_arm64.zip
-codex-token-usage_0.1.35_windows_amd64.zip
-codex-token-usage_0.1.35_darwin_amd64.zip
-codex-token-usage_0.1.35_darwin_arm64.zip
+codex-token-usage_0.1.36_linux_amd64.zip
+codex-token-usage_0.1.36_linux_arm64.zip
+codex-token-usage_0.1.36_windows_amd64.zip
+codex-token-usage_0.1.36_darwin_amd64.zip
+codex-token-usage_0.1.36_darwin_arm64.zip
 checksums.txt
 ```
 

@@ -305,6 +305,34 @@ func TestQuotaTriggerWarningLabelAndConfigCompatibility(t *testing.T) {
 	}
 }
 
+func TestSessionAffinityConfigLabelAndCompatibility(t *testing.T) {
+	const label = "同一个Session优先固定到同一个账号"
+	fields := pluginConfigFields()
+	index := -1
+	for i, field := range fields {
+		if field.Name == label {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		t.Fatalf("plugin config fields do not contain %q", label)
+	}
+	if index+1 >= len(fields) || fields[index+1].Name != "自动更新模型价格表" {
+		t.Fatalf("session affinity field should be immediately above model price auto-update field, got %q", fields[index+1].Name)
+	}
+	if !defaultPluginConfig().SchedulerSessionAffinityEnabled {
+		t.Fatal("session affinity should remain enabled by default for compatibility")
+	}
+	for _, key := range []string{"scheduler_session_affinity_enabled", "session_affinity_enabled", label} {
+		cfg := defaultPluginConfig()
+		cfg = parsePluginConfigYAML([]byte(key+": false\n"), cfg)
+		if cfg.SchedulerSessionAffinityEnabled {
+			t.Fatalf("session affinity config key %q was not accepted", key)
+		}
+	}
+}
+
 func TestAccountProtectionWarningLabelIsLastConfigGroupAndKeepsCompatibility(t *testing.T) {
 	const warningName = "开启账号保护调度（可能会影响缓存）"
 	wantLastGroup := []string{

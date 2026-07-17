@@ -77,9 +77,21 @@ func (c *schedulerStateCache) refresh(ctx context.Context, db *sql.DB) error {
 		now := time.Now().Unix()
 		var state schedulerRestrictionState
 		var activeBans, activeInvalids, activeXAI int
-		if err := db.QueryRowContext(ctx, `
-SELECT COUNT(*), COALESCE(MIN(reset_at),0) FROM autoban_bans WHERE active=1 AND reset_at>?`, now).Scan(&activeBans, &state.codexResetAt); err != nil {
+		// queryActiveAutobans filters legacy rows created for external
+		// codex-api-key endpoints, so those provider 429s cannot restrict the
+		// OAuth account scheduler.
+		bans, err := queryActiveAutobans(ctx, db, now)
+		if err != nil {
 			return schedulerRestrictionState{}, err
+		}
+		for _, ban := range bans {
+			if !ban.Active || ban.ResetAt <= now || isCodexAPIKeyAutoban(ban) {
+				continue
+			}
+			activeBans++
+			if state.codexResetAt == 0 || ban.ResetAt < state.codexResetAt {
+				state.codexResetAt = ban.ResetAt
+			}
 		}
 		if err := db.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM invalid_auths WHERE active=1`).Scan(&activeInvalids); err != nil {

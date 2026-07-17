@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.35"
+	pluginVersion    = "0.1.36"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -165,6 +165,7 @@ type pluginConfig struct {
 	QuotaTriggerMaxConcurrency              int
 	QuotaTriggerTimeoutSeconds              int
 	QuotaTriggerMinAccountCooldownMinutes   int
+	SchedulerSessionAffinityEnabled         bool
 	ModelPriceAutoUpdateEnabled             bool
 	ModelPriceUpdateIntervalHours           int
 	ModelPriceUpdateURL                     string
@@ -520,6 +521,7 @@ func pluginConfigFields() []configField {
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
 		{Name: "单账号超时秒数", Type: "number", Description: "单个账号触发请求超时时间，单位秒。默认 20。"},
 		{Name: "单账号最小冷却分钟", Type: "number", Description: "同一账号两次触发的最小冷却时间，单位分钟。默认 10。"},
+		{Name: "同一个Session优先固定到同一个账号", Type: "boolean", Description: "是否让插件在接管 Codex 账号调度时保持同一 Session 的账号粘性；关闭后按账号轮询。默认开启。"},
 		{Name: "自动更新模型价格表", Type: "boolean", Description: "是否自动下载并更新模型价格缓存。默认开启。"},
 		{Name: "模型价格更新间隔小时", Type: "number", Description: "模型价格缓存自动检查间隔，单位小时。默认 6。"},
 		{Name: "模型价格表地址", Type: "string", Description: "模型价格 JSON 下载地址。默认使用 LiteLLM 官方价格表。"},
@@ -996,6 +998,7 @@ func defaultPluginConfig() pluginConfig {
 		QuotaTriggerMaxConcurrency:              1,
 		QuotaTriggerTimeoutSeconds:              20,
 		QuotaTriggerMinAccountCooldownMinutes:   10,
+		SchedulerSessionAffinityEnabled:         true,
 		ModelPriceAutoUpdateEnabled:             true,
 		ModelPriceUpdateIntervalHours:           6,
 		ModelPriceUpdateURL:                     defaultModelPriceURL,
@@ -1028,6 +1031,9 @@ func configurePlugin(request []byte) error {
 		cfg = parsePluginConfigYAML(raw, cfg)
 	}
 	cfg = normalizePluginConfig(cfg)
+	if !cfg.SchedulerSessionAffinityEnabled {
+		globalSchedulerAffinity.reset()
+	}
 	globalAccountProtection.configure(cfg)
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
@@ -1117,6 +1123,9 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	}
 	if value, ok := configValue(values, "quota_trigger_min_account_cooldown_minutes", "单账号最小冷却分钟"); ok {
 		cfg.QuotaTriggerMinAccountCooldownMinutes = parseInt(value, cfg.QuotaTriggerMinAccountCooldownMinutes, 1, 1440)
+	}
+	if value, ok := configValue(values, "scheduler_session_affinity_enabled", "session_affinity_enabled", "同一个Session优先固定到同一个账号"); ok {
+		cfg.SchedulerSessionAffinityEnabled = parseBoolString(value, cfg.SchedulerSessionAffinityEnabled)
 	}
 	if value, ok := configValue(values, "model_price_auto_update_enabled", "自动更新模型价格表"); ok {
 		cfg.ModelPriceAutoUpdateEnabled = parseBoolString(value, cfg.ModelPriceAutoUpdateEnabled)
@@ -1356,6 +1365,15 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if err := ensureInvalidAuthColumns(ctx, db); err != nil {
+		return err
+	}
+	// API-key endpoints are provider endpoints, not Codex OAuth accounts.  Older
+	// versions could persist a 429 for the raw `sk-*` source in autoban_bans;
+	// retire those rows during startup so they cannot affect the scheduler or UI.
+	if err := cleanupExternalCodexAutobans(ctx, db); err != nil {
+		return err
+	}
+	if err := cleanupExternalCodexInvalidAuths(ctx, db); err != nil {
 		return err
 	}
 	return nil
@@ -2196,6 +2214,9 @@ func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord,
 	if !strings.EqualFold(trim(rec.Provider), "codex") {
 		return nil
 	}
+	if isCodexAPIKeyUsageRecord(rec) {
+		return nil
+	}
 	if status != http.StatusUnauthorized && status != http.StatusPaymentRequired {
 		return nil
 	}
@@ -2312,6 +2333,9 @@ func recordRepeatedForbiddenIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 		return nil
 	}
 	if !rec.Failed || status != http.StatusForbidden {
+		return nil
+	}
+	if isCodexAPIKeyUsageRecord(rec) {
 		return nil
 	}
 	account, ok := exactInvalidAuthAccountForRecord(rec)
@@ -2464,6 +2488,11 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	if !rec.Failed || status != http.StatusTooManyRequests {
 		return nil
 	}
+	// A codex-api-key request belongs to the external provider endpoint view.
+	// Never turn that endpoint (or its raw key) into an OAuth account autoban.
+	if isCodexAPIKeyUsageRecord(rec) {
+		return nil
+	}
 	authFile, authFileMTime := authFileStateForRecord(rec)
 	authID := invalidAuthIDForRecord(rec, authFile)
 	if authID == "" {
@@ -2504,6 +2533,172 @@ ON CONFLICT(auth_id) DO UPDATE SET
 	globalSchedulerState.finishRestrictionWrite("codex")
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+func isCodexAPIKeyUsageRecord(rec usageRecord) bool {
+	if !strings.EqualFold(strings.TrimSpace(rec.Provider), "codex") {
+		return false
+	}
+	if isAPIKeyAuthType(rec.AuthType) {
+		return true
+	}
+	for _, value := range []string{rec.APIKey, rec.AuthID, rec.AuthIndex, rec.Source} {
+		if isCodexAPIKeyIdentity(value) {
+			return true
+		}
+	}
+	// Match configured keys even when CPA supplies a non-standard identity
+	// string.  The comparison is exact after stripping an optional Bearer
+	// prefix; the key itself is never returned to the dashboard.
+	for _, entry := range readConfiguredProviderEntries() {
+		if !strings.EqualFold(strings.TrimSpace(entry.Provider), "codex") || strings.TrimSpace(entry.APIKey) == "" {
+			continue
+		}
+		key := normalizeAPIKeyIdentity(entry.APIKey)
+		for _, value := range []string{rec.APIKey, rec.AuthID, rec.AuthIndex, rec.Source} {
+			if normalizeAPIKeyIdentity(value) == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isCodexAPIKeySchedulerCandidate(candidate schedulerAuthCandidate) bool {
+	if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "codex") {
+		return false
+	}
+	values := []string{
+		candidate.ID,
+		candidate.Attributes["auth_type"], candidate.Attributes["authType"],
+		candidate.Attributes["api_key"], candidate.Attributes["apiKey"],
+		candidate.Attributes["source"], candidate.Attributes["auth_index"],
+		stringFromAny(candidate.Metadata["auth_type"]), stringFromAny(candidate.Metadata["authType"]),
+		stringFromAny(candidate.Metadata["api_key"]), stringFromAny(candidate.Metadata["apiKey"]),
+		stringFromAny(candidate.Metadata["source"]), stringFromAny(candidate.Metadata["auth_index"]),
+	}
+	for _, value := range []string{
+		candidate.Attributes["auth_type"], candidate.Attributes["authType"],
+		stringFromAny(candidate.Metadata["auth_type"]), stringFromAny(candidate.Metadata["authType"]),
+	} {
+		if isAPIKeyAuthType(value) {
+			return true
+		}
+	}
+	for _, value := range values {
+		if isCodexAPIKeyIdentity(value) {
+			return true
+		}
+	}
+	for _, entry := range readConfiguredProviderEntries() {
+		if !strings.EqualFold(strings.TrimSpace(entry.Provider), "codex") || strings.TrimSpace(entry.APIKey) == "" {
+			continue
+		}
+		key := normalizeAPIKeyIdentity(entry.APIKey)
+		for _, value := range values {
+			if normalizeAPIKeyIdentity(value) == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isAPIKeyAuthType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "apikey", "api_key", "api-key", "key":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeAPIKeyIdentity(value string) string {
+	value = strings.TrimSpace(strings.Trim(value, `"'`))
+	if len(value) >= len("Bearer ") && strings.EqualFold(value[:len("Bearer ")], "Bearer ") {
+		value = strings.TrimSpace(value[len("Bearer "):])
+	}
+	return strings.ToLower(value)
+}
+
+func isCodexAPIKeyIdentity(value string) bool {
+	value = normalizeAPIKeyIdentity(value)
+	return strings.HasPrefix(value, "sk-") || strings.HasPrefix(value, "codex:apikey:") || strings.HasPrefix(value, "codex-api-key:")
+}
+
+func isCodexAPIKeyAutoban(row autobanRow) bool {
+	return isCodexAPIKeyUsageRecord(usageRecord{
+		Provider:  row.Provider,
+		AuthID:    row.AuthID,
+		AuthIndex: row.AuthIndex,
+		Source:    row.Source,
+		AuthFile:  row.AuthFile,
+	})
+}
+
+func cleanupExternalCodexAutobans(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT auth_id, auth_index, source, provider, auth_file FROM autoban_bans WHERE active=1`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var row autobanRow
+		if err := rows.Scan(&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.AuthFile); err != nil {
+			rows.Close()
+			return err
+		}
+		if !isCodexAPIKeyAutoban(row) {
+			continue
+		}
+		if strings.TrimSpace(row.AuthID) != "" {
+			ids = append(ids, row.AuthID)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return rows.Err()
+	}
+	now := time.Now().Unix()
+	for _, authID := range ids {
+		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0, released_at=?, release_reason=? WHERE active=1 AND auth_id=?`, now, "external Codex API key is not an account", authID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanupExternalCodexInvalidAuths(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT auth_id, auth_index, source, provider FROM invalid_auths WHERE active=1`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var row invalidAuthRow
+		if err := rows.Scan(&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider); err != nil {
+			rows.Close()
+			return err
+		}
+		if isCodexAPIKeyUsageRecord(usageRecord{Provider: row.Provider, AuthID: row.AuthID, AuthIndex: row.AuthIndex, Source: row.Source}) && strings.TrimSpace(row.AuthID) != "" {
+			ids = append(ids, row.AuthID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, authID := range ids {
+		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, authID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2673,6 +2868,9 @@ WHERE active=1`)
 			return nil, err
 		}
 		row.Active = active != 0
+		if isCodexAPIKeyAutoban(row) {
+			continue
+		}
 		for _, value := range []string{row.AuthID, row.AuthIndex, row.Source} {
 			if file := fileNameIfJSON(value); file != "" {
 				row.AuthFile = file
@@ -3519,6 +3717,18 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if !isCodexSchedulerRequest(req) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
+	// codex-api-key candidates are external provider endpoints. Let CPA's
+	// builtin picker handle them; this plugin only schedules OAuth accounts.
+	managedCandidates := make([]schedulerAuthCandidate, 0, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		if !isCodexAPIKeySchedulerCandidate(candidate) {
+			managedCandidates = append(managedCandidates, candidate)
+		}
+	}
+	if len(managedCandidates) == 0 {
+		return schedulerPickResponse{Handled: false}, nil
+	}
+	req.Candidates = managedCandidates
 	if len(req.Candidates) == 0 {
 		return schedulerPickResponse{Handled: false}, nil
 	}
@@ -3596,7 +3806,10 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
 	}
 	rotationKey := schedulerRotationKey(req, "codex")
-	affinityKey := schedulerAffinityKey(req, "codex")
+	affinityKey := ""
+	if protectionCfg.SchedulerSessionAffinityEnabled {
+		affinityKey = schedulerAffinityKey(req, "codex")
+	}
 	if protectionCfg.AccountProtectionEnabled {
 		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg, rotationKey, affinityKey)
 		if err != nil {
@@ -3866,6 +4079,9 @@ LIMIT 1000`, now, now)
 			AuthID:    authID,
 			AuthIndex: authIndex,
 			Source:    source,
+		}
+		if isCodexAPIKeyUsageRecord(rec) {
+			continue
 		}
 		if recordReferencesMissingCurrentAuthFile(rec, configured, authSourceAuthoritative) {
 			continue
