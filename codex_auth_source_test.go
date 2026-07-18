@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,6 +58,73 @@ func TestCodexHostAuthSourceShowsUnusedAccountsInSummary(t *testing.T) {
 	status := globalCodexAuthSource.status()
 	if !status.Authoritative || status.Source != "host_callback" || status.Accounts != 2 {
 		t.Fatalf("Codex auth source status = %+v", status)
+	}
+}
+
+func TestCodexHostAuthSourceMergesExplicitDiskFilesMissingFromHost(t *testing.T) {
+	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{
+			{ID: "a.json", AuthIndex: "a-index", Name: "a.json", Path: "/auth/a.json", Provider: "codex", Email: "a@example.com"},
+			{ID: "b.json", AuthIndex: "b-index", Name: "b.json", Path: "/auth/b.json", Provider: "codex", Email: "b@example.com"},
+			{ID: "other.json", AuthIndex: "other-index", Name: "other.json", Provider: "antigravity"},
+		}})
+	})
+	s := newTestStore(t)
+	dir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", dir)
+	for _, name := range []string{"a.json", "b.json", "c.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(`{"type":"codex","email":"`+strings.TrimSuffix(name, ".json")+`@example.com"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := s.summaryOnce(context.Background(), "24h", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 3 {
+		t.Fatalf("accounts=%+v, want two registered plus one disk-only Codex account", accounts)
+	}
+	var waiting int
+	for _, account := range accounts {
+		if account.WaitingRuntimeLoad {
+			waiting++
+			if account.AuthFile != "c.json" || account.RuntimeRegistered {
+				t.Fatalf("waiting account=%+v, want c.json not registered", account)
+			}
+		}
+	}
+	if waiting != 1 {
+		t.Fatalf("waiting accounts=%d, want 1", waiting)
+	}
+	status := globalCodexAuthSource.status()
+	if status.HostEntries != 3 || status.RegisteredFiles != 2 || status.DiskCodexFiles != 3 || status.OtherProviders != 1 || status.WaitingRuntimeLoad != 1 {
+		t.Fatalf("source status=%+v, want host/provider reconciliation counts", status)
+	}
+}
+
+func TestCodexHostAuthSourceDoesNotInferUnknownDiskProvider(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", dir)
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "codex-looking.json"), []byte(`{"email":"unknown@example.com"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "model_prices.json"), []byte(`{"type":"codex"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{})
+	})
+	accounts := readConfiguredAuthAccounts()
+	if len(accounts) != 0 {
+		t.Fatalf("accounts=%+v, want unknown provider file excluded", accounts)
 	}
 }
 
@@ -341,6 +409,25 @@ func TestCodexHostAuthListChangeInvalidatesSummaryRevisionWithoutUsage(t *testin
 	second := authFilesRevision()
 	if first == second {
 		t.Fatalf("auth revision stayed %q after an unused host account was added", first)
+	}
+}
+
+func TestCodexDiskOnlyAccountInvalidatesHostBackedSummaryRevision(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", dir)
+	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{})
+	})
+	first := authFilesRevision()
+	if err := os.WriteFile(filepath.Join(dir, "pending.json"), []byte(`{"type":"codex","email":"pending@example.com"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second := authFilesRevision()
+	if first == second {
+		t.Fatalf("auth revision stayed %q after a disk-only Codex account was added", first)
 	}
 }
 

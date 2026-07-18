@@ -2596,10 +2596,14 @@ function renderAccounts(){
   const workspaceDeactivatedCount=allWorkspaceRows.length;
   const active429Count=isXAIPool()?rows.filter(r=>r.xai_state==='free_usage_exhausted'||r.xai_state==='rate_limited').length:autobanReleaseRows().length;
   const triggerFailed=rows.filter(r=>r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped').length;
-  const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.workspace_deactivated||r.xai_state||r.external_use_suspected||r.disabled||r.expired||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;
+  const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.workspace_deactivated||r.xai_state||r.external_use_suspected||r.disabled||r.expired||r.waiting_runtime_load||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;
   const quotaHot=[...rows].sort((a,b)=>maxQuota(b)-maxQuota(a))[0];
   const lowCache=[...rows].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0];
-  document.getElementById('account-scope').textContent='显示 '+(rows.length?start+1:0)+'-'+Math.min(start+pageRows.length,rows.length)+' / '+rows.length+'，已加载 '+allCount+' 个账号';
+  const authDiag=lastData&&lastData.diagnostics&&lastData.diagnostics.codex_auth||{};
+  const schedulerDiag=lastData&&lastData.diagnostics&&lastData.diagnostics.scheduler||{};
+  const sourceHint=Number(authDiag.waiting_runtime_load||0)>0?(' · '+fmt(authDiag.waiting_runtime_load)+' 个等待 CPA 加载'):Number(authDiag.other_providers||0)>0?(' · '+fmt(authDiag.other_providers)+' 个其他 Provider 未纳入 Codex 池'):'';
+  const schedulerHint=schedulerDiag.candidate_pool_stale?(' · 警告：CPA 候选缺少 '+fmt(schedulerDiag.missing_healthy_accounts||0)+' 个健康账号'):'';
+  document.getElementById('account-scope').textContent='显示 '+(rows.length?start+1:0)+'-'+Math.min(start+pageRows.length,rows.length)+' / '+rows.length+'，已加载 '+allCount+' 个账号'+sourceHint+schedulerHint;
   document.getElementById('account-loaded').textContent=fmt(rows.length)+' / '+fmt(allCount);
   document.getElementById('account-cost-total').textContent=money(rows.reduce((sum,r)=>sum+Number(r.cost_usd||0),0));
   document.getElementById('account-risk').textContent=fmt(riskCount);
@@ -2647,6 +2651,7 @@ function accountStatus(r){
   if(triggerRisk(r))return '<span class="status-pill warn" title="'+esc(r.quota_trigger_error||'quota trigger failed')+'">触发异常</span>';
   if(r.disabled)return '<span class="status-pill warn">已禁用</span>';
   if(r.expired)return '<span class="status-pill warn">已过期</span>';
+  if(r.waiting_runtime_load)return '<span class="status-pill warn" title="认证文件存在，但 CPA 尚未将其加载到运行时账号池。">等待 CPA 加载</span>';
   if(maxQuota(r)>=90)return '<span class="status-pill danger">额度高</span>';
   if(maxQuota(r)>=70)return '<span class="status-pill warn">接近额度</span>';
   if((r.requests||0)===0&&r.configured)return '<span class="status-pill warn">未使用</span>';
@@ -2677,7 +2682,8 @@ function accountIdentityCell(r){
 	if(r.xai_state)badges.push('<span class="pill danger" title="'+esc(r.xai_state_reason||'')+'">'+esc(xaiStateLabel(r.xai_state))+'</span>');
 	if(r.protection_concurrency_limit)badges.push('<span class="pill">在途 '+fmt(r.protection_in_flight||0)+' / '+fmt(r.protection_concurrency_limit)+'</span>');
 	if(r.protection_token_limit)badges.push('<span class="pill'+(r.protection_token_demoted?' danger':'')+'">5m '+compact(r.protection_window_tokens||0)+' / '+compact(r.protection_token_limit)+'</span>');
-  if(r.configured)badges.push('<span class="pill">已配置</span>');
+	if(r.configured)badges.push('<span class="pill">已配置</span>');
+	if(r.waiting_runtime_load)badges.push('<span class="pill warn" title="认证文件存在，但 CPA 尚未将其加载到运行时账号池。">等待 CPA 加载</span>');
 	if(r.invalid_auth){const forbidden=Number(r.invalid_auth_status_code)===403;badges.push('<span class="pill danger" title="'+esc(r.invalid_auth_at||'')+'">'+(forbidden?'403 拒绝':'401 失效')+'</span>')}
   if(r.workspace_deactivated)badges.push('<span class="pill danger" title="'+esc(r.workspace_deactivated_at||'')+'">402 工作区</span>');
   if(r.external_use_suspected)badges.push('<span class="pill danger" title="'+esc(r.external_use_reason||'')+'">外部消耗 '+pct(r.external_use_delta_percent)+'</span>');

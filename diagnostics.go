@@ -45,10 +45,25 @@ type authDiagnostics struct {
 }
 
 type schedulerDiagnostics struct {
-	ActiveBanCount      int    `json:"active_ban_count"`
-	FilteredCandidates  int    `json:"filtered_candidates"`
-	UnmatchedActiveBans int    `json:"unmatched_active_bans"`
-	LastFilteredAt      string `json:"last_filtered_at,omitempty"`
+	ActiveBanCount           int    `json:"active_ban_count"`
+	FilteredCandidates       int    `json:"filtered_candidates"`
+	UnmatchedActiveBans      int    `json:"unmatched_active_bans"`
+	RequestCandidates        int    `json:"request_candidates"`
+	CandidateHighestPriority int    `json:"candidate_highest_priority"`
+	MissingHealthyAccounts   int    `json:"missing_healthy_accounts"`
+	CandidatePoolStale       bool   `json:"candidate_pool_stale"`
+	LastFilteredAt           string `json:"last_filtered_at,omitempty"`
+	LastCandidatePoolCheckAt string `json:"last_candidate_pool_check_at,omitempty"`
+}
+
+func (t *schedulerDiagnosticsTracker) recordCandidatePool(requestCandidates, highestPriority, missingHealthyAccounts int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.state.RequestCandidates = requestCandidates
+	t.state.CandidateHighestPriority = highestPriority
+	t.state.MissingHealthyAccounts = missingHealthyAccounts
+	t.state.CandidatePoolStale = missingHealthyAccounts > 0
+	t.state.LastCandidatePoolCheckAt = time.Now().Format(time.RFC3339)
 }
 
 type schedulerDiagnosticsTracker struct {
@@ -489,6 +504,14 @@ func buildAlerts(data map[string]any) []dashboardAlert {
 		}
 		if len(diagnostics.Providers.UnmatchedConfigured) > 0 {
 			alerts = append(alerts, dashboardAlert{ID: "provider-unmatched", Severity: "info", Type: "provider_config", Scope: "provider", Target: "CPA config", Message: "存在已配置但暂无流量的接入点", Detail: strings.Join(diagnostics.Providers.UnmatchedConfigured, " / "), CreatedAt: now, Active: true})
+		}
+		if diagnostics.Scheduler.CandidatePoolStale {
+			alerts = append(alerts, dashboardAlert{
+				ID: "scheduler-candidate-pool", Severity: "critical", Type: "scheduler_candidate_pool", Scope: "system", Target: "CPA scheduler",
+				Message:   "CPA 调度候选池未包含健康账号",
+				Detail:    fmt.Sprintf("当前候选 %d 个，另有 %d 个健康注册账号未进入候选；插件不会绕过限制选择未知账号", diagnostics.Scheduler.RequestCandidates, diagnostics.Scheduler.MissingHealthyAccounts),
+				CreatedAt: diagnostics.Scheduler.LastCandidatePoolCheckAt, Active: true,
+			})
 		}
 	}
 	sort.SliceStable(alerts, func(i, j int) bool {

@@ -797,7 +797,13 @@ WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.Next
 func authFilesRevision() string {
 	_ = readConfiguredAuthAccounts()
 	if status := globalCodexAuthSource.status(); status.Authoritative && status.Source == "host_callback" {
-		return "host:" + globalCodexAuthSource.currentRevision()
+		hostRevision := "host:" + globalCodexAuthSource.currentRevision()
+		if authDir := configuredAuthDir(); authDir != "" {
+			if _, diskRevision, err := configuredAuthDirectorySnapshot(authDir); err == nil {
+				return hostRevision + "|disk:" + diskRevision
+			}
+		}
+		return hostRevision
 	}
 	authDir := configuredAuthDir()
 	if authDir == "" {
@@ -1190,6 +1196,9 @@ type accountRow struct {
 	AuthFileMTime                   int64    `json:"-"`
 	ChatGPTAccountID                string   `json:"chatgpt_account_id,omitempty"`
 	Configured                      bool     `json:"configured"`
+	Priority                        int      `json:"priority,omitempty"`
+	RuntimeRegistered               bool     `json:"runtime_registered,omitempty"`
+	WaitingRuntimeLoad              bool     `json:"waiting_runtime_load,omitempty"`
 	Disabled                        bool     `json:"disabled,omitempty"`
 	Expired                         bool     `json:"expired,omitempty"`
 	InvalidAuth                     bool     `json:"invalid_auth,omitempty"`
@@ -1282,6 +1291,10 @@ type configuredAccount struct {
 	AuthFile           string
 	AuthFileMTime      int64
 	AuthSourceKind     string
+	Priority           int
+	ProviderExplicit   bool
+	RuntimeRegistered  bool
+	WaitingRuntimeLoad bool
 	Disabled           bool
 	Expired            bool
 	PlanType           string
@@ -1635,16 +1648,18 @@ func readConfiguredAuthAccounts() []configuredAccount {
 	if err == nil {
 		var metadata []configuredAccount
 		for _, file := range readConfiguredAuthFiles() {
-			if isCodexAuthProvider(file.Provider) {
+			if isCodexAuthProvider(file.Provider) && file.ProviderExplicit {
 				metadata = append(metadata, file)
 			}
 		}
-		return mergeConfiguredAccountMetadata(accounts, metadata)
+		merged, waiting := reconcileConfiguredAccountMetadata(accounts, metadata)
+		globalCodexAuthSource.recordFilesystemReconciliation(len(metadata), waiting, len(merged))
+		return merged
 	}
 	files := readConfiguredAuthFiles()
 	out := make([]configuredAccount, 0, len(files))
 	for _, file := range files {
-		if isCodexAuthProvider(file.Provider) {
+		if isCodexAuthProvider(file.Provider) && file.ProviderExplicit {
 			out = append(out, file)
 		}
 	}
@@ -1711,12 +1726,13 @@ func readConfiguredAuthFiles() []configuredAccount {
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			continue
 		}
-		authType := normalizeAuthProvider(firstNonEmptyString(
+		rawProvider := firstNonEmptyString(
 			stringFromAny(doc["provider"]),
 			stringFromAny(doc["platform"]),
 			stringFromAny(doc["type"]),
 			stringFromAny(doc["auth_type"]),
-		), entry.Name())
+		)
+		authType := normalizeAuthProvider(rawProvider, entry.Name())
 		email := firstNonEmptyString(stringFromAny(doc["email"]), stringFromAny(doc["account"]), stringFromAny(doc["username"]))
 		name := stringFromAny(doc["name"])
 		authFile := entry.Name()
@@ -1726,21 +1742,22 @@ func readConfiguredAuthFiles() []configuredAccount {
 			xaiTier = classifyXAITierDocument(doc)
 		}
 		out = append(out, configuredAccount{
-			AuthIndex:      authFile,
-			AuthID:         email,
-			Source:         source,
-			Provider:       firstNonEmptyString(authType, "codex"),
-			Email:          email,
-			Name:           name,
-			AuthFile:       authFile,
-			AuthFileMTime:  info.ModTime().Unix(),
-			AuthSourceKind: authSourceKindFile,
-			Disabled:       boolFromAny(doc["disabled"]),
-			Expired:        boolFromAny(doc["expired"]),
-			PlanType:       firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
-			XAITier:        xaiTier.Tier,
-			XAITierSource:  xaiTier.Source,
-			XAITierDetail:  xaiTier.Detail,
+			AuthIndex:        authFile,
+			AuthID:           email,
+			Source:           source,
+			Provider:         firstNonEmptyString(authType, "codex"),
+			Email:            email,
+			Name:             name,
+			AuthFile:         authFile,
+			AuthFileMTime:    info.ModTime().Unix(),
+			AuthSourceKind:   authSourceKindFile,
+			ProviderExplicit: explicitCodexHostProvider(rawProvider) || (!isCodexAuthProvider(authType) && strings.TrimSpace(rawProvider) != ""),
+			Disabled:         boolFromAny(doc["disabled"]),
+			Expired:          boolFromAny(doc["expired"]),
+			PlanType:         firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
+			XAITier:          xaiTier.Tier,
+			XAITierSource:    xaiTier.Source,
+			XAITierDetail:    xaiTier.Detail,
 			AccessToken: firstNonEmptyString(
 				stringFromAny(doc["access_token"]),
 				stringFromAny(doc["accessToken"]),
@@ -1825,7 +1842,7 @@ func readTriggerAuthAccounts() []triggerAuthAccount {
 	files := readConfiguredAuthFiles()
 	out := make([]triggerAuthAccount, 0, len(files))
 	for _, file := range files {
-		if !isCodexAuthProvider(file.Provider) {
+		if !isCodexAuthProvider(file.Provider) || !file.ProviderExplicit {
 			continue
 		}
 		out = append(out, triggerAuthAccount{
@@ -2263,6 +2280,9 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 			AuthFileMTime:      cfg.AuthFileMTime,
 			ChatGPTAccountID:   cfg.ChatGPTAccountID,
 			Configured:         true,
+			Priority:           cfg.Priority,
+			RuntimeRegistered:  cfg.RuntimeRegistered,
+			WaitingRuntimeLoad: cfg.WaitingRuntimeLoad,
 			Disabled:           cfg.Disabled,
 			Expired:            cfg.Expired,
 			PlanType:           cfg.PlanType,
@@ -2347,6 +2367,9 @@ func accountFileIdentityAliases(row accountRow) []string {
 
 func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
 	row.Configured = true
+	row.Priority = cfg.Priority
+	row.RuntimeRegistered = row.RuntimeRegistered || cfg.RuntimeRegistered
+	row.WaitingRuntimeLoad = row.WaitingRuntimeLoad || cfg.WaitingRuntimeLoad
 	row.Disabled = cfg.Disabled
 	row.Expired = cfg.Expired
 	row.PlanType = firstNonEmptyString(row.PlanType, cfg.PlanType)

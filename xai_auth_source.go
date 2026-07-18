@@ -85,6 +85,15 @@ type xaiAuthSourceDiagnostics struct {
 	Source             string `json:"source"`
 	Authoritative      bool   `json:"authoritative"`
 	Accounts           int    `json:"accounts"`
+	HostEntries        int    `json:"host_entries,omitempty"`
+	RegisteredFiles    int    `json:"registered_files,omitempty"`
+	DiskCodexFiles     int    `json:"disk_codex_files,omitempty"`
+	OtherProviders     int    `json:"other_providers,omitempty"`
+	RuntimeOnly        int    `json:"runtime_only,omitempty"`
+	LegacyEntries      int    `json:"legacy_entries,omitempty"`
+	UnknownProviders   int    `json:"unknown_providers,omitempty"`
+	PluginDataEntries  int    `json:"plugin_data_entries,omitempty"`
+	WaitingRuntimeLoad int    `json:"waiting_runtime_load,omitempty"`
 	MetadataReadErrors int    `json:"metadata_read_errors"`
 	LastSuccessAt      string `json:"last_success_at,omitempty"`
 	LastError          string `json:"last_error,omitempty"`

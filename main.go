@@ -4154,14 +4154,24 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		recordSchedulerFilteringDiagnostics(bans, invalids, restrictionFilteredCandidates, matchedBanIndexes, matchedInvalidIndexes)
 	}
 	if !filtered && !protectionCfg.AccountProtectionEnabled {
+		globalSchedulerDiagnostics.recordCandidatePool(len(req.Candidates), highestSchedulerCandidatePriority(req.Candidates), 0)
 		if len(bans) == 0 && len(invalids) == 0 && s == globalStore {
 			globalSchedulerState.clearRestrictedIfGeneration("codex", stateGeneration)
 		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
+	missingHealthyAccounts := 0
 	if len(available) == 0 {
-		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
+		if protectionCfg.SchedulerSessionAffinityEnabled {
+			globalSchedulerAffinity.unbind(schedulerAffinityKey(req, "codex"))
+		}
+		if inventory, inventoryErr := readCodexHostAuthInventory(); inventoryErr == nil {
+			missingHealthyAccounts = countMissingHealthySchedulerAccounts(req.Candidates, inventory, bans, invalids)
+		}
+		globalSchedulerDiagnostics.recordCandidatePool(len(req.Candidates), highestSchedulerCandidatePriority(req.Candidates), missingHealthyAccounts)
+		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now, missingHealthyAccounts)
 	}
+	globalSchedulerDiagnostics.recordCandidatePool(len(req.Candidates), highestSchedulerCandidatePriority(req.Candidates), 0)
 	rotationKey := schedulerRotationKey(req, "codex")
 	affinityKey := ""
 	if protectionCfg.SchedulerSessionAffinityEnabled {
@@ -4295,8 +4305,11 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 }
 
-func newNoAvailableCodexAuthError(bans []autobanRow, now int64) error {
+func newNoAvailableCodexAuthError(bans []autobanRow, now int64, missingHealthyAccounts int) error {
 	message := "no available Codex auth candidates: all candidates are auto-banned by 429/401/402/403"
+	if missingHealthyAccounts > 0 {
+		message += fmt.Sprintf("; CPA candidate pool omitted %d healthy registered Codex account(s); refresh CPA auth scheduling state", missingHealthyAccounts)
+	}
 	if resetAt := earliestActiveBanReset(bans, now); resetAt > 0 {
 		message += "; earliest autoban reset at " + unixTime(resetAt)
 	}
@@ -4305,6 +4318,82 @@ func newNoAvailableCodexAuthError(bans []autobanRow, now int64) error {
 		Message:    message,
 		HTTPStatus: http.StatusServiceUnavailable,
 	}
+}
+
+func highestSchedulerCandidatePriority(candidates []schedulerAuthCandidate) int {
+	if len(candidates) == 0 {
+		return 0
+	}
+	highest := candidates[0].Priority
+	for _, candidate := range candidates[1:] {
+		if candidate.Priority > highest {
+			highest = candidate.Priority
+		}
+	}
+	return highest
+}
+
+func countMissingHealthySchedulerAccounts(candidates []schedulerAuthCandidate, inventory []configuredAccount, bans []autobanRow, invalids []invalidAuthRow) int {
+	seenAccounts := make(map[string]bool, len(inventory))
+	missing := 0
+	for _, account := range inventory {
+		if !isCodexAuthProvider(account.Provider) || account.Disabled || account.Expired || account.RuntimeUnavailable {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(account.RuntimeStatus))
+		if status == "disabled" || status == "expired" || status == "unavailable" {
+			continue
+		}
+		if configuredMatchesAutoban(account, bans) || configuredMatchesInvalidAuth(account, invalids) {
+			continue
+		}
+		key := configuredAccountKey(account)
+		if key == "" {
+			key = strings.Join(configuredAliases(account), "\x00")
+		}
+		if key == "" || seenAccounts[key] {
+			continue
+		}
+		seenAccounts[key] = true
+		matched := false
+		for _, candidate := range candidates {
+			if schedulerCandidateMatchesConfiguredAccount(candidate, account) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			missing++
+		}
+	}
+	return missing
+}
+
+func schedulerCandidateMatchesConfiguredAccount(candidate schedulerAuthCandidate, account configuredAccount) bool {
+	candidateStrict := schedulerCandidateStrictAliases(candidate)
+	accountStrict := normalizeAccountAliases(account.AuthFile, account.AuthIndex, account.ChatGPTAccountID)
+	if len(candidateStrict) > 0 && len(accountStrict) > 0 {
+		return aliasesIntersect(candidateStrict, accountStrict)
+	}
+	return aliasesIntersect(schedulerCandidateAliases(candidate), configuredAliases(account))
+}
+
+func aliasesIntersect(left, right []string) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(left))
+	for _, alias := range left {
+		if alias != "" {
+			set[alias] = struct{}{}
+		}
+	}
+	for _, alias := range right {
+		if _, ok := set[alias]; ok && alias != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func earliestActiveBanReset(bans []autobanRow, now int64) int64 {

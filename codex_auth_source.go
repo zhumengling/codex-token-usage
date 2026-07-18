@@ -76,14 +76,37 @@ func (m *codexAuthSourceManager) refreshHostInventory() error {
 		}
 		inventory := make([]configuredAccount, 0, len(response.Files))
 		accounts := make([]configuredAccount, 0, len(response.Files))
+		otherProviders := 0
+		unknownProviders := 0
+		pluginDataEntries := 0
+		runtimeOnly := 0
+		legacyEntries := 0
 		for _, entry := range response.Files {
+			if pluginOwnedHostAuthEntry(entry) {
+				pluginDataEntries++
+				continue
+			}
+			if !explicitCodexHostProvider(entry.Provider, entry.Type) {
+				provider := strings.ToLower(strings.TrimSpace(firstNonEmptyString(entry.Provider, entry.Type)))
+				if provider == "" || provider == "unknown" {
+					unknownProviders++
+				} else {
+					otherProviders++
+				}
+				continue
+			}
 			account, ok := configuredCodexHostAuthEntry(entry)
 			if !ok {
 				continue
 			}
 			inventory = append(inventory, account)
-			if account.AuthSourceKind == authSourceKindFile {
+			switch account.AuthSourceKind {
+			case authSourceKindFile:
 				accounts = append(accounts, account)
+			case authSourceKindRuntimeOnly:
+				runtimeOnly++
+			default:
+				legacyEntries++
 			}
 		}
 		revision := configuredAccountListRevision(inventory)
@@ -99,10 +122,17 @@ func (m *codexAuthSourceManager) refreshHostInventory() error {
 		m.revision = revision
 		m.lastError = nil
 		m.diagnostics = xaiAuthSourceDiagnostics{
-			Source:        "host_callback",
-			Authoritative: true,
-			Accounts:      len(accounts),
-			LastSuccessAt: now.Format(time.RFC3339),
+			Source:            "host_callback",
+			Authoritative:     true,
+			Accounts:          len(accounts),
+			HostEntries:       len(response.Files),
+			RegisteredFiles:   len(accounts),
+			OtherProviders:    otherProviders,
+			RuntimeOnly:       runtimeOnly,
+			LegacyEntries:     legacyEntries,
+			UnknownProviders:  unknownProviders,
+			PluginDataEntries: pluginDataEntries,
+			LastSuccessAt:     now.Format(time.RFC3339),
 		}
 		m.mu.Unlock()
 		return nil
@@ -136,6 +166,9 @@ func configuredCodexHostAuthEntry(entry hostAuthFileEntry) (configuredAccount, b
 		AuthFile:           authFile,
 		AuthFileMTime:      parseHostAuthUpdatedAt(firstNonEmptyString(entry.ModTime, entry.UpdatedAt)),
 		AuthSourceKind:     sourceKind,
+		Priority:           entry.Priority,
+		ProviderExplicit:   true,
+		RuntimeRegistered:  true,
 		Disabled:           entry.Disabled || strings.EqualFold(strings.TrimSpace(entry.Status), "disabled"),
 		Expired:            entry.Expired || strings.EqualFold(strings.TrimSpace(entry.Status), "expired"),
 		PlanType:           firstNonEmptyString(entry.PlanType, entry.Plan, entry.Subscription),
@@ -453,8 +486,25 @@ func (m *codexAuthSourceManager) markFilesystemFallback(accounts []configuredAcc
 	m.diagnostics.Source = "filesystem_fallback"
 	m.diagnostics.Authoritative = configuredAuthDirectoryReadable()
 	m.diagnostics.Accounts = len(accounts)
+	m.diagnostics.HostEntries = 0
+	m.diagnostics.RegisteredFiles = 0
+	m.diagnostics.DiskCodexFiles = len(accounts)
+	m.diagnostics.OtherProviders = 0
+	m.diagnostics.RuntimeOnly = 0
+	m.diagnostics.LegacyEntries = 0
+	m.diagnostics.UnknownProviders = 0
+	m.diagnostics.PluginDataEntries = 0
+	m.diagnostics.WaitingRuntimeLoad = 0
 	m.diagnostics.MetadataReadErrors = 0
 	m.diagnostics.LastError = sanitizeTriggerError(err)
+}
+
+func (m *codexAuthSourceManager) recordFilesystemReconciliation(diskCodexFiles, waitingRuntimeLoad, visibleAccounts int) {
+	m.mu.Lock()
+	m.diagnostics.DiskCodexFiles = diskCodexFiles
+	m.diagnostics.WaitingRuntimeLoad = waitingRuntimeLoad
+	m.diagnostics.Accounts = visibleAccounts
+	m.mu.Unlock()
 }
 
 func (m *codexAuthSourceManager) authoritative() bool {
@@ -493,6 +543,7 @@ func configuredAccountListRevision(accounts []configuredAccount) string {
 			account.AuthSourceKind,
 			account.Email,
 			strconv.FormatInt(account.AuthFileMTime, 10),
+			strconv.Itoa(account.Priority),
 			strconv.FormatBool(account.Disabled),
 			strconv.FormatBool(account.Expired),
 			account.RuntimeStatus,
@@ -509,39 +560,65 @@ func configuredAccountListRevision(accounts []configuredAccount) string {
 }
 
 func mergeConfiguredAccountMetadata(accounts, metadata []configuredAccount) []configuredAccount {
-	if len(accounts) == 0 || len(metadata) == 0 {
-		return accounts
+	merged, _ := reconcileConfiguredAccountMetadata(accounts, metadata)
+	return merged
+}
+
+func reconcileConfiguredAccountMetadata(accounts, metadata []configuredAccount) ([]configuredAccount, int) {
+	merged := cloneConfiguredAccounts(accounts)
+	if len(metadata) == 0 {
+		return merged, 0
 	}
-	index := make(map[string]configuredAccount, len(metadata)*4)
-	for _, item := range metadata {
+	index := make(map[string][]int, len(metadata)*4)
+	for i, item := range metadata {
 		for _, alias := range configuredAliases(item) {
 			if alias != "" {
-				index[alias] = item
+				index[alias] = append(index[alias], i)
 			}
 		}
 	}
 	emailCounts := configuredEmailCounts(metadata)
-	for i := range accounts {
+	matchedMetadata := make(map[int]bool, len(metadata))
+	for i := range merged {
 		var detail configuredAccount
-		found := false
-		for _, alias := range configuredAccountMatchAliases(accounts[i], emailCounts) {
-			if item, ok := index[alias]; ok {
-				detail = item
-				found = true
+		matchedIndex := -1
+		for _, alias := range configuredAccountMatchAliases(merged[i], emailCounts) {
+			for _, metadataIndex := range index[alias] {
+				if matchedMetadata[metadataIndex] {
+					continue
+				}
+				detail = metadata[metadataIndex]
+				matchedIndex = metadataIndex
+				break
+			}
+			if matchedIndex >= 0 {
 				break
 			}
 		}
-		if !found {
+		if matchedIndex < 0 {
 			continue
 		}
-		accounts[i].Email = firstNonEmptyString(accounts[i].Email, detail.Email)
-		accounts[i].Name = firstNonEmptyString(accounts[i].Name, detail.Name)
-		accounts[i].PlanType = firstNonEmptyString(accounts[i].PlanType, detail.PlanType)
-		accounts[i].ChatGPTAccountID = firstNonEmptyString(accounts[i].ChatGPTAccountID, detail.ChatGPTAccountID)
-		accounts[i].AccessToken = firstNonEmptyString(accounts[i].AccessToken, detail.AccessToken)
-		if accounts[i].AuthFileMTime == 0 {
-			accounts[i].AuthFileMTime = detail.AuthFileMTime
+		matchedMetadata[matchedIndex] = true
+		merged[i].Email = firstNonEmptyString(merged[i].Email, detail.Email)
+		merged[i].Name = firstNonEmptyString(merged[i].Name, detail.Name)
+		merged[i].PlanType = firstNonEmptyString(merged[i].PlanType, detail.PlanType)
+		merged[i].ChatGPTAccountID = firstNonEmptyString(merged[i].ChatGPTAccountID, detail.ChatGPTAccountID)
+		merged[i].AccessToken = firstNonEmptyString(merged[i].AccessToken, detail.AccessToken)
+		if merged[i].AuthFileMTime == 0 {
+			merged[i].AuthFileMTime = detail.AuthFileMTime
 		}
 	}
-	return accounts
+	waiting := 0
+	for i, item := range metadata {
+		authFile := fileNameIfJSON(item.AuthFile)
+		if matchedMetadata[i] || !item.ProviderExplicit || !isCodexAuthProvider(item.Provider) || authFile == "" || pluginOwnedDataPath(filepath.Join(configuredAuthDir(), authFile)) {
+			continue
+		}
+		item.RuntimeRegistered = false
+		item.WaitingRuntimeLoad = true
+		item.AuthSourceKind = authSourceKindFile
+		merged = append(merged, item)
+		waiting++
+	}
+	return merged, waiting
 }

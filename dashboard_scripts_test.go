@@ -67,6 +67,14 @@ func TestCodexPoolDataCarriesForbiddenAuths(t *testing.T) {
 	}
 }
 
+func TestDashboardExplainsWaitingRuntimeAccountsAndStaleCandidates(t *testing.T) {
+	for _, marker := range []string{"waiting_runtime_load", "等待 CPA 加载", "candidate_pool_stale", "CPA 候选缺少"} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard missing Issue #12 diagnostic marker %q", marker)
+		}
+	}
+}
+
 func TestInvalidAuthManagementUsesUnfilteredCountsAndPartialDeleteResults(t *testing.T) {
 	for _, marker := range []string{
 		"const allInvalidRows=",

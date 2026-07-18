@@ -110,6 +110,16 @@ func (m *schedulerAffinityManager) bind(key, authID string) {
 	m.bindings[key] = schedulerAffinityBinding{AuthID: authID, ExpiresAt: now.Add(schedulerAffinityTTL)}
 }
 
+func (m *schedulerAffinityManager) unbind(key string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.bindings, key)
+	m.mu.Unlock()
+}
+
 func (m *schedulerAffinityManager) evictOneLocked(now time.Time) {
 	oldestKey := ""
 	var oldestExpiry time.Time
