@@ -1302,29 +1302,35 @@ type triggerAuthAccount struct {
 }
 
 type quotaTriggerRun struct {
-	AuthID               string
-	AuthIndex            string
-	Source               string
-	Provider             string
-	AuthFile             string
-	AuthFileMTime        int64
-	Mode                 string
-	Status               string
-	HTTPStatus           int
-	Error                string
-	StartedAt            int64
-	FinishedAt           int64
-	PrimaryUsedPercent   *float64
-	PrimaryResetAt       *int64
-	SecondaryUsedPercent *float64
-	SecondaryResetAt     *int64
-	PrimaryUsedTokens    *int64
-	PrimaryRemaining     *int64
-	PrimaryLimit         *int64
-	SecondaryUsedTokens  *int64
-	SecondaryRemaining   *int64
-	SecondaryLimit       *int64
-	ResponseHeaders      map[string][]string
+	AuthID                      string
+	AuthIndex                   string
+	Source                      string
+	Provider                    string
+	AuthFile                    string
+	AuthFileMTime               int64
+	Mode                        string
+	Status                      string
+	HTTPStatus                  int
+	Error                       string
+	StartedAt                   int64
+	FinishedAt                  int64
+	PrimaryUsedPercent          *float64
+	PrimaryResetAt              *int64
+	SecondaryUsedPercent        *float64
+	SecondaryResetAt            *int64
+	PrimaryUsedTokens           *int64
+	PrimaryRemaining            *int64
+	PrimaryLimit                *int64
+	PrimaryWindowPresence       quotaWindowPresence
+	PrimaryLimitWindowSeconds   *int64
+	PrimaryResetAfterSeconds    *int64
+	SecondaryUsedTokens         *int64
+	SecondaryRemaining          *int64
+	SecondaryLimit              *int64
+	SecondaryWindowPresence     quotaWindowPresence
+	SecondaryLimitWindowSeconds *int64
+	SecondaryResetAfterSeconds  *int64
+	ResponseHeaders             map[string][]string
 }
 
 type quotaTriggerAccountStatus struct {

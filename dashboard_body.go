@@ -10,6 +10,7 @@ const dashboardBody = `</style>
       <input id="key" class="fallback-key" type="password" autocomplete="current-password" aria-label="CPA 管理密码备用输入" placeholder="管理密钥备用输入">
       <button id="auth-import-open" class="ghost" type="button">账号 JSON 导入</button>
       <button id="batch-proxy-open" class="ghost" type="button">批量写入代理</button>
+      <button id="quota-activation-open" class="ghost" type="button">一次性启动额度窗口</button>
       <select id="language" data-no-i18n aria-label="语言"><option value="zh">中文</option><option value="en">English</option></select>
       <select id="window" aria-label="统计窗口"><option value="24h">最近 24 小时</option><option value="today">今天</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="all">全部</option></select>
       <button id="export-logs" class="ghost">导出日志</button>
@@ -167,6 +168,25 @@ const dashboardBody = `</style>
       <button id="autoban-release-select-page" class="ghost" type="button">全选当前页</button>
       <button id="autoban-release-selected" class="ghost danger-ghost" type="button">解除选中</button>
       <button id="autoban-release-close-bottom" class="ghost" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+<div id="quota-activation-modal" class="modal-backdrop" hidden>
+  <div class="modal-panel quota-activation-panel" role="dialog" aria-modal="true" aria-labelledby="quota-activation-title">
+    <div class="modal-head"><h2 id="quota-activation-title">一次性启动 Codex 额度窗口</h2><button id="quota-activation-close" class="icon-button ghost" type="button" aria-label="关闭一次性额度启动">×</button></div>
+    <div class="modal-body">
+      <div class="modal-note">先预览，不会发送模型请求。默认仅选择至少一个明确上报窗口且所有上报窗口均完全新鲜的账号；执行时会发送一个最小真实 Codex 请求，不保证恰好消耗一个 Token。</div>
+      <label class="quota-activation-force"><input id="quota-activation-force" type="checkbox">强制恢复模式（必须明确选择账号，可绕过新鲜窗口检查）</label>
+      <div id="quota-activation-status" class="modal-status" role="status" aria-live="polite">等待预览新鲜账号。</div>
+      <div class="quota-activation-summary" id="quota-activation-summary"></div>
+      <div class="quota-activation-table-wrap"><table><thead><tr><th>选择</th><th>账号</th><th>Primary 上报窗口（前 → 后）</th><th>Secondary 上报窗口（前 → 后）</th><th>判定 / 结果</th></tr></thead><tbody id="quota-activation-results"></tbody></table></div>
+      <div class="quota-activation-pagination"><button id="quota-activation-prev" class="ghost" type="button">上一页</button><span id="quota-activation-page">1 / 1</span><button id="quota-activation-next" class="ghost" type="button">下一页</button></div>
+      <label class="quota-activation-ack"><input id="quota-activation-ack" type="checkbox">我确认执行会消耗少量真实 Codex 额度，并且成功请求无法撤销。</label>
+    </div>
+    <div class="modal-actions">
+      <button id="quota-activation-preview" class="ghost" type="button">预览新鲜账号</button>
+      <button id="quota-activation-run" type="button" disabled>仅执行选中账号一次</button>
+      <button id="quota-activation-close-bottom" class="ghost" type="button">关闭</button>
     </div>
   </div>
 </div>
