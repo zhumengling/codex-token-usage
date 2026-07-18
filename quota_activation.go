@@ -50,6 +50,7 @@ const (
 	activationPrimaryNotFresh    quotaActivationReason = "primary_not_fresh"
 	activationSecondaryNotFresh  quotaActivationReason = "secondary_not_fresh"
 	activationDuplicateCycle     quotaActivationReason = "duplicate_cycle"
+	activationCycleStateFailed   quotaActivationReason = "cycle_state_failed"
 	activationInventoryChanged   quotaActivationReason = "inventory_changed"
 	activationNoLongerEligible   quotaActivationReason = "no_longer_eligible"
 	activationPreviewNotEligible quotaActivationReason = "preview_not_eligible"
@@ -132,7 +133,7 @@ type quotaActivationAccountResult struct {
 	Reason     quotaActivationReason `json:"reason"`
 	Status     string                `json:"status"`
 	HTTPStatus int                   `json:"http_status,omitempty"`
-	CycleKey   string                `json:"cycle_key,omitempty"`
+	CycleKey   string                `json:"-"`
 	Before     *quotaActivationQuota `json:"before,omitempty"`
 	After      *quotaActivationQuota `json:"after,omitempty"`
 	Error      string                `json:"error,omitempty"`
@@ -415,55 +416,262 @@ func activationCycleKey(account configuredAccount, quota quotaActivationQuota) s
 	return hex.EncodeToString(sum[:])
 }
 
-func activationCycleKeyForReservation(ctx context.Context, db *sql.DB, account configuredAccount, quota quotaActivationQuota) (string, error) {
-	baseKey := activationCycleKey(account, quota)
-	observedAt := quota.ObservedAt
-	if observedAt <= 0 {
-		observedAt = time.Now().Unix()
+type activationCycleDecisionKind string
+
+const (
+	activationCycleNoPriorCycle           activationCycleDecisionKind = "no_prior_cycle"
+	activationCycleSameCycleBlocked       activationCycleDecisionKind = "same_cycle_blocked"
+	activationCycleScheduledSuccessor     activationCycleDecisionKind = "scheduled_successor"
+	activationCycleObservedResetSuccessor activationCycleDecisionKind = "observed_reset_successor"
+)
+
+type activationCycleDecision struct {
+	Kind     activationCycleDecisionKind
+	CycleKey string
+}
+
+type activationCycleRecord struct {
+	AccountKey        string
+	CycleKey          string
+	ReservedAt        int64
+	NextCycleAfter    int64
+	ActiveObservedAt  int64
+	RefreshObservedAt int64
+}
+
+type activationQuotaObservationState string
+
+const (
+	activationObservationInvalid activationQuotaObservationState = "invalid"
+	activationObservationFresh   activationQuotaObservationState = "fresh"
+	activationObservationActive  activationQuotaObservationState = "active"
+)
+
+func activationCycleObservationMarkersValid(cycle activationCycleRecord) bool {
+	if cycle.ActiveObservedAt < 0 || cycle.RefreshObservedAt < 0 {
+		return false
 	}
-	var predecessorKey string
-	var boundary int64
+	if cycle.ActiveObservedAt == 0 {
+		return cycle.RefreshObservedAt == 0
+	}
+	// A directly observed post-dispatch snapshot can share the reservation's
+	// Unix second, so equality is valid even though historical backfill requires
+	// a strictly later timestamp.
+	if cycle.ActiveObservedAt < cycle.ReservedAt {
+		return false
+	}
+	return cycle.RefreshObservedAt == 0 || cycle.RefreshObservedAt > cycle.ActiveObservedAt
+}
+
+func activationCycleDecisionForQuota(ctx context.Context, db *sql.DB, account configuredAccount, quota quotaActivationQuota) (activationCycleDecision, error) {
+	baseKey := activationCycleKey(account, quota)
+	accountKey := activationAccountKey(account)
+	predecessor, err := loadLatestActivationCycleGuard(ctx, db, accountKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return activationCycleDecision{Kind: activationCycleNoPriorCycle, CycleKey: baseKey}, nil
+	}
+	if err != nil {
+		return activationCycleDecision{}, err
+	}
+	predecessor, err = reconcileActivationCycleObservations(ctx, db, predecessor, []quotaActivationQuota{quota})
+	if err != nil {
+		return activationCycleDecision{}, err
+	}
+	currentState := classifyActivationQuotaObservation(quota)
+	if activationCycleObservationMarkersValid(predecessor) && predecessor.RefreshObservedAt > 0 && currentState == activationObservationFresh {
+		sum := sha256.Sum256([]byte(strings.Join([]string{
+			baseKey,
+			predecessor.CycleKey,
+			"observed-refresh",
+			strconv.FormatInt(predecessor.RefreshObservedAt, 10),
+		}, "\x00")))
+		return activationCycleDecision{Kind: activationCycleObservedResetSuccessor, CycleKey: hex.EncodeToString(sum[:])}, nil
+	}
+	if predecessor.NextCycleAfter > 0 && quota.ObservedAt > predecessor.NextCycleAfter && currentState == activationObservationFresh {
+		sum := sha256.Sum256([]byte(strings.Join([]string{baseKey, predecessor.CycleKey, strconv.FormatInt(predecessor.NextCycleAfter, 10)}, "\x00")))
+		return activationCycleDecision{Kind: activationCycleScheduledSuccessor, CycleKey: hex.EncodeToString(sum[:])}, nil
+	}
+	// A prior ambiguous or still-active dispatch guards the whole account, not
+	// merely one payload shape. This prevents changed window shapes and force
+	// mode from bypassing sent-unknown idempotency.
+	return activationCycleDecision{Kind: activationCycleSameCycleBlocked, CycleKey: predecessor.CycleKey}, nil
+}
+
+func activationCycleKeyForReservation(ctx context.Context, db *sql.DB, account configuredAccount, quota quotaActivationQuota) (string, error) {
+	decision, err := activationCycleDecisionForQuota(ctx, db, account, quota)
+	return decision.CycleKey, err
+}
+
+func loadLatestActivationCycleGuard(ctx context.Context, db *sql.DB, accountKey string) (activationCycleRecord, error) {
+	var record activationCycleRecord
+	record.AccountKey = accountKey
 	err := db.QueryRowContext(ctx, `
-SELECT cycle_key,next_cycle_after
+SELECT cycle_key,reserved_at,next_cycle_after,active_observed_at,refresh_observed_at
 FROM quota_activation_cycles
 WHERE account_key=? AND status IN ('dispatch_intent','verified','partial','sent_unknown')
 ORDER BY rowid DESC
-LIMIT 1`, activationAccountKey(account)).Scan(&predecessorKey, &boundary)
-	if errors.Is(err, sql.ErrNoRows) {
-		return baseKey, nil
-	}
-	if err != nil {
-		return "", err
-	}
-	// A prior ambiguous or still-active dispatch guards the whole account, not
-	// merely one payload shape. This prevents a changed presence/duration shape
-	// or force mode from bypassing sent-unknown idempotency.
-	if boundary <= 0 || observedAt <= boundary {
-		return predecessorKey, nil
-	}
-	if !activationQuotaIsFreshFullDuration(quota) {
-		return baseKey, nil
-	}
-	sum := sha256.Sum256([]byte(strings.Join([]string{baseKey, predecessorKey, strconv.FormatInt(boundary, 10)}, "\x00")))
-	return hex.EncodeToString(sum[:]), nil
+LIMIT 1`, accountKey).Scan(
+		&record.CycleKey, &record.ReservedAt, &record.NextCycleAfter, &record.ActiveObservedAt, &record.RefreshObservedAt,
+	)
+	return record, err
 }
 
-func activationQuotaIsFreshFullDuration(quota quotaActivationQuota) bool {
+func reconcileActivationCycleObservations(ctx context.Context, db *sql.DB, cycle activationCycleRecord, current []quotaActivationQuota) (activationCycleRecord, error) {
+	// Never repair contradictory persisted markers by guessing which timestamp is
+	// trustworthy. A malformed predecessor can still use an independently safe
+	// scheduled boundary, but it cannot mint an observed-reset successor.
+	if !activationCycleObservationMarkersValid(cycle) {
+		return cycle, nil
+	}
+	observations := append([]quotaActivationQuota(nil), current...)
+	if cycle.ActiveObservedAt == 0 || cycle.RefreshObservedAt == 0 {
+		history, err := loadActivationQuotaHistory(ctx, db, cycle.AccountKey)
+		if err != nil {
+			return activationCycleRecord{}, err
+		}
+		observations = append(observations, history...)
+	}
+	sort.SliceStable(observations, func(i, j int) bool { return observations[i].ObservedAt < observations[j].ObservedAt })
+	activeCandidate := cycle.ActiveObservedAt
+	refreshCandidate := cycle.RefreshObservedAt
+	for _, observation := range observations {
+		if observation.ObservedAt <= cycle.ReservedAt {
+			continue
+		}
+		switch classifyActivationQuotaObservation(observation) {
+		case activationObservationActive:
+			if activeCandidate == 0 {
+				activeCandidate = observation.ObservedAt
+			}
+		case activationObservationFresh:
+			if activeCandidate > 0 && observation.ObservedAt > activeCandidate && refreshCandidate == 0 {
+				refreshCandidate = observation.ObservedAt
+			}
+		}
+	}
+	if activeCandidate == cycle.ActiveObservedAt && refreshCandidate == cycle.RefreshObservedAt {
+		return cycle, nil
+	}
+	_, err := db.ExecContext(ctx, `
+UPDATE quota_activation_cycles
+SET active_observed_at=CASE
+      WHEN active_observed_at=0 AND ?>reserved_at THEN ?
+      ELSE active_observed_at
+    END,
+    refresh_observed_at=CASE
+      WHEN refresh_observed_at=0
+       AND ?>CASE WHEN active_observed_at>0 THEN active_observed_at ELSE ? END
+       AND CASE WHEN active_observed_at>0 THEN active_observed_at ELSE ? END>0
+      THEN ?
+      ELSE refresh_observed_at
+    END
+WHERE account_key=? AND cycle_key=?`,
+		activeCandidate, activeCandidate,
+		refreshCandidate, activeCandidate, activeCandidate, refreshCandidate,
+		cycle.AccountKey, cycle.CycleKey,
+	)
+	if err != nil {
+		return activationCycleRecord{}, err
+	}
+	err = db.QueryRowContext(ctx, `
+SELECT reserved_at,next_cycle_after,active_observed_at,refresh_observed_at
+FROM quota_activation_cycles WHERE account_key=? AND cycle_key=?`, cycle.AccountKey, cycle.CycleKey).Scan(
+		&cycle.ReservedAt, &cycle.NextCycleAfter, &cycle.ActiveObservedAt, &cycle.RefreshObservedAt,
+	)
+	return cycle, err
+}
+
+func loadActivationQuotaHistory(ctx context.Context, db *sql.DB, accountKey string) ([]quotaActivationQuota, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT before_quota_json,after_quota_json
+FROM quota_activation_job_accounts
+WHERE account_key=? AND (before_quota_json<>'' OR after_quota_json<>'')`, accountKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var observations []quotaActivationQuota
+	for rows.Next() {
+		var beforeJSON, afterJSON string
+		if err := rows.Scan(&beforeJSON, &afterJSON); err != nil {
+			return nil, err
+		}
+		for _, raw := range []string{beforeJSON, afterJSON} {
+			if quota := unmarshalActivationQuota(raw); quota != nil && quota.ObservedAt > 0 {
+				observations = append(observations, *quota)
+			}
+		}
+	}
+	return observations, rows.Err()
+}
+
+func classifyActivationQuotaObservation(quota quotaActivationQuota) activationQuotaObservationState {
+	if quota.ObservedAt <= 0 {
+		return activationObservationInvalid
+	}
 	reported := 0
+	active := false
 	for _, window := range []quotaActivationWindow{quota.Primary, quota.Secondary} {
 		switch parseQuotaWindowPresence(string(window.Presence)) {
 		case quotaWindowAbsent:
 			continue
 		case quotaWindowPresent:
 			reported++
-			if !activationWindowIsFreshFullDuration(window) {
-				return false
-			}
 		default:
-			return false
+			return activationObservationInvalid
+		}
+		_, reason := evaluateFreshActivationWindow(window, quota.ObservedAt)
+		switch reason {
+		case activationEligible:
+			if !activationWindowIsFreshFullDuration(window) {
+				return activationObservationInvalid
+			}
+		case activationPrimaryNotFresh:
+			active = true
+		default:
+			return activationObservationInvalid
 		}
 	}
-	return reported > 0
+	if reported == 0 {
+		return activationObservationInvalid
+	}
+	if active {
+		return activationObservationActive
+	}
+	return activationObservationFresh
+}
+
+func backfillQuotaActivationCycleObservations(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT account_key,cycle_key,reserved_at,next_cycle_after,active_observed_at,refresh_observed_at
+FROM quota_activation_cycles
+WHERE status IN ('dispatch_intent','verified','partial','sent_unknown')
+  AND (active_observed_at=0 OR refresh_observed_at=0)`)
+	if err != nil {
+		return err
+	}
+	var cycles []activationCycleRecord
+	for rows.Next() {
+		var cycle activationCycleRecord
+		if err := rows.Scan(&cycle.AccountKey, &cycle.CycleKey, &cycle.ReservedAt, &cycle.NextCycleAfter, &cycle.ActiveObservedAt, &cycle.RefreshObservedAt); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		cycles = append(cycles, cycle)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, cycle := range cycles {
+		if _, err := reconcileActivationCycleObservations(ctx, db, cycle, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func activationCycleBoundary(before, after quotaActivationQuota) int64 {
@@ -743,7 +951,7 @@ func (m *quotaActivationManager) runPreview(ctx context.Context, jobID string, f
 				return
 			}
 			_, identityStable := stableIndexes[normalizeAccountAlias(account.AuthIndex)]
-			row := previewActivationAccount(ctx, account, identityStable, force, selected, cfg)
+			row := previewActivationAccount(ctx, db, account, identityStable, force, selected, cfg)
 			if err := insertActivationAccount(ctx, db, jobID, row); err != nil {
 				jobErrOnce.Do(func() { jobErr = err })
 				return
@@ -782,7 +990,7 @@ func (m *quotaActivationManager) runPreview(ctx context.Context, jobID string, f
 	}
 }
 
-func previewActivationAccount(ctx context.Context, account configuredAccount, identityStable, force bool, selected map[string]struct{}, cfg pluginConfig) quotaActivationAccountResult {
+func previewActivationAccount(ctx context.Context, db *sql.DB, account configuredAccount, identityStable, force bool, selected map[string]struct{}, cfg pluginConfig) quotaActivationAccountResult {
 	row := activationAccountResultFromConfigured(account)
 	row.Status = "checking"
 	if !identityStable {
@@ -815,6 +1023,20 @@ func previewActivationAccount(ctx context.Context, account configuredAccount, id
 	row.Eligible = decision.Eligible
 	row.Reason = decision.Reason
 	if decision.Eligible {
+		cycleDecision, cycleErr := activationCycleDecisionForQuota(ctx, db, account, quota)
+		if cycleErr != nil {
+			row.Eligible = false
+			row.Reason = activationCycleStateFailed
+			row.Status = "failed"
+			row.Error = sanitizeTriggerError(cycleErr)
+			return row
+		}
+		if cycleDecision.Kind == activationCycleSameCycleBlocked {
+			row.Eligible = false
+			row.Reason = activationDuplicateCycle
+			row.Status = "skipped"
+			return row
+		}
 		row.Status = "eligible"
 	} else if decision.Reason == activationQuotaReadFailed {
 		row.Status = "failed"
@@ -1022,9 +1244,14 @@ func executeQuotaActivationAccount(ctx context.Context, db *sql.DB, runID string
 		finishActivationAccount(ctx, db, runID, row.AccountKey, "skipped", reason, 0, quotaErr, quotaPointer(before, quotaErr), "")
 		return
 	}
-	cycleKey, cycleErr := activationCycleKeyForReservation(ctx, db, current, before)
+	cycleDecision, cycleErr := activationCycleDecisionForQuota(ctx, db, current, before)
 	if cycleErr != nil {
-		finishActivationAccount(ctx, db, runID, row.AccountKey, "failed_before_send", activationEligible, 0, cycleErr, &before, "")
+		finishActivationAccount(ctx, db, runID, row.AccountKey, "failed_before_send", activationCycleStateFailed, 0, cycleErr, &before, "")
+		return
+	}
+	cycleKey := cycleDecision.CycleKey
+	if cycleDecision.Kind == activationCycleSameCycleBlocked {
+		finishActivationAccount(ctx, db, runID, row.AccountKey, "skipped", activationDuplicateCycle, 0, nil, &before, cycleKey)
 		return
 	}
 	reserved, reserveErr := reserveActivationCycle(ctx, db, row.AccountKey, cycleKey, runID)
@@ -1251,7 +1478,18 @@ func updateActivationCycle(ctx context.Context, db *sql.DB, accountKey, cycleKey
 
 func updateActivationCycleOutcome(ctx context.Context, db *sql.DB, accountKey, cycleKey, status string, before, after quotaActivationQuota) error {
 	boundary := activationCycleBoundary(before, after)
-	_, err := db.ExecContext(ctx, `UPDATE quota_activation_cycles SET status=?,next_cycle_after=?,updated_at=? WHERE account_key=? AND cycle_key=?`, status, boundary, time.Now().Unix(), accountKey, cycleKey)
+	activeObservedAt := int64(0)
+	if classifyActivationQuotaObservation(after) == activationObservationActive {
+		activeObservedAt = after.ObservedAt
+	}
+	_, err := db.ExecContext(ctx, `
+UPDATE quota_activation_cycles
+SET status=?,next_cycle_after=?,updated_at=?,
+    active_observed_at=CASE
+      WHEN active_observed_at=0 AND ?>=reserved_at AND ?>0 THEN ?
+      ELSE active_observed_at
+    END
+WHERE account_key=? AND cycle_key=?`, status, boundary, time.Now().Unix(), activeObservedAt, activeObservedAt, activeObservedAt, accountKey, cycleKey)
 	return err
 }
 
@@ -1550,6 +1788,12 @@ func activationAPIError(status int, err error) managementResponse {
 }
 
 func pruneQuotaActivationState(ctx context.Context, db *sql.DB, cutoff int64) (int64, error) {
+	// Reconcile durable before/after snapshots before retention removes them. The
+	// latest account guard then carries the monotonic active/refresh evidence it
+	// needs to distinguish one event-driven successor without preserving old jobs.
+	if err := backfillQuotaActivationCycleObservations(ctx, db); err != nil {
+		return 0, err
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1570,6 +1814,7 @@ WHERE updated_at < ? AND (
     SELECT 1 FROM quota_activation_cycles AS newer
     WHERE newer.account_key=quota_activation_cycles.account_key
       AND newer.rowid>quota_activation_cycles.rowid
+      AND newer.status IN ('dispatch_intent','verified','partial','sent_unknown')
   )
 )`, cutoff); err != nil {
 		return 0, err

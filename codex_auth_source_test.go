@@ -311,13 +311,24 @@ func TestMatchCodexHostAuthInventoryExactMapsFilesystemProbeToStableHostIndex(t 
 
 func TestConfiguredCodexFileInventoryMatchesHostRecordedFileByFileName(t *testing.T) {
 	inventory := configuredCodexFileInventory([]configuredAccount{{
-		AuthID: "same@example.com", AuthIndex: "b.json", AuthFile: "b.json", Email: "same@example.com", Provider: "codex",
+		AuthID: "same@example.com", AuthIndex: "b.json", AuthFile: "b.json", Email: "same@example.com", Provider: "codex", ProviderExplicit: true,
 	}})
 	match, ok := matchCodexHostAuthInventoryExact(invalidAuthRow{
 		AuthID: "stable-host-id", AuthIndex: "opaque-host-index", AuthFile: "b.json", AuthSourceKind: authSourceKindFile,
 	}, inventory)
 	if !ok || match.AuthFile != "b.json" {
 		t.Fatalf("filesystem-only identity match = %+v, %v, want b.json", match, ok)
+	}
+}
+
+func TestConfiguredCodexFileInventoryRejectsImplicitProviderFallback(t *testing.T) {
+	inventory := configuredCodexFileInventory([]configuredAccount{
+		{AuthFile: "implicit.json", Provider: "codex"},
+		{AuthFile: "explicit.json", Provider: "codex", ProviderExplicit: true},
+		{AuthFile: "other.json", Provider: "xai", ProviderExplicit: true},
+	})
+	if len(inventory) != 1 || inventory[0].AuthFile != "explicit.json" {
+		t.Fatalf("filesystem fallback inventory=%+v, want only explicit Codex provider", inventory)
 	}
 }
 

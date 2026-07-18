@@ -227,6 +227,8 @@ CREATE TABLE IF NOT EXISTS quota_activation_cycles (
   reserved_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   next_cycle_after INTEGER NOT NULL DEFAULT 0,
+  active_observed_at INTEGER NOT NULL DEFAULT 0,
+  refresh_observed_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(account_key, cycle_key)
 );
 CREATE INDEX IF NOT EXISTS idx_quota_activation_cycles_updated ON quota_activation_cycles(updated_at);
@@ -265,10 +267,23 @@ func ensureQuotaActivationColumns(ctx context.Context, db *sql.DB) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	if !existing["next_cycle_after"] {
-		_, err = db.ExecContext(ctx, `ALTER TABLE quota_activation_cycles ADD COLUMN next_cycle_after INTEGER NOT NULL DEFAULT 0`)
+	columns := []struct {
+		name string
+		sql  string
+	}{
+		{name: "next_cycle_after", sql: `ALTER TABLE quota_activation_cycles ADD COLUMN next_cycle_after INTEGER NOT NULL DEFAULT 0`},
+		{name: "active_observed_at", sql: `ALTER TABLE quota_activation_cycles ADD COLUMN active_observed_at INTEGER NOT NULL DEFAULT 0`},
+		{name: "refresh_observed_at", sql: `ALTER TABLE quota_activation_cycles ADD COLUMN refresh_observed_at INTEGER NOT NULL DEFAULT 0`},
 	}
-	return err
+	for _, column := range columns {
+		if existing[column.name] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, column.sql); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ensureInvalidAuthColumns(ctx context.Context, db *sql.DB) error {

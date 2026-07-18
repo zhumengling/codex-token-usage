@@ -5354,7 +5354,7 @@ WHERE active=1 AND auth_id=?`, action.sourceKind, action.authFile, action.authFi
 func configuredCodexFileInventory(accounts []configuredAccount) []configuredAccount {
 	out := make([]configuredAccount, 0, len(accounts))
 	for _, account := range accounts {
-		if !isCodexAuthProvider(account.Provider) || fileNameIfJSON(account.AuthFile) == "" {
+		if !account.ProviderExplicit || !isCodexAuthProvider(account.Provider) || fileNameIfJSON(account.AuthFile) == "" {
 			continue
 		}
 		account.AuthID = ""
