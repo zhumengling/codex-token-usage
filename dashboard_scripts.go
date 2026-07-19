@@ -1751,7 +1751,7 @@ const i18nEn={
   '窗口：':'Window: ',
   '数据库：':'DB: ',
   '更新时间：':'Updated: ',
-  '按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。':'Aggregate CPA usage by account: tokens, cache rate, request health, 5h/7d quota windows, and recent anomalies.',
+  '按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、账号当前上报的动态额度窗口和最近异常。':'Aggregate CPA usage by account: tokens, cache rate, request health, dynamically reported quota windows, and recent anomalies.',
   '语言':'Language',
   '中文':'Chinese',
   '批量写入代理':'Batch proxy',
@@ -1841,8 +1841,9 @@ const i18nEn={
   '不可用状态':'Unavailable states',
   '活跃账号':'Active accounts',
   '可识别账号':'Recognized accounts',
-  '7d/月剩余额度':'7d/month remaining quota',
+  '窗口 2 额度估算':'Window 2 quota estimate',
   '按账号额度快照估算':'Estimated from account quota snapshots',
+  '按账号最近探测到的窗口 2 估算':'Estimated from each account\'s latest window 2 probe',
   '额度触发':'Quota trigger',
   '默认关闭':'Off by default',
   'Top 账号占比':'Top account share',
@@ -1877,8 +1878,8 @@ const i18nEn={
   '账号排序方式':'Account sort',
   '按 Token':'By tokens',
   '按费用':'By cost',
-  '按 7d/月余量':'By 7d/month remaining',
-  '按 7d/月总额度':'By 7d/month total quota',
+  '按动态窗口余量':'By dynamic window remaining',
+  '按动态窗口总额度':'By dynamic window total quota',
   '按平均耗时':'By avg latency',
   '按 401 失效':'By 401 invalid',
   '按 402 工作区':'By 402 workspace',
@@ -1947,11 +1948,11 @@ const i18nEn={
   '成功率':'Success rate',
   '性能':'Performance',
   '总 Token / 费用':'Total tokens / cost',
-  '5h 窗口':'5h window',
+  '窗口 1':'Window 1',
   '错误状态':'Error state',
   '恢复时间':'Recovery time',
   '错误':'Errors',
-  '7d/月窗口 / 额度预估':'7d/month window / quota estimate',
+  '窗口 2 / 额度预估':'Window 2 / quota estimate',
   '最近':'Recent',
   '状态':'Status',
   '自动禁用状态':'Auto-ban status',
@@ -2089,7 +2090,7 @@ const i18nEn={
   '覆盖':'Covers',
   '个账号':'accounts',
   '总额':'Total',
-  '等待 7d/月额度快照':'Waiting for 7d/month quota snapshots',
+  '等待窗口 2 额度快照':'Waiting for window 2 quota snapshots',
   '运行中':'Running',
   '已开启':'On',
   '已关闭':'Off',
@@ -2097,7 +2098,7 @@ const i18nEn={
   '成功':'success',
   '失败':'failed',
   '跳过':'skipped',
-  '默认关闭 · quota 查询不保证启动 5h 窗口':'Off by default · quota query does not guarantee starting the 5h window',
+  '默认关闭 · quota 查询不保证启动动态额度窗口':'Off by default · quota query does not guarantee starting a dynamic quota window',
   '显示':'Showing',
   '已加载':'loaded',
   '外部消耗':'External use',
@@ -2415,10 +2416,10 @@ function renderPoolPage(source){
   document.getElementById('m-bans').textContent=fmt(data.autobans.length);
   document.getElementById('m-accounts').textContent=fmt((data.accounts||[]).length);
   document.getElementById('m-7d-remaining').textContent=quotaValue(t.secondary_quota_remaining_estimate);
-  document.getElementById('m-7d-remaining-sub').textContent=(t.secondary_quota_estimated_accounts||0)>0?'覆盖 '+fmt(t.secondary_quota_estimated_accounts)+' 个账号 · 总额 '+quotaValue(t.secondary_quota_total_estimate):'等待 7d/月额度快照';
+  document.getElementById('m-7d-remaining-sub').textContent=(t.secondary_quota_estimated_accounts||0)>0?'覆盖 '+fmt(t.secondary_quota_estimated_accounts)+' 个账号 · 总额 '+quotaValue(t.secondary_quota_total_estimate):'等待窗口 2 额度快照';
   const qt=(source&&source.quota_trigger)||{};
   document.getElementById('m-trigger').textContent=qt.enabled?(qt.running?'运行中':'已开启'):'已关闭';
-  document.getElementById('m-trigger-sub').textContent=qt.enabled?('模式 '+(qt.mode||'quota')+' · '+(qt.interval_minutes||10)+'m · 成功 '+fmt(qt.last_success||0)+' / 失败 '+fmt(qt.last_failed||0)+' / 跳过 '+fmt(qt.last_skipped||0)):'默认关闭 · quota 查询不保证启动 5h 窗口';
+  document.getElementById('m-trigger-sub').textContent=qt.enabled?('模式 '+(qt.mode||'quota')+' · '+(qt.interval_minutes||10)+'m · 成功 '+fmt(qt.last_success||0)+' / 失败 '+fmt(qt.last_failed||0)+' / 跳过 '+fmt(qt.last_skipped||0)):'默认关闭 · quota 查询不保证启动动态额度窗口';
   const top=data.accounts[0]?.total_tokens||0;
   document.getElementById('m-topshare').textContent=pct(ratio(top,total));
   document.getElementById('m-latency').textContent=fmtLatencyMs(t.avg_latency_ms);
@@ -2436,7 +2437,7 @@ function renderPoolPage(source){
 }
 function renderPoolLabels(data){
   const xai=data.provider==='xai';
-  document.getElementById('pool-hero-hint').textContent=xai?'按账号聚合 xAI usage：Token 消耗、缓存率、请求健康和 xAI 专属错误状态。':'按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。';
+  document.getElementById('pool-hero-hint').textContent=xai?'按账号聚合 xAI usage：Token 消耗、缓存率、请求健康和 xAI 专属错误状态。':'按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、账号当前上报的动态额度窗口和最近异常。';
   document.getElementById('m-total-sub').textContent=xai?'xAI 账号池合计':'Codex 账号池合计';
   document.getElementById('m-429-sub').textContent=xai?'免费额度耗尽 / 短期限流':'限流/额度打满';
   document.getElementById('m-bans-label').textContent=xai?'不可用状态':'自动禁用';
@@ -2450,10 +2451,10 @@ function renderPoolLabels(data){
   if(stateTitle)stateTitle.textContent=xai?'xAI 账号状态':'自动禁用状态';
   if(stateMini)stateMini.textContent=xai?'401/403 更换认证后解除，免费额度耗尽按 24 小时恢复，普通 429 短期退避':'429 按 reset_at 恢复，401/402 处理认证文件后解除';
   const accountHeads=document.querySelectorAll('.account-table thead th');
-  if(accountHeads[6])accountHeads[6].textContent=xai?'错误状态':'5h 窗口';
-  if(accountHeads[7])accountHeads[7].textContent=xai?'恢复时间':'7d/月窗口 / 额度预估';
+  if(accountHeads[6])accountHeads[6].textContent=xai?'错误状态':'窗口 1';
+  if(accountHeads[7])accountHeads[7].textContent=xai?'恢复时间':'窗口 2 / 额度预估';
   const quotaToggle=document.querySelector('#account-columns input[data-col="quota5h"]');
-  if(quotaToggle&&quotaToggle.parentElement.lastChild)quotaToggle.parentElement.lastChild.textContent=xai?'错误':'5h';
+  if(quotaToggle&&quotaToggle.parentElement.lastChild)quotaToggle.parentElement.lastChild.textContent=xai?'错误':'窗口 1';
   document.getElementById('invalid-auth-card').disabled=xai;
   document.getElementById('workspace-deactivated-card').disabled=xai;
   document.getElementById('autoban-release-card').disabled=xai;
@@ -2666,8 +2667,8 @@ function renderAccountTable(rows,total){
     td(perfCell(r),'num','perf')+
     td(tokenCostStack(r,total),'num')+
     td(metricStack(pct(cacheRate(r)),compact(cacheTokens(r))),'num','cache')+
-    td(isXAIPool()?xaiAccountStateCell(r):quotaCompact('5h',r.primary_used_percent,r.primary_window_tokens,r.primary_reset_at),'num','quota5h')+
-    td(isXAIPool()?xaiAccountResetCell(r):quota7dCell(r),'num')+
+    td(isXAIPool()?xaiAccountStateCell(r):quotaWindowCell(r,'primary'),'num','quota5h')+
+    td(isXAIPool()?xaiAccountResetCell(r):quotaWindow2Cell(r),'num')+
     td('<span class="'+((r.rate_limited||0)>0?'danger':'ok')+'">'+fmt(r.rate_limited||0)+'</span>','num')+
     td(esc(r.last_seen||'-'))+td(accountStatus(r),'','status')+
   '</tr>').join('') || '<tr><td colspan="11" class="muted">没有匹配的账号。</td></tr>';
@@ -2709,15 +2710,21 @@ function accountSuccessCell(r){if((r.requests||0)===0)return '<span class="muted
 function quotaRemainingSortValue(r){return Number(r.secondary_quota_total_estimate||0)>0?Number(r.secondary_quota_remaining_estimate||0):Number.MAX_SAFE_INTEGER}
 function quotaTotalSortValue(r){return Number(r.secondary_quota_total_estimate||0)}
 function quotaValue(v,allowZero=false){const n=Number(v||0);return n>0||allowZero?compact(n):'-'}
-function quotaWindowLabel(r){return (r.secondary_quota_window||'7d')==='month'?'月':'7d'}
+function quotaWindowPresence(r,prefix){return String(r&&r[prefix+'_quota_window_presence']||'').toLowerCase()}
+function quotaWindowLabel(r,prefix){prefix=prefix||'secondary';const presence=quotaWindowPresence(r,prefix);if(presence==='absent')return '';const raw=firstText(r&&r[prefix+'_quota_window'],quotaWindowLabelFromSeconds(r&&r[prefix+'_quota_window_seconds']));if(raw==='month')return '月';if(raw==='week')return '7d';return raw}
+function quotaWindowLabelFromSeconds(value){const seconds=Number(value||0);if(!Number.isFinite(seconds)||seconds<=0)return '';if(seconds>=4*3600&&seconds<=6*3600)return '5h';if(seconds>=6*86400&&seconds<=10*86400)return '7d';if(seconds>=25*86400&&seconds<=35*86400)return '月';if(seconds%86400===0)return (seconds/86400)+'d';if(seconds%3600===0)return (seconds/3600)+'h';return Math.round(seconds)+'s'}
+function quotaWindowHasData(r,prefix){return quotaWindowPresence(r,prefix)==='present'||r&&r[prefix+'_used_percent']!=null||Number(r&&r[prefix+'_reset_at']||0)>0||Number(r&&r[prefix+'_window_tokens']||0)>0}
+function quotaWindowMissingCell(r,prefix){const presence=quotaWindowPresence(r,prefix);if(presence==='absent')return '<span class="metric-stack"><b class="muted">无窗口</b><span>最近探测未上报</span></span>';if(!quotaWindowHasData(r,prefix))return '<span class="metric-stack"><b class="muted">-</b><span>尚未探测</span></span>';return ''}
+function quotaWindowCell(r,prefix){const missing=quotaWindowMissingCell(r,prefix);if(missing)return missing;const label=quotaWindowLabel(r,prefix)||'窗口';return quotaCompact(label,r[prefix+'_used_percent'],r[prefix+'_window_tokens'],r[prefix+'_reset_at'])}
 function quotaEstimateCell(r){
   const total=Number(r.secondary_quota_total_estimate||0), remaining=Number(r.secondary_quota_remaining_estimate||0);
-  if(total<=0)return '<span class="metric-stack"><b class="muted">-</b><span>样本不足</span></span>';
+  if(total<=0)return '<span class="metric-stack"><b class="muted">-</b><span>'+(!quotaWindowHasData(r,'secondary')?'尚未探测':'暂无 Token 容量')+'</span></span>';
   const usedPct=ratio(total-remaining,total);
   const tone=usedPct>=90?'danger':usedPct>=70?'warn':'ok';
-  return '<span class="metric-stack" title="按当前 '+quotaWindowLabel(r)+' 窗口已用 Token、额度百分比和最近 quota trigger 快照实时估算"><b class="'+tone+'">余 '+quotaValue(remaining,true)+'</b><span>总 '+quotaValue(total)+' · 已用 '+pct(usedPct)+'</span></span>';
+  return '<span class="metric-stack" title="按当前 '+(quotaWindowLabel(r,'secondary')||'动态')+' 窗口已用 Token、额度百分比和最近 quota trigger 快照实时估算"><b class="'+tone+'">余 '+quotaValue(remaining,true)+'</b><span>总 '+quotaValue(total)+' · 已用 '+pct(usedPct)+'</span></span>';
 }
-function quota7dCell(r){return '<div class="metric-stack">'+quotaCompact(quotaWindowLabel(r),r.secondary_used_percent,r.secondary_window_tokens,r.secondary_reset_at)+quotaEstimateCell(r)+'</div>'}
+function quotaWindow2Cell(r){const missing=quotaWindowMissingCell(r,'secondary');return '<div class="metric-stack">'+(missing||quotaCompact(quotaWindowLabel(r,'secondary')||'窗口',r.secondary_used_percent,r.secondary_window_tokens,r.secondary_reset_at))+quotaEstimateCell(r)+'</div>'}
+function quotaSummaryText(r){const parts=[];if(quotaWindowHasData(r,'primary'))parts.push((quotaWindowLabel(r,'primary')||'窗口 1')+' '+pct(r.primary_used_percent));else if(quotaWindowPresence(r,'primary')==='absent')parts.push('窗口 1 无');if(quotaWindowHasData(r,'secondary'))parts.push((quotaWindowLabel(r,'secondary')||'窗口 2')+' '+pct(r.secondary_used_percent));else if(quotaWindowPresence(r,'secondary')==='absent')parts.push('窗口 2 无');return parts.length?parts.join(' · '):'暂无额度快照'}
 function tokenCostStack(r,total){const cost=r.cost_available||Number(r.cost_usd||0)>0?money(r.cost_usd):'缺价格'; const cls=r.cost_available?'cost-line':'cost-weak'; return '<span class="metric-stack"><b>'+compact(r.total_tokens)+'</b><span>占 '+pct(ratio(r.total_tokens,total))+'</span><span class="'+cls+'">'+esc(cost)+'</span></span>'}
 function renderProviders(rows,total){
   document.getElementById('providers').innerHTML=rows.map(r=>'<tr>'+
@@ -2774,7 +2781,7 @@ function renderInsights(data){
     ['403 拒绝',forbidden?accountName(forbidden):'0 个账号',forbidden?'权限被拒绝，需检查账号权限或认证':'当前没有权限拒绝',forbidden?'tone-red':'tone-green'],
     ['402 工作区',workspace?accountName(workspace):'0 个账号',workspace?'Team 工作区失效，删除或替换 json 后解除':'当前没有工作区失效',workspace?'tone-orange':'tone-green'],
     ['外部消耗',external?accountName(external):'0 个账号',external?external.external_use_window+' +'+pct(external.external_use_delta_percent)+' · 本地 '+compact(external.external_use_local_tokens)+' tok':'未发现一号多卖迹象',external?'tone-red':'tone-green'],
-    ['额度最高',quota?accountName(quota):'-',quota?'5h '+pct(quota.primary_used_percent)+' · '+quotaWindowLabel(quota)+' '+pct(quota.secondary_used_percent):'暂无额度快照',maxQuota(quota||{})>=90?'tone-red':maxQuota(quota||{})>=70?'tone-orange':''],
+    ['额度最高',quota?accountName(quota):'-',quota?quotaSummaryText(quota):'暂无额度快照',maxQuota(quota||{})>=90?'tone-red':maxQuota(quota||{})>=70?'tone-orange':''],
     ['缓存最低',lowCache?accountName(lowCache):'-',lowCache?'缓存率 '+pct(cacheRate(lowCache))+' · 输入 '+compact(lowCache.input_tokens):'暂无输入 Token',lowCache&&cacheRate(lowCache)<30?'tone-orange':'']
   ];
   if(noisy&&(noisy.rate_limited||0)>0){items.push(['429 最多',accountName(noisy),fmt(noisy.rate_limited)+' 次 · 失败 '+fmt(noisy.failed),'tone-red'])}
@@ -2800,7 +2807,7 @@ function renderAutobans(rows){
   document.getElementById('autoban-page-label').textContent=autobanPage+' / '+pages;
   document.getElementById('autoban-prev').disabled=autobanPage<=1;
   document.getElementById('autoban-next').disabled=autobanPage>=pages;
-  const heads=document.getElementById('autobans').closest('table').querySelectorAll('thead th'); if(heads[4])heads[4].textContent=isXAIPool()?'检测时间':'封禁时间'; if(heads[5])heads[5].textContent=isXAIPool()?'恢复时间':'解禁时间'; if(heads[7])heads[7].textContent=isXAIPool()?'HTTP':'5h'; if(heads[8])heads[8].textContent=isXAIPool()?'类型':'7d';
+  const heads=document.getElementById('autobans').closest('table').querySelectorAll('thead th'); if(heads[4])heads[4].textContent=isXAIPool()?'检测时间':'封禁时间'; if(heads[5])heads[5].textContent=isXAIPool()?'恢复时间':'解禁时间'; if(heads[7])heads[7].textContent=isXAIPool()?'HTTP':'窗口 1'; if(heads[8])heads[8].textContent=isXAIPool()?'类型':'窗口 2';
   document.getElementById('autobans').innerHTML=pageRows.map(r=>'<tr>'+
     td(esc(r.source||r.auth_id||'-'))+td(esc(r.auth_index||'-'))+td(esc(r.window||'-'))+td(esc(r.reason||'-'))+
     td(esc(r.banned_at_text||'-'))+td(esc(isXAIPool()?r.reset_at_text:autobanResetText(r)))+td(esc(isXAIPool()?(Number(r.seconds_remaining)>=0?duration(r.seconds_remaining):'需处理'):autobanRemainingText(r)),'num')+

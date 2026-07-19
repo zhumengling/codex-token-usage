@@ -318,7 +318,7 @@ func TestSuccessfulQuotaProbeClearsRecoveredRestriction(t *testing.T) {
 	}
 }
 
-func TestQuotaProbeRechecksInvalidAccountsDespiteFullQuotaSnapshot(t *testing.T) {
+func TestQuotaProbeSkipsInvalidAccountsDespiteFullQuotaSnapshot(t *testing.T) {
 	authFile := "probe-account.json"
 	for _, status := range []int{http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -362,10 +362,67 @@ INSERT INTO quota_trigger_runs (
 			if err != nil {
 				t.Fatal(err)
 			}
-			if skipped != 0 || len(candidates) != 1 || candidates[0].AuthFile != authFile {
-				t.Fatalf("status=%d skipped=%d candidates=%+v, want one health-recheck candidate", status, skipped, candidates)
+			if skipped != 1 || len(candidates) != 0 {
+				t.Fatalf("status=%d skipped=%d candidates=%+v, want unavailable account skipped", status, skipped, candidates)
 			}
 		})
+	}
+}
+
+func TestQuotaProbeSkipsActive429UntilReset(t *testing.T) {
+	s := newTestStore(t)
+	authDir := os.Getenv("CPA_AUTH_DIR")
+	authFile := "rate-limited.json"
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir, authFile), []byte(`{
+  "type": "codex",
+  "email": "rate-limited@example.com",
+  "access_token": "test-token"
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if _, err := db.Exec(`
+INSERT INTO autoban_bans (
+  auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code, auth_file
+) VALUES (?, ?, ?, 'codex', '14d', 'quota trigger', ?, ?, 1, ?, ?)`,
+		authFile, authFile, "rate-limited@example.com", now-30, now+3600, http.StatusTooManyRequests, authFile); err != nil {
+		t.Fatal(err)
+	}
+	candidates, skipped, err := selectQuotaTriggerCandidates(context.Background(), db, defaultPluginConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped != 1 || len(candidates) != 0 {
+		t.Fatalf("active 429 skipped=%d candidates=%+v, want skipped until reset", skipped, candidates)
+	}
+	generation := globalSchedulerState.generation("codex")
+	if err := expireAutobans(context.Background(), db, now+3601); err != nil {
+		t.Fatal(err)
+	}
+	if globalSchedulerState.generation("codex") <= generation {
+		t.Fatal("expired 429 did not invalidate scheduler state")
+	}
+	var active int
+	var releaseReason string
+	if err := db.QueryRow(`SELECT active,release_reason FROM autoban_bans WHERE auth_id=?`, authFile).Scan(&active, &releaseReason); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 || releaseReason != "reset_at reached" {
+		t.Fatalf("expired 429 active=%d release_reason=%q", active, releaseReason)
+	}
+	candidates, skipped, err = selectQuotaTriggerCandidates(context.Background(), db, defaultPluginConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped != 0 || len(candidates) != 1 || candidates[0].AuthFile != authFile {
+		t.Fatalf("expired 429 skipped=%d candidates=%+v, want one candidate after reset", skipped, candidates)
 	}
 }
 

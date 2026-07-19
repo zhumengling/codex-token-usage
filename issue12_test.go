@@ -118,6 +118,54 @@ INSERT INTO autoban_bans (
 	}
 }
 
+func TestDeleteThenReaddSameJSONDoesNotRestoreOldRestriction(t *testing.T) {
+	resetSchedulerStateForTest()
+	t.Cleanup(resetSchedulerStateForTest)
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if _, err := db.Exec(`
+INSERT INTO invalid_auths (
+  auth_id, auth_index, source, provider, reason, invalidated_at, active,
+  last_status_code, auth_file, auth_source_kind
+) VALUES ('foo.json', 'foo.json', 'same@example.com', 'codex', '401 unauthorized', ?, 1, 401, 'foo.json', 'file')`, now-100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO autoban_bans (
+  auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
+  last_status_code, auth_file, auth_file_mtime
+) VALUES ('foo.json', 'foo.json', 'same@example.com', 'codex', '14d', 'quota exhausted', ?, ?, 1, 429, 'foo.json', ?)`, now-100, now+3600, now-200); err != nil {
+		t.Fatal(err)
+	}
+	generation := globalSchedulerState.generation("codex")
+	if err := clearMissingConfiguredAuthState(context.Background(), db, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if globalSchedulerState.generation("codex") <= generation {
+		t.Fatal("deleting the old JSON did not invalidate scheduler state")
+	}
+	// Re-adding the same filename must not reactivate historical database rows.
+	if err := clearMissingConfiguredAuthState(context.Background(), db, []configuredAccount{{
+		AuthID: "new-stable-id", AuthIndex: "foo.json", AuthFile: "foo.json", Source: "same@example.com", Provider: "codex", AuthSourceKind: authSourceKindFile,
+	}}, true); err != nil {
+		t.Fatal(err)
+	}
+	var invalidActive, banActive int
+	if err := db.QueryRow(`SELECT active FROM invalid_auths WHERE auth_id='foo.json'`).Scan(&invalidActive); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT active FROM autoban_bans WHERE auth_id='foo.json'`).Scan(&banActive); err != nil {
+		t.Fatal(err)
+	}
+	if invalidActive != 0 || banActive != 0 {
+		t.Fatalf("re-added JSON restored old state: invalid=%d ban=%d", invalidActive, banActive)
+	}
+}
+
 func TestAllFilteredSchedulingForcesFreshHostAuthList(t *testing.T) {
 	now := time.Now().Unix()
 	email := "old@example.com"

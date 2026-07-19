@@ -44,7 +44,7 @@ func TestUnusedAccountDoesNotInheritAnotherAccountsQuota(t *testing.T) {
 	}
 }
 
-func TestUnusedAccountDoesNotDisplayItsOwnQuotaProbe(t *testing.T) {
+func TestUnusedAccountDisplaysItsOwnQuotaProbe(t *testing.T) {
 	s := newTestStore(t)
 	insertQuotaSnapshotForTest(t, s, "user@example.com", "user.json", "user@example.com", "user.json", 303, 12, 3)
 	db, _, err := s.open(context.Background())
@@ -56,8 +56,8 @@ func TestUnusedAccountDoesNotDisplayItsOwnQuotaProbe(t *testing.T) {
 		Email: "user@example.com", AuthFile: "user.json", AuthFileMTime: 303, Requests: 0,
 	}}
 	applyLatestQuotaSnapshots(context.Background(), db, accounts, time.Now().Add(-24*time.Hour).Unix())
-	if accounts[0].PrimaryUsedPercent != nil || accounts[0].SecondaryUsedPercent != nil {
-		t.Fatalf("unused account displayed probe quota: %+v", accounts[0])
+	if accounts[0].PrimaryUsedPercent == nil || *accounts[0].PrimaryUsedPercent != 12 || accounts[0].SecondaryUsedPercent == nil || *accounts[0].SecondaryUsedPercent != 3 {
+		t.Fatalf("unused account did not display probe quota: %+v", accounts[0])
 	}
 }
 

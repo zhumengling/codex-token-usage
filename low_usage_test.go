@@ -428,6 +428,8 @@ func TestQueryHasXAIUsageUsesProviderIndexPath(t *testing.T) {
 }
 
 func TestInvalidAuthUsesEventTimeSoNewAuthFileClearsOld401(t *testing.T) {
+	resetSchedulerStateForTest()
+	t.Cleanup(resetSchedulerStateForTest)
 	ctx := context.Background()
 	s := newTestStore(t)
 	authDir := os.Getenv("CPA_AUTH_DIR")
@@ -472,8 +474,12 @@ func TestInvalidAuthUsesEventTimeSoNewAuthFileClearsOld401(t *testing.T) {
 	if invalids[0].InvalidatedAt != oldFailureAt.Unix() {
 		t.Fatalf("invalidated_at = %d, want event time %d", invalids[0].InvalidatedAt, oldFailureAt.Unix())
 	}
+	generation := globalSchedulerState.generation("codex")
 	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
 		t.Fatalf("clear replaced invalid auths: %v", err)
+	}
+	if globalSchedulerState.generation("codex") <= generation {
+		t.Fatal("replaced auth cleared 401 without invalidating scheduler state")
 	}
 	invalids, err = queryActiveInvalidAuths(ctx, db)
 	if err != nil {

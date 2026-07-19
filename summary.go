@@ -748,6 +748,12 @@ func summaryPrecomputeStale(data map[string]any) bool {
 }
 
 func (s *store) currentRevision(ctx context.Context) (storeRevision, error) {
+	return withSQLiteAutoRepair(ctx, s, "current revision", func() (storeRevision, error) {
+		return s.currentRevisionOnce(ctx)
+	})
+}
+
+func (s *store) currentRevisionOnce(ctx context.Context) (storeRevision, error) {
 	if s == nil {
 		return storeRevision{Revision: "empty"}, nil
 	}
@@ -1250,13 +1256,19 @@ type accountRow struct {
 	PrimaryUsedPercent              *float64 `json:"primary_used_percent,omitempty"`
 	PrimaryResetAt                  *int64   `json:"primary_reset_at,omitempty"`
 	PrimaryQuotaWindow              string   `json:"primary_quota_window,omitempty"`
+	PrimaryQuotaWindowPresence      string   `json:"primary_quota_window_presence,omitempty"`
 	PrimaryQuotaSource              string   `json:"primary_quota_source,omitempty"`
 	PrimaryQuotaObservedFrom        string   `json:"primary_quota_observed_from,omitempty"`
+	PrimaryQuotaWindowSeconds       int64    `json:"primary_quota_window_seconds,omitempty"`
+	PrimaryQuotaResetAfterSeconds   int64    `json:"primary_quota_reset_after_seconds,omitempty"`
 	PrimaryWindowTokens             int64    `json:"primary_window_tokens"`
 	SecondaryUsedPercent            *float64 `json:"secondary_used_percent,omitempty"`
 	SecondaryResetAt                *int64   `json:"secondary_reset_at,omitempty"`
 	SecondaryWindowTokens           int64    `json:"secondary_window_tokens"`
 	SecondaryQuotaWindow            string   `json:"secondary_quota_window,omitempty"`
+	SecondaryQuotaWindowPresence    string   `json:"secondary_quota_window_presence,omitempty"`
+	SecondaryQuotaWindowSeconds     int64    `json:"secondary_quota_window_seconds,omitempty"`
+	SecondaryQuotaResetAfterSeconds int64    `json:"secondary_quota_reset_after_seconds,omitempty"`
 	QuotaWindowSource               string   `json:"quota_window_source,omitempty"`
 	SecondaryQuotaSource            string   `json:"secondary_quota_source,omitempty"`
 	SecondaryQuotaObservedFrom      string   `json:"secondary_quota_observed_from,omitempty"`
@@ -2530,15 +2542,18 @@ func looksOpaqueAccountKey(value string) bool {
 }
 
 type quotaWindowSnapshot struct {
-	Percent       sql.NullFloat64
-	ResetAt       sql.NullInt64
-	Source        string
-	ObservedAt    int64
-	ID            int64
-	AuthIndex     string
-	AuthID        string
-	AuthFile      string
-	AuthFileMTime int64
+	Presence           quotaWindowPresence
+	Percent            sql.NullFloat64
+	ResetAt            sql.NullInt64
+	LimitWindowSeconds sql.NullInt64
+	ResetAfterSeconds  sql.NullInt64
+	Source             string
+	ObservedAt         int64
+	ID                 int64
+	AuthIndex          string
+	AuthID             string
+	AuthFile           string
+	AuthFileMTime      int64
 }
 
 func queryLatestAccountWindowQuota(ctx context.Context, db *sql.DB, account accountRow, since int64, window string) quotaWindowSnapshot {
@@ -2554,22 +2569,28 @@ func queryLatestAccountWindowQuotaSnapshots(ctx context.Context, db *sql.DB, acc
 	index := newQuotaAccountIdentityIndex(accounts)
 	percentColumn := "primary_used_percent"
 	resetColumn := "primary_reset_at"
+	presenceColumn := "primary_window_presence"
+	limitWindowColumn := "primary_limit_window_seconds"
+	resetAfterColumn := "primary_reset_after_seconds"
 	if window == "secondary" {
 		percentColumn = "secondary_used_percent"
 		resetColumn = "secondary_reset_at"
+		presenceColumn = "secondary_window_presence"
+		limitWindowColumn = "secondary_limit_window_seconds"
+		resetAfterColumn = "secondary_reset_after_seconds"
 	}
 	query := `
-SELECT source_type, id, observed_at, auth_index, auth_id, source, auth_file, auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `
+SELECT source_type, id, observed_at, auth_index, auth_id, source, auth_file, auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `, window_presence, limit_window_seconds, reset_after_seconds
 FROM (
-  SELECT 'usage' AS source_type, id, requested_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, '' AS auth_file, 0 AS auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `
+  SELECT 'usage' AS source_type, id, requested_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, '' AS auth_file, 0 AS auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `, '' AS window_presence, NULL AS limit_window_seconds, NULL AS reset_after_seconds
   FROM usage_events
   WHERE requested_at >= ?
   AND (` + trustedUsageQuotaSnapshotSQL() + `)
   AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
   UNION ALL
-  SELECT 'trigger' AS source_type, id, finished_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, lower(auth_file) AS auth_file, auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `
+  SELECT 'trigger' AS source_type, id, finished_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, lower(auth_file) AS auth_file, auth_file_mtime, ` + percentColumn + `, ` + resetColumn + `, ` + presenceColumn + `, ` + limitWindowColumn + `, ` + resetAfterColumn + `
   FROM quota_trigger_runs
-  WHERE finished_at >= ? AND status='success' AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
+  WHERE finished_at >= ? AND status='success' AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL OR ` + presenceColumn + ` <> '')
 ) snapshots
 ORDER BY observed_at DESC, id DESC`
 	rows, err := db.QueryContext(ctx, query, since, since)
@@ -2581,9 +2602,11 @@ ORDER BY observed_at DESC, id DESC`
 	for rows.Next() {
 		var snapshot quotaWindowSnapshot
 		var source string
-		if err := rows.Scan(&snapshot.Source, &snapshot.ID, &snapshot.ObservedAt, &snapshot.AuthIndex, &snapshot.AuthID, &source, &snapshot.AuthFile, &snapshot.AuthFileMTime, &snapshot.Percent, &snapshot.ResetAt); err != nil {
+		var presence string
+		if err := rows.Scan(&snapshot.Source, &snapshot.ID, &snapshot.ObservedAt, &snapshot.AuthIndex, &snapshot.AuthID, &source, &snapshot.AuthFile, &snapshot.AuthFileMTime, &snapshot.Percent, &snapshot.ResetAt, &presence, &snapshot.LimitWindowSeconds, &snapshot.ResetAfterSeconds); err != nil {
 			continue
 		}
+		snapshot.Presence = parseQuotaWindowPresence(presence)
 		if snapshot.ResetAt.Valid {
 			snapshot.ResetAt.Int64 = normalizeUnixSeconds(snapshot.ResetAt.Int64)
 			if snapshot.ResetAt.Int64 <= now {
@@ -2594,8 +2617,31 @@ ORDER BY observed_at DESC, id DESC`
 		if !ok {
 			continue
 		}
-		if _, exists := out[accountIndex]; !exists {
+		if current, exists := out[accountIndex]; !exists {
 			out[accountIndex] = snapshot
+		} else if current.Source == "usage" && snapshot.Source == "trigger" && snapshot.Presence != quotaWindowUnknown {
+			// A normal request may be newer than the scheduled probe, but usage_events
+			// do not carry window presence/duration. Keep its freshest percentage/reset
+			// while borrowing the probe's authoritative window shape. An explicit
+			// absent probe clears the old usage snapshot so a removed 5h/month window
+			// is not rendered as a fabricated quota.
+			if snapshot.Presence == quotaWindowAbsent {
+				current.Percent = sql.NullFloat64{}
+				current.ResetAt = sql.NullInt64{}
+			}
+			current.Presence = snapshot.Presence
+			current.LimitWindowSeconds = snapshot.LimitWindowSeconds
+			current.ResetAfterSeconds = snapshot.ResetAfterSeconds
+			if !current.Percent.Valid && snapshot.Percent.Valid {
+				current.Percent = snapshot.Percent
+			}
+			if !current.ResetAt.Valid && snapshot.ResetAt.Valid {
+				current.ResetAt = snapshot.ResetAt
+			}
+			if current.Source == "" {
+				current.Source = snapshot.Source
+			}
+			out[accountIndex] = current
 		}
 	}
 	return out
@@ -2772,12 +2818,28 @@ func trustedUsageQuotaSnapshotSQL() string {
 }
 
 func applyAccountQuotaSnapshot(account *accountRow, primary quotaWindowSnapshot, secondary quotaWindowSnapshot) {
+	if primary.Presence == quotaWindowAbsent {
+		primary.Percent = sql.NullFloat64{}
+		primary.ResetAt = sql.NullInt64{}
+	}
+	if secondary.Presence == quotaWindowAbsent {
+		secondary.Percent = sql.NullFloat64{}
+		secondary.ResetAt = sql.NullInt64{}
+	}
+	account.PrimaryQuotaWindowPresence = string(primary.Presence)
+	account.PrimaryQuotaWindowSeconds = quotaWindowSeconds(primary)
+	account.PrimaryQuotaResetAfterSeconds = quotaResetAfterSeconds(primary)
+	account.SecondaryQuotaWindowPresence = string(secondary.Presence)
+	account.SecondaryQuotaWindowSeconds = quotaWindowSeconds(secondary)
+	account.SecondaryQuotaResetAfterSeconds = quotaResetAfterSeconds(secondary)
 	if primary.Percent.Valid {
 		account.PrimaryUsedPercent = &primary.Percent.Float64
 	}
 	if primary.ResetAt.Valid {
 		account.PrimaryResetAt = &primary.ResetAt.Int64
-		account.PrimaryQuotaWindow = "5h"
+		account.PrimaryQuotaWindow = quotaWindowLabel(primary)
+	} else if primary.Presence == quotaWindowPresent {
+		account.PrimaryQuotaWindow = quotaWindowLabel(primary)
 	}
 	if primary.Source != "" {
 		account.PrimaryQuotaSource = primary.Source
@@ -2789,10 +2851,48 @@ func applyAccountQuotaSnapshot(account *accountRow, primary quotaWindowSnapshot,
 	if secondary.ResetAt.Valid {
 		account.SecondaryResetAt = &secondary.ResetAt.Int64
 	}
+	if secondary.Presence == quotaWindowPresent {
+		account.SecondaryQuotaWindow = quotaWindowLabel(secondary)
+	}
 	if secondary.Source != "" {
 		account.SecondaryQuotaSource = secondary.Source
 		account.SecondaryQuotaObservedFrom = quotaObservedFrom(secondary.Source)
 	}
+}
+
+func quotaWindowSeconds(snapshot quotaWindowSnapshot) int64 {
+	if snapshot.LimitWindowSeconds.Valid && snapshot.LimitWindowSeconds.Int64 > 0 {
+		return snapshot.LimitWindowSeconds.Int64
+	}
+	if snapshot.ResetAfterSeconds.Valid && snapshot.ResetAfterSeconds.Int64 > 0 {
+		return snapshot.ResetAfterSeconds.Int64
+	}
+	return 0
+}
+
+func quotaResetAfterSeconds(snapshot quotaWindowSnapshot) int64 {
+	if snapshot.ResetAfterSeconds.Valid && snapshot.ResetAfterSeconds.Int64 >= 0 {
+		return snapshot.ResetAfterSeconds.Int64
+	}
+	return 0
+}
+
+func quotaWindowDuration(snapshot quotaWindowSnapshot) time.Duration {
+	seconds := quotaWindowSeconds(snapshot)
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func quotaWindowLabel(snapshot quotaWindowSnapshot) string {
+	if snapshot.Presence == quotaWindowAbsent {
+		return ""
+	}
+	if duration := quotaWindowDuration(snapshot); duration > 0 {
+		return quotaWindowLabelForDuration(duration)
+	}
+	return "window"
 }
 
 func quotaObservedFrom(source string) string {
@@ -3002,39 +3102,47 @@ func sqlPlaceholders(n int) string {
 	return strings.TrimRight(strings.Repeat("?,", n), ",")
 }
 
-func secondaryQuotaDuration(account accountRow, reset sql.NullInt64) time.Duration {
-	if isFreePlan(account.PlanType) {
-		return 30 * 24 * time.Hour
+func quotaWindowLabelForDuration(duration time.Duration) string {
+	seconds := int64(duration / time.Second)
+	if seconds <= 0 {
+		return "window"
 	}
-	if reset.Valid {
-		resetAt := normalizeUnixSeconds(reset.Int64)
-		if resetAt-time.Now().Unix() > int64(8*24*time.Hour/time.Second) {
-			return 30 * 24 * time.Hour
-		}
+	if seconds >= int64(4*time.Hour/time.Second) && seconds <= int64(6*time.Hour/time.Second) {
+		return "5h"
 	}
-	return 7 * 24 * time.Hour
-}
-
-func secondaryQuotaWindowLabel(duration time.Duration) string {
-	if duration >= 28*24*time.Hour {
+	if seconds >= int64(6*24*time.Hour/time.Second) && seconds <= int64(10*24*time.Hour/time.Second) {
+		return "7d"
+	}
+	if seconds >= int64(25*24*time.Hour/time.Second) && seconds <= int64(35*24*time.Hour/time.Second) {
 		return "month"
 	}
-	return "7d"
+	if seconds%int64(24*time.Hour/time.Second) == 0 {
+		return strconv.FormatInt(seconds/int64(24*time.Hour/time.Second), 10) + "d"
+	}
+	if seconds%int64(time.Hour/time.Second) == 0 {
+		return strconv.FormatInt(seconds/int64(time.Hour/time.Second), 10) + "h"
+	}
+	return strconv.FormatInt(seconds, 10) + "s"
 }
 
-func secondaryQuotaWindowSource(account accountRow, reset sql.NullInt64, duration time.Duration) string {
-	if isFreePlan(account.PlanType) {
-		return "plan_type"
+func quotaWindowLabelForSeconds(value sql.NullInt64) string {
+	if !value.Valid || value.Int64 <= 0 {
+		return "window"
 	}
-	if reset.Valid && duration >= 28*24*time.Hour {
-		return "reset_duration"
-	}
-	return "default_7d"
+	return quotaWindowLabelForDuration(time.Duration(value.Int64) * time.Second)
 }
 
-func isFreePlan(plan string) bool {
-	plan = strings.ToLower(strings.TrimSpace(plan))
-	return plan == "free" || strings.Contains(plan, "free") || strings.Contains(plan, "trial")
+func secondaryQuotaWindowSource(snapshot quotaWindowSnapshot, duration time.Duration) string {
+	if snapshot.Presence == quotaWindowAbsent {
+		return "probe_absent"
+	}
+	if duration > 0 {
+		return "probe_window_duration"
+	}
+	if snapshot.Presence == quotaWindowPresent {
+		return "probe_window_present"
+	}
+	return "probe_window_unknown"
 }
 
 type externalUseTracker struct {
@@ -3046,16 +3154,18 @@ type externalUseTracker struct {
 }
 
 type externalUseEvent struct {
-	timestamp        int64
-	provider         string
-	authID           string
-	authIndex        string
-	source           string
-	totalTokens      int64
-	primaryPercent   sql.NullFloat64
-	primaryResetAt   sql.NullInt64
-	secondaryPercent sql.NullFloat64
-	secondaryResetAt sql.NullInt64
+	timestamp              int64
+	provider               string
+	authID                 string
+	authIndex              string
+	source                 string
+	totalTokens            int64
+	primaryPercent         sql.NullFloat64
+	primaryResetAt         sql.NullInt64
+	primaryWindowSeconds   sql.NullInt64
+	secondaryPercent       sql.NullFloat64
+	secondaryResetAt       sql.NullInt64
+	secondaryWindowSeconds sql.NullInt64
 }
 
 type externalUseLocalEvent struct {
@@ -3071,10 +3181,12 @@ func queryExternalUseAlerts(ctx context.Context, db *sql.DB, since int64) ([]ext
 	delayGraceMinTokens := envInt64("CPA_EXTERNAL_USE_DELAY_GRACE_MIN_TOKENS", 50000)
 	rows, err := db.QueryContext(ctx, `
 SELECT requested_at, provider, auth_id, auth_index, source, total_tokens,
-primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
+primary_used_percent, primary_reset_at, primary_window_seconds,
+secondary_used_percent, secondary_reset_at, secondary_window_seconds
 FROM (
   SELECT id, requested_at, provider, auth_id, auth_index, source, total_tokens,
-  primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
+  primary_used_percent, primary_reset_at, NULL AS primary_window_seconds,
+  secondary_used_percent, secondary_reset_at, NULL AS secondary_window_seconds
   FROM usage_events
   WHERE requested_at >= ?
   AND `+usageScopeSQL("codex")+`
@@ -3084,7 +3196,8 @@ FROM (
   AND NOT (executor_type='quota-trigger' OR model='quota-trigger' OR alias='quota-trigger')
   UNION ALL
   SELECT id, finished_at AS requested_at, provider, auth_id, auth_index, source, 0 AS total_tokens,
-  primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
+  primary_used_percent, primary_reset_at, primary_limit_window_seconds,
+  secondary_used_percent, secondary_reset_at, secondary_limit_window_seconds
   FROM quota_trigger_runs
   WHERE finished_at >= ?
   AND provider='codex'
@@ -3110,7 +3223,7 @@ ORDER BY COALESCE(NULLIF(source,''), NULLIF(auth_id,''), NULLIF(auth_index,''), 
 		var ev externalUseEvent
 		if err := rows.Scan(
 			&ev.timestamp, &ev.provider, &ev.authID, &ev.authIndex, &ev.source, &ev.totalTokens,
-			&ev.primaryPercent, &ev.primaryResetAt, &ev.secondaryPercent, &ev.secondaryResetAt,
+			&ev.primaryPercent, &ev.primaryResetAt, &ev.primaryWindowSeconds, &ev.secondaryPercent, &ev.secondaryResetAt, &ev.secondaryWindowSeconds,
 		); err != nil {
 			return nil, err
 		}
@@ -3141,8 +3254,8 @@ ORDER BY COALESCE(NULLIF(source,''), NULLIF(auth_id,''), NULLIF(auth_index,''), 
 			}
 			recentLocal = recentLocal[:keep]
 		}
-		checkExternalUseWindow(&alerts, seen, "5h", ev, ev.primaryPercent, ev.primaryResetAt, &primary, cumulativeTokens, recentLocalTokens, minDeltaPct, maxLocalTokens, minIdleSeconds, delayGraceMinTokens)
-		checkExternalUseWindow(&alerts, seen, "7d", ev, ev.secondaryPercent, ev.secondaryResetAt, &secondary, cumulativeTokens, recentLocalTokens, minDeltaPct, maxLocalTokens, minIdleSeconds, delayGraceMinTokens)
+		checkExternalUseWindow(&alerts, seen, quotaWindowLabelForSeconds(ev.primaryWindowSeconds), ev, ev.primaryPercent, ev.primaryResetAt, &primary, cumulativeTokens, recentLocalTokens, minDeltaPct, maxLocalTokens, minIdleSeconds, delayGraceMinTokens)
+		checkExternalUseWindow(&alerts, seen, quotaWindowLabelForSeconds(ev.secondaryWindowSeconds), ev, ev.secondaryPercent, ev.secondaryResetAt, &secondary, cumulativeTokens, recentLocalTokens, minDeltaPct, maxLocalTokens, minIdleSeconds, delayGraceMinTokens)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -3332,25 +3445,27 @@ func applyLatestQuotaSnapshots(ctx context.Context, db *sql.DB, accounts []accou
 	for i := range accounts {
 		primary := primarySnapshots[i]
 		secondary := secondarySnapshots[i]
-		primary, secondary = moveMonthlyPrimaryQuotaToSecondary(accounts[i], primary, secondary)
-		if accounts[i].Requests <= 0 {
-			primary = quotaWindowSnapshot{}
-			secondary = quotaWindowSnapshot{}
-		}
-		secondaryDurations[i] = secondaryQuotaDuration(accounts[i], secondary.ResetAt)
+		secondaryDurations[i] = quotaWindowDuration(secondary)
 		accounts[i].PrimaryUsedPercent = nil
 		accounts[i].PrimaryResetAt = nil
 		accounts[i].PrimaryQuotaWindow = ""
+		accounts[i].PrimaryQuotaWindowPresence = ""
+		accounts[i].PrimaryQuotaWindowSeconds = 0
+		accounts[i].PrimaryQuotaResetAfterSeconds = 0
 		accounts[i].PrimaryQuotaSource = ""
 		accounts[i].PrimaryQuotaObservedFrom = ""
 		accounts[i].SecondaryUsedPercent = nil
 		accounts[i].SecondaryResetAt = nil
+		accounts[i].SecondaryQuotaWindow = ""
+		accounts[i].SecondaryQuotaWindowPresence = ""
+		accounts[i].SecondaryQuotaWindowSeconds = 0
+		accounts[i].SecondaryQuotaResetAfterSeconds = 0
 		accounts[i].SecondaryQuotaSource = ""
 		accounts[i].SecondaryQuotaObservedFrom = ""
 		accounts[i].PrimaryWindowTokens = 0
 		accounts[i].SecondaryWindowTokens = 0
 		applyAccountQuotaSnapshot(&accounts[i], primary, secondary)
-		primaryWindows[i] = accountTokenWindowForReset(primary.ResetAt, 5*time.Hour, quotaAliases[i])
+		primaryWindows[i] = accountTokenWindowForReset(primary.ResetAt, quotaWindowDuration(primary), quotaAliases[i])
 		secondaryWindows[i] = accountTokenWindowForReset(secondary.ResetAt, secondaryDurations[i], quotaAliases[i])
 	}
 	primaryTokens := queryAccountWindowTokensBatch(ctx, db, primaryWindows)
@@ -3363,28 +3478,10 @@ func applyLatestQuotaSnapshots(ctx context.Context, db *sql.DB, accounts []accou
 			accounts[i].SecondaryWindowTokens = secondaryTokens[i]
 		}
 		secondary := secondarySnapshots[i]
-		if primary, ok := primarySnapshots[i]; ok {
-			primary, secondary = moveMonthlyPrimaryQuotaToSecondary(accounts[i], primary, secondary)
-			_ = primary
-		}
-		accounts[i].SecondaryQuotaWindow = secondaryQuotaWindowLabel(secondaryDurations[i])
-		accounts[i].QuotaWindowSource = secondaryQuotaWindowSource(accounts[i], secondary.ResetAt, secondaryDurations[i])
+		accounts[i].SecondaryQuotaWindow = quotaWindowLabel(secondary)
+		accounts[i].QuotaWindowSource = secondaryQuotaWindowSource(secondary, secondaryDurations[i])
 		applyAccountQuotaSource(&accounts[i])
 	}
-}
-
-func moveMonthlyPrimaryQuotaToSecondary(account accountRow, primary quotaWindowSnapshot, secondary quotaWindowSnapshot) (quotaWindowSnapshot, quotaWindowSnapshot) {
-	if !primary.Percent.Valid || !primary.ResetAt.Valid || secondary.ResetAt.Valid {
-		return primary, secondary
-	}
-	resetAt := normalizeUnixSeconds(primary.ResetAt.Int64)
-	if resetAt-time.Now().Unix() <= int64(8*24*time.Hour/time.Second) {
-		return primary, secondary
-	}
-	secondary = primary
-	secondary.ResetAt = sql.NullInt64{Int64: resetAt, Valid: true}
-	primary = quotaWindowSnapshot{}
-	return primary, secondary
 }
 
 func queryRecentQuotaTriggerRuns(ctx context.Context, db *sql.DB, limit int) ([]quotaTriggerAccountStatus, error) {
@@ -3512,10 +3609,11 @@ func applySecondaryQuotaEstimates(ctx context.Context, db *sql.DB, accounts []ac
 }
 
 type secondaryQuotaCapacitySnapshot struct {
-	Total      int64
-	Remaining  int64
-	ResetAt    sql.NullInt64
-	FinishedAt int64
+	Total         int64
+	Remaining     int64
+	ResetAt       sql.NullInt64
+	WindowSeconds int64
+	FinishedAt    int64
 }
 
 func latestSecondaryQuotaTriggerCapacity(ctx context.Context, db *sql.DB, account accountRow, since int64) (int64, int64) {
@@ -3534,7 +3632,7 @@ func latestSecondaryQuotaTriggerCapacities(ctx context.Context, db *sql.DB, acco
 	}
 	index := newQuotaAccountIdentityIndex(accounts)
 	rows, err := db.QueryContext(ctx, `
-SELECT auth_index, auth_id, source, auth_file, auth_file_mtime, secondary_limit_tokens, secondary_remaining_tokens, secondary_reset_at, finished_at
+SELECT auth_index, auth_id, source, auth_file, auth_file_mtime, secondary_limit_tokens, secondary_remaining_tokens, secondary_reset_at, secondary_limit_window_seconds, finished_at
 FROM quota_trigger_runs
 WHERE finished_at >= ?
 AND status='success'
@@ -3550,8 +3648,9 @@ ORDER BY finished_at DESC, id DESC`, since)
 		var source string
 		var limit, remaining sql.NullInt64
 		var reset sql.NullInt64
+		var windowSeconds sql.NullInt64
 		var finishedAt int64
-		if err := rows.Scan(&snapshot.AuthIndex, &snapshot.AuthID, &source, &snapshot.AuthFile, &snapshot.AuthFileMTime, &limit, &remaining, &reset, &finishedAt); err != nil {
+		if err := rows.Scan(&snapshot.AuthIndex, &snapshot.AuthID, &source, &snapshot.AuthFile, &snapshot.AuthFileMTime, &limit, &remaining, &reset, &windowSeconds, &finishedAt); err != nil {
 			continue
 		}
 		if reset.Valid {
@@ -3564,9 +3663,15 @@ ORDER BY finished_at DESC, id DESC`, since)
 			continue
 		}
 		capacity := secondaryQuotaCapacitySnapshot{
-			Total:      limit.Int64,
-			Remaining:  remaining.Int64,
-			ResetAt:    reset,
+			Total:     limit.Int64,
+			Remaining: remaining.Int64,
+			ResetAt:   reset,
+			WindowSeconds: func() int64 {
+				if windowSeconds.Valid && windowSeconds.Int64 > 0 {
+					return windowSeconds.Int64
+				}
+				return 0
+			}(),
 			FinishedAt: finishedAt,
 		}
 		snapshot.Source = "trigger"
@@ -3587,10 +3692,12 @@ func adjustedSecondaryQuotaTriggerCapacity(ctx context.Context, db *sql.DB, acco
 	if total <= 0 || remain > total {
 		return 0, 0
 	}
-	duration := secondaryQuotaDuration(account, capacity.ResetAt)
-	windowStart := normalizeUnixSeconds(capacity.ResetAt.Int64) - int64(duration.Seconds())
-	if windowStart < 0 {
-		windowStart = 0
+	windowStart := capacity.FinishedAt
+	if capacity.WindowSeconds > 0 && capacity.ResetAt.Valid {
+		windowStart = normalizeUnixSeconds(capacity.ResetAt.Int64) - capacity.WindowSeconds
+		if windowStart < 0 {
+			windowStart = 0
+		}
 	}
 	start := capacity.FinishedAt
 	if start < windowStart {

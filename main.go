@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.39"
+	pluginVersion    = "0.1.40"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -521,7 +521,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 func pluginConfigFields() []configField {
 	return []configField{
-		{Name: "开启定时额度触发（不建议账号多的情况下开启）", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。探测结果会参与 401、402、403、429 状态管理。默认关闭。"},
+		{Name: "开启定时额度触发（不建议账号多的情况下开启）", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。探测结果会参与 401、402、403、429 状态管理；已处于异常不可用状态的账号会跳过后续探测，429 到 reset_at 后再恢复探测。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
 		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
@@ -614,6 +614,14 @@ func handleManagement(req managementRequest) managementResponse {
 		result, err := releaseAutobans(context.Background(), db, body)
 		if err != nil {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
+		}
+		if result.Released > 0 {
+			// Manual release changes the database immediately. Invalidate the
+			// scheduler fast-path so the next pick cannot retain the old ban.
+			globalSchedulerState.invalidate()
+			if err := globalSchedulerState.refresh(context.Background(), db); err != nil {
+				globalSchedulerState.invalidate()
+			}
 		}
 		return jsonResponse(http.StatusOK, result)
 	}
@@ -1447,9 +1455,14 @@ func withSQLiteAutoRepair[T any](ctx context.Context, s *store, operation string
 	if !isSQLiteCorruptionError(err) {
 		return value, err
 	}
-	if repairErr := s.repairSQLiteDatabase(ctx); repairErr != nil {
+	if repairErr := s.repairSQLiteDatabase(ctx, err); repairErr != nil {
 		var zero T
 		return zero, fmt.Errorf("%s failed with sqlite corruption (%w); automatic repair failed: %v", operation, err, repairErr)
+	}
+	// The failed operation may have left a pooled connection with the malformed
+	// schema cached. Reopen it before retrying against the repaired file.
+	if s != nil {
+		s.close()
 	}
 	value, retryErr := fn()
 	if retryErr != nil {
@@ -1476,33 +1489,207 @@ func isSQLiteCorruptionError(err error) bool {
 		(strings.Contains(text, "database") && strings.Contains(text, "corrupt"))
 }
 
-func (s *store) repairSQLiteDatabase(ctx context.Context) error {
+func (s *store) repairSQLiteDatabase(ctx context.Context, causes ...error) error {
 	s.repairMu.Lock()
 	defer s.repairMu.Unlock()
-	db, closeAfter, err := s.repairDBHandle()
+	dbPath, err := s.repairDatabasePath()
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve sqlite path before repair: %w", err)
 	}
-	if closeAfter {
-		defer db.Close()
+	backupPath, err := createSQLiteRepairBackup(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("back up sqlite database before repair: %w", err)
 	}
+	// Open an in-memory coordinator first. go-sqlite3 executes connection
+	// pragmas before a normal file handle can enable writable_schema, so an
+	// attached database is the reliable way to recover a malformed schema.
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		return fmt.Errorf("open sqlite repair handle: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
 	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout=30000`); err != nil {
-		return err
+		return fmt.Errorf("set attached repair busy timeout: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, `REINDEX`); err != nil {
-		return err
+	if _, err := db.ExecContext(ctx, `PRAGMA writable_schema=ON`); err != nil {
+		return fmt.Errorf("enable writable_schema for attached repair: %w", err)
 	}
-	problems, err := sqliteIntegrityProblems(ctx, db, 5)
+	if _, err := db.ExecContext(ctx, `ATTACH DATABASE ? AS repair`, dbPath); err != nil {
+		return fmt.Errorf("attach sqlite database for repair: %w", err)
+	}
+	if _, reindexErr := db.ExecContext(ctx, `REINDEX`); reindexErr != nil {
+		allCauses := append(append([]error{}, causes...), reindexErr)
+		indexes := sqliteInvalidRootpageIndexes(allCauses...)
+		if len(indexes) == 0 {
+			return fmt.Errorf("global reindex failed after backup %q: %w", backupPath, reindexErr)
+		}
+		for _, indexName := range indexes {
+			createSQL, ok := sqliteRepairableIndexes[indexName]
+			if !ok {
+				return fmt.Errorf("global reindex failed after backup %q; damaged index %q is not repairable: %w", backupPath, indexName, reindexErr)
+			}
+			if err := rebuildSQLiteAttachedIndex(ctx, db, indexName, createSQL); err != nil {
+				return fmt.Errorf("global reindex failed after backup %q; rebuild index %q: %w", backupPath, indexName, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx, `REINDEX`); err != nil {
+			return fmt.Errorf("global reindex still failed after rebuilding damaged indexes (backup %q): %w", backupPath, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA writable_schema=RESET`); err != nil {
+		return fmt.Errorf("disable writable_schema after repair: %w", err)
+	}
+	problems, err := sqliteCheckProblems(ctx, db, `PRAGMA repair.integrity_check`, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("integrity_check after sqlite repair (backup %q): %w", backupPath, err)
 	}
 	if sqliteIntegrityOK(problems) {
 		return nil
 	}
 	if len(problems) == 0 {
-		return errors.New("integrity_check returned no rows after reindex")
+		return fmt.Errorf("integrity_check returned no rows after sqlite repair (backup %q)", backupPath)
 	}
-	return fmt.Errorf("integrity_check still reports: %s", strings.Join(problems, "; "))
+	return fmt.Errorf("integrity_check after sqlite repair did not return ok (backup %q): %s", backupPath, strings.Join(problems, "; "))
+}
+
+func createSQLiteRepairBackup(ctx context.Context, sourcePath string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	backupPath := sourcePath + ".bak-auto-repair-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	if err := copySQLiteDatabaseFiles(sourcePath, backupPath); err != nil {
+		_ = os.Remove(backupPath)
+		_ = os.Remove(backupPath + "-wal")
+		_ = os.Remove(backupPath + "-shm")
+		return "", err
+	}
+	return backupPath, nil
+}
+
+var sqliteRepairableIndexes = map[string]string{
+	"idx_quota_activation_jobs_state": `CREATE INDEX repair.idx_quota_activation_jobs_state ON quota_activation_jobs(job_type, state, updated_at)`,
+}
+
+func rebuildSQLiteAttachedIndex(ctx context.Context, db *sql.DB, indexName string, createSQL string) error {
+	result, err := db.ExecContext(ctx, `DELETE FROM repair.sqlite_schema WHERE type='index' AND name=?`, indexName)
+	if err != nil {
+		return fmt.Errorf("remove damaged sqlite_schema entry: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("remove damaged sqlite_schema entry affected %d rows, want 1", affected)
+	}
+	var schemaVersion int64
+	if err := db.QueryRowContext(ctx, `PRAGMA repair.schema_version`).Scan(&schemaVersion); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA repair.schema_version=%d`, schemaVersion+1)); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA writable_schema=RESET`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `VACUUM repair`); err != nil {
+		return fmt.Errorf("vacuum after removing damaged index: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("recreate damaged index: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA writable_schema=ON`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *store) repairDatabasePath() (string, error) {
+	s.mu.Lock()
+	path := s.dbPath
+	s.mu.Unlock()
+	if strings.TrimSpace(path) != "" {
+		return path, nil
+	}
+	return usageDBPath()
+}
+
+func copySQLiteDatabaseFiles(sourcePath, backupPath string) error {
+	paths := []struct {
+		source string
+		dest   string
+	}{
+		{sourcePath, backupPath},
+		{sourcePath + "-wal", backupPath + "-wal"},
+		{sourcePath + "-shm", backupPath + "-shm"},
+	}
+	for _, item := range paths {
+		if _, err := os.Stat(item.source); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := copySQLiteFile(item.source, item.dest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copySQLiteFile(sourcePath, destPath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	destination, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		_ = destination.Close()
+		return err
+	}
+	return destination.Close()
+}
+
+func sqliteInvalidRootpageIndexes(errs ...error) []string {
+	const marker = "malformed database schema ("
+	seen := map[string]bool{}
+	var indexes []string
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		text := err.Error()
+		lower := strings.ToLower(text)
+		for offset := 0; offset < len(lower); {
+			start := strings.Index(lower[offset:], marker)
+			if start < 0 {
+				break
+			}
+			start += offset + len(marker)
+			end := strings.IndexByte(lower[start:], ')')
+			if end < 0 {
+				break
+			}
+			end += start
+			after := lower[end+1:]
+			if !strings.Contains(after, "invalid rootpage") {
+				offset = end + 1
+				continue
+			}
+			name := strings.TrimSpace(text[start:end])
+			if name != "" && !seen[name] {
+				seen[name] = true
+				indexes = append(indexes, name)
+			}
+			offset = end + 1
+		}
+	}
+	return indexes
 }
 
 func sqliteIntegrityProblems(ctx context.Context, db *sql.DB, limit int) ([]string, error) {
@@ -1514,9 +1701,7 @@ func sqliteQuickCheckProblems(ctx context.Context, db *sql.DB, limit int) ([]str
 }
 
 func sqliteCheckProblems(ctx context.Context, db *sql.DB, query string, limit int) ([]string, error) {
-	if limit <= 0 {
-		limit = 1
-	}
+	unlimited := limit <= 0
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -1529,7 +1714,7 @@ func sqliteCheckProblems(ctx context.Context, db *sql.DB, query string, limit in
 			return nil, err
 		}
 		problems = append(problems, problem)
-		if len(problems) >= limit {
+		if !unlimited && len(problems) >= limit {
 			break
 		}
 	}
@@ -2525,13 +2710,19 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 	if rec.Failed || !successfulStatusCode(status) {
 		return nil
 	}
+	changed := false
+	var invalidBefore int
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM invalid_auths WHERE active=1`).Scan(&invalidBefore)
 	if err := clearRecoveredInvalidAuthForRecord(ctx, db, rec); err != nil {
 		return err
 	}
+	var invalidAfter int
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM invalid_auths WHERE active=1`).Scan(&invalidAfter)
+	changed = invalidAfter < invalidBefore
 	aliases, strict := recoveryMatchAliasesForRecord(rec)
 	for _, alias := range aliases {
 		if strict {
-			if _, err := db.ExecContext(ctx, `
+			res, err := db.ExecContext(ctx, `
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
@@ -2539,12 +2730,16 @@ AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
   OR lower(auth_file)=?
-)`, alias, alias, alias); err != nil {
+			)`, alias, alias, alias)
+			if err != nil {
 				return err
+			}
+			if affected, _ := res.RowsAffected(); affected > 0 {
+				changed = true
 			}
 			continue
 		}
-		if _, err := db.ExecContext(ctx, `
+		res, err := db.ExecContext(ctx, `
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
@@ -2552,9 +2747,16 @@ AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
   OR lower(source)=?
-)`, alias, alias, alias); err != nil {
+		)`, alias, alias, alias)
+		if err != nil {
 			return err
 		}
+		if affected, _ := res.RowsAffected(); affected > 0 {
+			changed = true
+		}
+	}
+	if changed {
+		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -3066,7 +3268,12 @@ func isReleasable429Autoban(row autobanRow) bool {
 	case "429", "5h", "primary", "7d", "week", "secondary":
 		return true
 	}
-	return false
+	// The quota API may report a monthly or otherwise custom window. These
+	// labels are intentionally not mapped back to a fixed 5h/7d bucket.
+	if window == "month" || window == "rate_limit" || window == "window" || window == "unknown" {
+		return true
+	}
+	return strings.HasSuffix(window, "s") || strings.HasSuffix(window, "m") || strings.HasSuffix(window, "h") || strings.HasSuffix(window, "d")
 }
 
 func autobanReleaseItemMatchesRow(item autobanReleaseItem, row autobanRow) bool {
@@ -3102,6 +3309,9 @@ WHERE active=1 AND auth_id=?`, now, strings.TrimSpace(authID))
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if affected > 0 {
+		globalSchedulerState.invalidate()
 	}
 	return affected > 0, nil
 }
@@ -3218,12 +3428,18 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 			skipped++
 			continue
 		}
-		// Restricted accounts stay in the probe rotation so later healthy results
-		// can clear state even when an older quota snapshot is still full.
+		// Do not probe accounts that are already known to be unavailable. A 429 is
+		// queried again only after expireAutobans deactivates it at reset_at; 401,
+		// 402, and 403 remain out until their authentication/workspace state is
+		// explicitly cleared or replaced.
+		if isBanned || isInvalid {
+			skipped++
+			continue
+		}
 		row := accountRow{AuthIndex: account.AuthIndex, AuthID: account.AuthID, Source: account.Source, AuthFile: account.AuthFile, Email: account.Email, Name: account.Name}
 		primary := queryLatestAccountWindowQuota(ctx, db, row, 0, "primary")
 		secondary := queryLatestAccountWindowQuota(ctx, db, row, 0, "secondary")
-		if !isBanned && !isInvalid && (quotaWindowFull(primary.Percent, primary.ResetAt) || quotaWindowFull(secondary.Percent, secondary.ResetAt)) {
+		if quotaWindowFull(primary.Percent, primary.ResetAt) || quotaWindowFull(secondary.Percent, secondary.ResetAt) {
 			skipped++
 			continue
 		}
@@ -4035,27 +4251,60 @@ func classifyCodexBan(headers map[string][]string, primaryPct *float64, primaryR
 	const threshold = 100.0
 	primaryFull := primaryPct != nil && *primaryPct >= threshold
 	secondaryFull := secondaryPct != nil && *secondaryPct >= threshold
+	primaryLabel := quotaWindowLabelForSeconds(headerQuotaWindowSeconds(headers, "primary"))
+	secondaryLabel := quotaWindowLabelForSeconds(headerQuotaWindowSeconds(headers, "secondary"))
 	if primaryFull && secondaryFull {
+		if primaryReset != nil && secondaryReset != nil && *primaryReset > 0 && *secondaryReset > 0 {
+			if *secondaryReset >= *primaryReset {
+				return *secondaryReset, secondaryLabel, "primary and secondary windows are full"
+			}
+			return *primaryReset, primaryLabel, "primary and secondary windows are full"
+		}
 		if secondaryReset != nil && *secondaryReset > 0 {
-			return *secondaryReset, "week", "primary and secondary windows are full"
+			return *secondaryReset, secondaryLabel, "primary and secondary windows are full"
 		}
 		if primaryReset != nil && *primaryReset > 0 {
-			return *primaryReset, "5h", "both windows full, secondary reset missing"
+			return *primaryReset, primaryLabel, "primary and secondary windows are full"
 		}
 	}
 	if secondaryFull && secondaryReset != nil && *secondaryReset > 0 {
-		return *secondaryReset, "week", "secondary weekly window is full"
+		return *secondaryReset, secondaryLabel, "secondary quota window is full"
 	}
 	if primaryFull && primaryReset != nil && *primaryReset > 0 {
-		return *primaryReset, "5h", "primary 5h window is full"
+		return *primaryReset, primaryLabel, "primary quota window is full"
 	}
-	if primaryReset != nil && *primaryReset > 0 && headerIntValue(headers, "x-codex-primary-window-minutes") == 300 {
-		return *primaryReset, "5h", "primary reset header present"
+	if primaryReset != nil && *primaryReset > 0 {
+		return *primaryReset, primaryLabel, "primary quota reset header present"
 	}
-	if secondaryReset != nil && *secondaryReset > 0 && headerIntValue(headers, "x-codex-secondary-window-minutes") == 10080 {
-		return *secondaryReset, "week", "secondary reset header present"
+	if secondaryReset != nil && *secondaryReset > 0 {
+		return *secondaryReset, secondaryLabel, "secondary quota reset header present"
 	}
-	return now + int64((5 * time.Hour).Seconds()), "5h", "fallback: missing x-codex quota headers"
+	if retryAfter := headerIntOrZero(headers, "retry-after"); retryAfter.Valid && retryAfter.Int64 > 0 {
+		return now + retryAfter.Int64, "rate_limit", "fallback: retry-after header"
+	}
+	// Keep an unclassified 429 suppressed for one normal probe interval. This
+	// is a cooldown, not a fabricated quota window; when the upstream provides
+	// reset metadata, the real reset time above remains authoritative.
+	return now + int64((10*time.Minute)/time.Second), "rate_limit", "fallback: quota window metadata unavailable"
+}
+
+func headerIntOrZero(headers map[string][]string, key string) sql.NullInt64 {
+	value := headerInt(headers, key)
+	if value == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *value, Valid: true}
+}
+
+func headerQuotaWindowSeconds(headers map[string][]string, prefix string) sql.NullInt64 {
+	if value := headerIntOrZero(headers, "x-codex-"+prefix+"-limit-window-seconds"); value.Valid && value.Int64 > 0 {
+		return value
+	}
+	minutes := headerIntOrZero(headers, "x-codex-"+prefix+"-window-minutes")
+	if !minutes.Valid || minutes.Int64 <= 0 || minutes.Int64 > math.MaxInt64/60 {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: minutes.Int64 * 60, Valid: true}
 }
 
 func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
@@ -4430,7 +4679,12 @@ func schedulerPickRequiresPlugin(req schedulerPickRequest) bool {
 }
 
 func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
-	_, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND reset_at <= ?`, now)
+	res, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0, released_at=?, release_reason='reset_at reached' WHERE active=1 AND reset_at <= ?`, now, now)
+	if err == nil {
+		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected > 0 {
+			globalSchedulerState.invalidate()
+		}
+	}
 	return err
 }
 
@@ -4795,6 +5049,7 @@ WHERE provider='codex'
 }
 
 func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
+	changed := false
 	invalids, err := queryActiveInvalidAuths(ctx, db)
 	if err != nil {
 		return err
@@ -4806,6 +5061,7 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 			return err
 		}
+		changed = true
 	}
 	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
 	if err != nil {
@@ -4825,6 +5081,10 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
 			return err
 		}
+		changed = true
+	}
+	if changed {
+		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -4876,15 +5136,15 @@ func classifyStoredCodexBan(pp sql.NullFloat64, pr sql.NullInt64, sp sql.NullFlo
 	secondaryFull := sp.Valid && sp.Float64 >= 100 && sr.Valid && sr.Int64 > now
 	if primaryFull && secondaryFull {
 		if sr.Int64 >= pr.Int64 {
-			return sr.Int64, "week", "backfilled: primary and secondary windows are full"
+			return sr.Int64, "unknown", "backfilled: primary and secondary quota windows are full"
 		}
-		return pr.Int64, "5h", "backfilled: primary and secondary windows are full"
+		return pr.Int64, "unknown", "backfilled: primary and secondary quota windows are full"
 	}
 	if secondaryFull {
-		return sr.Int64, "week", "backfilled: secondary weekly window is full"
+		return sr.Int64, "unknown", "backfilled: secondary quota window is full"
 	}
 	if primaryFull {
-		return pr.Int64, "5h", "backfilled: primary 5h window is full"
+		return pr.Int64, "unknown", "backfilled: primary quota window is full"
 	}
 	return now, "", ""
 }
@@ -5029,6 +5289,7 @@ func clearReplacedInvalidAuthsForConfigured(ctx context.Context, db *sql.DB, con
 		return err
 	}
 	fileIndex := newConfiguredAuthFileIndex(configured)
+	changed := false
 	for _, invalid := range invalids {
 		if normalizeAuthSourceKind(invalid.AuthSourceKind) != authSourceKindFile {
 			continue
@@ -5058,6 +5319,10 @@ WHERE active=1 AND auth_id=?`, invalid.AuthID)
 		if err != nil {
 			return err
 		}
+		changed = true
+	}
+	if changed {
+		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5077,6 +5342,7 @@ func clearReplacedAutobansForConfigured(ctx context.Context, db *sql.DB, configu
 	}
 	fileIndex := newConfiguredAuthFileIndex(configured)
 	now := time.Now().Unix()
+	changed := false
 	for _, ban := range bans {
 		baseline := ban.AuthFileMTime
 		if baseline <= 0 {
@@ -5095,8 +5361,12 @@ WHERE active=1 AND auth_id=?`, now, ban.AuthID)
 			if err != nil {
 				return err
 			}
+			changed = true
 			break
 		}
+	}
+	if changed {
+		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5269,6 +5539,7 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 	if err != nil {
 		return err
 	}
+	changed := false
 	for _, invalid := range invalids {
 		if normalizeAuthSourceKind(invalid.AuthSourceKind) == authSourceKindRuntimeOnly {
 			continue
@@ -5281,6 +5552,7 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 			if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 				return err
 			}
+			changed = true
 			continue
 		}
 		strictAliases := strictAuthStateAliasesForValues(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
@@ -5297,6 +5569,10 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 			return err
 		}
+		changed = true
+	}
+	if changed {
+		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5306,6 +5582,7 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 	if err != nil {
 		return err
 	}
+	changed := false
 	for _, ban := range bans {
 		cleanupAliases := fileBackedCleanupAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
 		if len(cleanupAliases) > 0 {
@@ -5315,6 +5592,7 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 			if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
 				return err
 			}
+			changed = true
 			continue
 		}
 		strictAliases := strictAuthStateAliasesForValues(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
@@ -5331,6 +5609,10 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
 			return err
 		}
+		changed = true
+	}
+	if changed {
+		globalSchedulerState.invalidate()
 	}
 	return nil
 }
