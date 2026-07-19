@@ -69,6 +69,78 @@ WHERE type='index' AND name='idx_quota_activation_jobs_state'`).Scan(&rootpage);
 	assertInvalidRootpage(t, backups[0], "idx_quota_activation_jobs_state")
 }
 
+func TestSummaryResetsToEmptyDatabaseWhenSimpleRepairCannotRecover(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	db, dbPath, err := s.open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO usage_events (
+		requested_at, provider, model, auth_id, auth_index, total_tokens
+	) VALUES (1, 'codex', 'gpt-test', 'discard-me', 'discard-me', 123)`); err != nil {
+		t.Fatal(err)
+	}
+	s.close()
+
+	const damagedIndex = "idx_usage_events_provider_model_requested"
+	corruptSQLiteIndexRootpage(t, dbPath, damagedIndex)
+	assertInvalidRootpage(t, dbPath, damagedIndex)
+
+	manager := &summaryPrecomputeManager{}
+	data, err := manager.summary(ctx, s, "24h", 50)
+	if err != nil {
+		t.Fatalf("Summary did not recover by resetting the database: %v", err)
+	}
+	if data == nil {
+		t.Fatal("Summary returned nil data after resetting the database")
+	}
+
+	replacementDB, _, err := s.open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventCount int64
+	if err := replacementDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events`).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("usage_events count after reset=%d, want 0", eventCount)
+	}
+	problems, err := sqliteIntegrityProblems(ctx, replacementDB, 0)
+	if err != nil {
+		t.Fatalf("integrity_check replacement database: %v", err)
+	}
+	if !sqliteIntegrityOK(problems) {
+		t.Fatalf("integrity_check replacement database=%v, want [ok]", problems)
+	}
+	var indexCount int64
+	if err := replacementDB.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM sqlite_schema
+WHERE type='index' AND name=?`, damagedIndex).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("replacement index count=%d, want 1", indexCount)
+	}
+
+	backups, err := filepath.Glob(dbPath + ".bak-auto-repair-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("automatic repair backups=%v, want exactly one", backups)
+	}
+	assertInvalidRootpage(t, backups[0], damagedIndex)
+	resetFiles, err := filepath.Glob(dbPath + ".reset-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resetFiles) != 0 {
+		t.Fatalf("temporary reset files left behind: %v", resetFiles)
+	}
+}
+
 func corruptSQLiteIndexRootpage(t *testing.T, dbPath string, indexName string) {
 	t.Helper()
 	db, err := sql.Open("sqlite3", dbPath)

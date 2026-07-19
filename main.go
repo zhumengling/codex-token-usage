@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.40"
+	pluginVersion    = "0.1.41"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -1334,6 +1334,12 @@ type store struct {
 }
 
 func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
+	s.repairMu.Lock()
+	defer s.repairMu.Unlock()
+	return s.openWithoutRepairLock(ctx)
+}
+
+func (s *store) openWithoutRepairLock(ctx context.Context) (*sql.DB, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.db != nil {
@@ -1496,10 +1502,22 @@ func (s *store) repairSQLiteDatabase(ctx context.Context, causes ...error) error
 	if err != nil {
 		return fmt.Errorf("resolve sqlite path before repair: %w", err)
 	}
+	// Prevent a pooled connection from reopening or writing the file while it
+	// is being backed up, repaired, or replaced with a clean database.
+	s.close()
 	backupPath, err := createSQLiteRepairBackup(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("back up sqlite database before repair: %w", err)
 	}
+	if simpleErr := repairSQLiteDatabaseInPlace(ctx, dbPath, backupPath, causes...); simpleErr != nil {
+		if resetErr := resetSQLiteDatabaseToEmpty(ctx, dbPath, backupPath); resetErr != nil {
+			return fmt.Errorf("simple sqlite repair failed after backup %q: %v; reset to an empty database failed: %w", backupPath, simpleErr, resetErr)
+		}
+	}
+	return nil
+}
+
+func repairSQLiteDatabaseInPlace(ctx context.Context, dbPath, backupPath string, causes ...error) error {
 	// Open an in-memory coordinator first. go-sqlite3 executes connection
 	// pragmas before a normal file handle can enable writable_schema, so an
 	// attached database is the reliable way to recover a malformed schema.
@@ -1551,6 +1569,79 @@ func (s *store) repairSQLiteDatabase(ctx context.Context, causes ...error) error
 		return fmt.Errorf("integrity_check returned no rows after sqlite repair (backup %q)", backupPath)
 	}
 	return fmt.Errorf("integrity_check after sqlite repair did not return ok (backup %q): %s", backupPath, strings.Join(problems, "; "))
+}
+
+func resetSQLiteDatabaseToEmpty(ctx context.Context, dbPath, backupPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	temporaryPath := dbPath + ".reset-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	_ = removeSQLiteDatabaseFiles(temporaryPath)
+	defer removeSQLiteDatabaseFiles(temporaryPath)
+
+	db, err := openSQLiteDB(temporaryPath)
+	if err != nil {
+		return fmt.Errorf("open empty replacement database: %w", err)
+	}
+	closeReplacement := func() error {
+		if db == nil {
+			return nil
+		}
+		err := db.Close()
+		db = nil
+		return err
+	}
+	if err := initializeSQLiteStore(ctx, db); err != nil {
+		_ = closeReplacement()
+		return fmt.Errorf("initialize empty replacement database: %w", err)
+	}
+	problems, err := sqliteIntegrityProblems(ctx, db, 0)
+	if err != nil {
+		_ = closeReplacement()
+		return fmt.Errorf("integrity_check empty replacement database: %w", err)
+	}
+	if !sqliteIntegrityOK(problems) {
+		_ = closeReplacement()
+		return fmt.Errorf("integrity_check empty replacement database did not return ok: %s", strings.Join(problems, "; "))
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		_ = closeReplacement()
+		return fmt.Errorf("checkpoint empty replacement database: %w", err)
+	}
+	if err := closeReplacement(); err != nil {
+		return fmt.Errorf("close empty replacement database: %w", err)
+	}
+
+	if err := removeSQLiteDatabaseFiles(dbPath); err != nil {
+		if restoreErr := restoreSQLiteRepairBackup(backupPath, dbPath); restoreErr != nil {
+			return fmt.Errorf("remove damaged database: %v; restore backup: %w", err, restoreErr)
+		}
+		return fmt.Errorf("remove damaged database: %w", err)
+	}
+	if err := os.Rename(temporaryPath, dbPath); err != nil {
+		if restoreErr := restoreSQLiteRepairBackup(backupPath, dbPath); restoreErr != nil {
+			return fmt.Errorf("install empty replacement database: %v; restore backup: %w", err, restoreErr)
+		}
+		return fmt.Errorf("install empty replacement database: %w", err)
+	}
+	return nil
+}
+
+func removeSQLiteDatabaseFiles(basePath string) error {
+	var errs []error
+	for _, path := range []string{basePath, basePath + "-wal", basePath + "-shm"} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove %q: %w", path, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func restoreSQLiteRepairBackup(backupPath, dbPath string) error {
+	if err := removeSQLiteDatabaseFiles(dbPath); err != nil {
+		return err
+	}
+	return copySQLiteDatabaseFiles(backupPath, dbPath)
 }
 
 func createSQLiteRepairBackup(ctx context.Context, sourcePath string) (string, error) {
