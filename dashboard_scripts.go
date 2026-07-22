@@ -254,7 +254,7 @@ function renderQuotaActivation(job){
   applyLocale();syncQuotaActivationRunButton();
 }
 function quotaActivationResultText(value){
-  const labels={eligible:'符合条件',not_selected:'未选择',wrong_provider:'Provider 不匹配',disabled:'账号已禁用',expired:'账号已过期',unavailable:'账号不可用',unstable_identity:'账号身份不稳定',missing_credential:'缺少可用凭据',quota_read_failed:'额度读取失败',unknown_quota:'额度存在性未知或数据矛盾',primary_not_fresh:'Primary 上报窗口不新鲜',secondary_not_fresh:'Secondary 上报窗口不新鲜',duplicate_cycle:'本额度周期已发送',inventory_changed:'预览后账号清单已变化',no_longer_eligible:'账号已不再符合条件',preview_not_eligible:'预览时不符合条件',queued:'排队中',revalidating:'重新校验中',reserved:'已保留周期',dispatched:'已发送',verified:'所有上报窗口均已验证',partial:'仅部分上报窗口已验证',failed_before_send:'未获得成功模型响应',sent_unknown:'已发送但验证未知',failed:'失败',skipped:'跳过'};
+  const labels={eligible:'符合条件',not_selected:'未选择',wrong_provider:'Provider 不匹配',disabled:'账号已禁用',expired:'账号已过期',unavailable:'账号不可用',unstable_identity:'账号身份不稳定',missing_credential:'缺少可用凭据',quota_read_failed:'额度读取失败',unknown_quota:'额度存在性未知或数据矛盾',primary_not_fresh:'Primary 上报窗口不新鲜',secondary_not_fresh:'Secondary 上报窗口不新鲜',duplicate_cycle:'尚未确认活跃窗口已刷新，且安全边界尚未到达',cycle_state_failed:'额度周期状态读取失败',inventory_changed:'预览后账号清单已变化',no_longer_eligible:'账号已不再符合条件',preview_not_eligible:'预览时不符合条件',queued:'排队中',revalidating:'重新校验中',reserved:'已保留周期',dispatched:'已发送',verified:'所有上报窗口均已验证',partial:'仅部分上报窗口已验证',failed_before_send:'未获得成功模型响应',sent_unknown:'已发送但验证未知',failed:'失败',skipped:'跳过'};
   return labels[value]||value||'-';
 }
 function quotaActivationWindowTransitionHTML(before,after){
@@ -1711,7 +1711,8 @@ const i18nEn={
   '额度存在性未知或数据矛盾':'Unknown window presence or contradictory quota',
   'Primary 上报窗口不新鲜':'Reported primary window is not fresh',
   'Secondary 上报窗口不新鲜':'Reported secondary window is not fresh',
-  '本额度周期已发送':'This quota cycle was already dispatched',
+  '尚未确认活跃窗口已刷新，且安全边界尚未到达':'No active-to-fresh reset or elapsed safe boundary has been established',
+  '额度周期状态读取失败':'Failed to read quota-cycle state',
   '预览后账号清单已变化':'Account inventory changed after preview',
   '账号已不再符合条件':'Account is no longer eligible',
   '预览时不符合条件':'Not eligible in preview',
@@ -1735,7 +1736,8 @@ const i18nEn={
   'unknown_quota':'Unknown window presence or contradictory quota',
   'primary_not_fresh':'Reported primary window is not fresh',
   'secondary_not_fresh':'Reported secondary window is not fresh',
-  'duplicate_cycle':'This quota cycle was already dispatched',
+  'duplicate_cycle':'No active-to-fresh reset or elapsed safe boundary has been established',
+  'cycle_state_failed':'Failed to read quota-cycle state',
   'inventory_changed':'Account inventory changed after preview',
   'no_longer_eligible':'Account is no longer eligible',
   'preview_not_eligible':'Not eligible in preview',

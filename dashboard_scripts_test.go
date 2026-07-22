@@ -158,6 +158,8 @@ func TestQuotaActivationDashboardRequiresPreviewConfirmationAndBilingualCopy(t *
 		"window.presence==='absent'",
 		"'所有上报窗口均已验证':'All reported windows verified'",
 		"'已发送但验证未知':'Sent; verification unknown'",
+		"'尚未确认活跃窗口已刷新，且安全边界尚未到达':'No active-to-fresh reset or elapsed safe boundary has been established'",
+		"'duplicate_cycle':'No active-to-fresh reset or elapsed safe boundary has been established'",
 	} {
 		if !strings.Contains(dashboardBody+dashboardScripts+dashboardStyles, marker) {
 			t.Fatalf("quota activation UI marker %q not found", marker)

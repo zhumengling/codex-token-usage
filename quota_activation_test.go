@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -219,12 +220,13 @@ func TestActivationAPIIdentityDoesNotExposeAuthFile(t *testing.T) {
 	account := healthyActivationAccount()
 	account.AuthID = account.AuthFile // Host auth IDs may themselves be file names.
 	row := activationAccountResultFromConfigured(account)
+	row.CycleKey = "fixture-raw-cycle-key"
 	raw, err := json.Marshal(row)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), account.AuthFile) || strings.Contains(row.AccountKey, account.AuthFile) || strings.Contains(string(raw), "auth_id") {
-		t.Fatalf("activation API identity exposed internal auth/file identity: %s", raw)
+	if strings.Contains(string(raw), account.AuthFile) || strings.Contains(row.AccountKey, account.AuthFile) || strings.Contains(string(raw), "auth_id") || strings.Contains(string(raw), row.CycleKey) || strings.Contains(string(raw), "cycle_key") {
+		t.Fatalf("activation API identity exposed internal auth/file/cycle identity: %s", raw)
 	}
 	if len(row.AccountKey) != sha256.Size*2 {
 		t.Fatalf("account key length=%d, want opaque SHA-256 hex", len(row.AccountKey))
@@ -281,6 +283,503 @@ func TestQuotaActivationSchemaMigratesExistingCycleTable(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("next_cycle_after migration was not applied")
+	}
+}
+
+func TestQuotaActivationSchemaMigratesObservationMarkers(t *testing.T) {
+	db, err := openSQLiteDB(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE quota_activation_cycles (account_key TEXT NOT NULL,cycle_key TEXT NOT NULL,run_id TEXT NOT NULL,status TEXT NOT NULL,reserved_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,next_cycle_after INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(account_key,cycle_key))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at) VALUES ('existing','cycle','run','sent_unknown',100,100)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeSQLiteStore(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeSQLiteStore(context.Background(), db); err != nil {
+		t.Fatalf("idempotent initialization: %v", err)
+	}
+	columns := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(quota_activation_cycles)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"active_observed_at", "refresh_observed_at"} {
+		if !columns[name] {
+			t.Fatalf("%s migration was not applied", name)
+		}
+	}
+	var activeAt, refreshAt int64
+	if err := db.QueryRow(`SELECT active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key='existing'`).Scan(&activeAt, &refreshAt); err != nil {
+		t.Fatal(err)
+	}
+	if activeAt != 0 || refreshAt != 0 {
+		t.Fatalf("migrated observation defaults=%d/%d, want 0/0", activeAt, refreshAt)
+	}
+}
+
+func TestActivationQuotaObservationState(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*quotaActivationQuota)
+		want   activationQuotaObservationState
+	}{
+		{name: "fresh", want: activationObservationFresh},
+		{name: "positive percent active", mutate: func(quota *quotaActivationQuota) { *quota.Primary.UsedPercent = 1 }, want: activationObservationActive},
+		{name: "positive tokens active", mutate: func(quota *quotaActivationQuota) { *quota.Primary.UsedTokens = 1; *quota.Primary.RemainingTokens = 999 }, want: activationObservationActive},
+		{name: "short countdown active", mutate: func(quota *quotaActivationQuota) { *quota.Primary.ResetAfterSeconds--; *quota.Primary.ResetAt-- }, want: activationObservationActive},
+		{name: "unknown presence", mutate: func(quota *quotaActivationQuota) { quota.Secondary.Presence = quotaWindowUnknown }, want: activationObservationInvalid},
+		{name: "absent only", mutate: func(quota *quotaActivationQuota) {
+			quota.Primary = quotaActivationWindow{Presence: quotaWindowAbsent}
+			quota.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+		}, want: activationObservationInvalid},
+		{name: "contradictory countdown", mutate: func(quota *quotaActivationQuota) {
+			*quota.Primary.ResetAfterSeconds = *quota.Primary.LimitWindowSeconds + 1
+		}, want: activationObservationInvalid},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			quota := freshActivationQuota()
+			if test.mutate != nil {
+				test.mutate(quota)
+			}
+			if got := classifyActivationQuotaObservation(*quota); got != test.want {
+				t.Fatalf("observation state=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestActivationCycleDecisionRecognizesObservedReset(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   string
+		boundary int64
+		wantKind activationCycleDecisionKind
+	}{
+		{name: "future boundary sent unknown", status: "sent_unknown", boundary: time.Now().Add(7 * 24 * time.Hour).Unix(), wantKind: activationCycleObservedResetSuccessor},
+		{name: "no boundary partial", status: "partial", boundary: 0, wantKind: activationCycleObservedResetSuccessor},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestStore(t)
+			db, _, err := s.open(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			account := healthyActivationAccount()
+			fresh := *freshActivationQuota()
+			fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+			reservedAt := fresh.ObservedAt - 20
+			predecessorKey := activationCycleKey(account, fresh)
+			if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,?)`, activationAccountKey(account), predecessorKey, "run-old", test.status, reservedAt, reservedAt, test.boundary); err != nil {
+				t.Fatal(err)
+			}
+			active := fresh
+			active.ObservedAt = reservedAt + 5
+			shorter := *active.Primary.LimitWindowSeconds - 5
+			active.Primary.ResetAfterSeconds = &shorter
+			activeReset := active.ObservedAt + shorter
+			active.Primary.ResetAt = &activeReset
+			insertActivationHistory(t, db, "history-active", activationAccountKey(account), &active, nil)
+
+			fresh.ObservedAt = reservedAt + 10
+			freshReset := fresh.ObservedAt + *fresh.Primary.LimitWindowSeconds
+			fresh.Primary.ResetAt = &freshReset
+			decision, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Kind != test.wantKind || decision.CycleKey == predecessorKey {
+				t.Fatalf("decision=%+v, predecessor=%q", decision, predecessorKey)
+			}
+			var activeAt, refreshAt int64
+			if err := db.QueryRow(`SELECT active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key=? AND cycle_key=?`, activationAccountKey(account), predecessorKey).Scan(&activeAt, &refreshAt); err != nil {
+				t.Fatal(err)
+			}
+			if activeAt != active.ObservedAt || refreshAt != fresh.ObservedAt {
+				t.Fatalf("markers=%d/%d, want %d/%d", activeAt, refreshAt, active.ObservedAt, fresh.ObservedAt)
+			}
+			repeated, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+			if err != nil || repeated != decision {
+				t.Fatalf("repeated decision=%+v err=%v, want %+v", repeated, err, decision)
+			}
+		})
+	}
+}
+
+func TestActivationCycleDecisionBlocksFreshWithoutActiveEvidence(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := healthyActivationAccount()
+	fresh := *freshActivationQuota()
+	fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	predecessorKey := activationCycleKey(account, fresh)
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,?)`, activationAccountKey(account), predecessorKey, "run-old", "sent_unknown", fresh.ObservedAt-10, fresh.ObservedAt-10, fresh.ObservedAt+1000); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != activationCycleSameCycleBlocked || decision.CycleKey != predecessorKey {
+		t.Fatalf("decision=%+v, want blocked predecessor", decision)
+	}
+	var activeAt, refreshAt int64
+	if err := db.QueryRow(`SELECT active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key=?`, activationAccountKey(account)).Scan(&activeAt, &refreshAt); err != nil {
+		t.Fatal(err)
+	}
+	if activeAt != 0 || refreshAt != 0 {
+		t.Fatalf("fresh-only observation advanced markers=%d/%d", activeAt, refreshAt)
+	}
+}
+
+func TestActivationCycleDecisionRejectsMalformedPersistedObservationMarkers(t *testing.T) {
+	tests := []struct {
+		name      string
+		activeAt  int64
+		refreshAt int64
+	}{
+		{name: "negative active", activeAt: -1, refreshAt: 0},
+		{name: "negative refresh", activeAt: 105, refreshAt: -1},
+		{name: "refresh without active", activeAt: 0, refreshAt: 110},
+		{name: "active before reservation", activeAt: 99, refreshAt: 110},
+		{name: "refresh equals active", activeAt: 105, refreshAt: 105},
+		{name: "refresh precedes active", activeAt: 110, refreshAt: 105},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestStore(t)
+			db, _, err := s.open(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			account := healthyActivationAccount()
+			fresh := *freshActivationQuota()
+			fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+			fresh.ObservedAt = 120
+			resetAt := fresh.ObservedAt + *fresh.Primary.LimitWindowSeconds
+			fresh.Primary.ResetAt = &resetAt
+			accountKey := activationAccountKey(account)
+			if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after,active_observed_at,refresh_observed_at) VALUES (?,?,?,?,?,?,?,?,?)`, accountKey, "malformed-predecessor", "run-old", "sent_unknown", 100, 100, 0, test.activeAt, test.refreshAt); err != nil {
+				t.Fatal(err)
+			}
+			decision, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Kind != activationCycleSameCycleBlocked || decision.CycleKey != "malformed-predecessor" {
+				t.Fatalf("malformed markers produced decision=%+v", decision)
+			}
+			var activeAt, refreshAt int64
+			if err := db.QueryRow(`SELECT active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key=?`, accountKey).Scan(&activeAt, &refreshAt); err != nil {
+				t.Fatal(err)
+			}
+			if activeAt != test.activeAt || refreshAt != test.refreshAt {
+				t.Fatalf("malformed markers were moved from %d/%d to %d/%d", test.activeAt, test.refreshAt, activeAt, refreshAt)
+			}
+		})
+	}
+}
+
+func TestActivationCycleHistoryIsScopedToExactAccount(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := healthyActivationAccount()
+	other := account
+	other.AuthIndex = "other-index"
+	other.AuthID = "other-id"
+	fresh := *freshActivationQuota()
+	fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	reservedAt := fresh.ObservedAt - 20
+	accountKey := activationAccountKey(account)
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,0)`, accountKey, "account-predecessor", "run-old", "sent_unknown", reservedAt, reservedAt); err != nil {
+		t.Fatal(err)
+	}
+	active := fresh
+	active.ObservedAt = reservedAt + 5
+	shorter := *active.Primary.LimitWindowSeconds - 5
+	active.Primary.ResetAfterSeconds = &shorter
+	activeReset := active.ObservedAt + shorter
+	active.Primary.ResetAt = &activeReset
+	insertActivationHistory(t, db, "other-account-history", activationAccountKey(other), &active, nil)
+	fresh.ObservedAt = reservedAt + 10
+	freshReset := fresh.ObservedAt + *fresh.Primary.LimitWindowSeconds
+	fresh.Primary.ResetAt = &freshReset
+	decision, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != activationCycleSameCycleBlocked || decision.CycleKey != "account-predecessor" {
+		t.Fatalf("other account history advanced decision=%+v", decision)
+	}
+	var activeAt, refreshAt int64
+	if err := db.QueryRow(`SELECT active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key=?`, accountKey).Scan(&activeAt, &refreshAt); err != nil {
+		t.Fatal(err)
+	}
+	if activeAt != 0 || refreshAt != 0 {
+		t.Fatalf("other account history advanced markers=%d/%d", activeAt, refreshAt)
+	}
+}
+
+func TestActivationCycleDecisionDoesNotAdvancePastBoundaryWithoutFreshQuota(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := healthyActivationAccount()
+	active := *freshActivationQuota()
+	active.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	boundary := active.ObservedAt - 10
+	reservedAt := boundary - 10
+	shorter := *active.Primary.LimitWindowSeconds - 5
+	active.Primary.ResetAfterSeconds = &shorter
+	activeReset := active.ObservedAt + shorter
+	active.Primary.ResetAt = &activeReset
+	predecessorKey := "boundary-predecessor"
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,?)`, activationAccountKey(account), predecessorKey, "run-old", "sent_unknown", reservedAt, reservedAt, boundary); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := activationCycleDecisionForQuota(context.Background(), db, account, active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != activationCycleSameCycleBlocked || decision.CycleKey != predecessorKey {
+		t.Fatalf("active quota after boundary decision=%+v, want blocked predecessor", decision)
+	}
+}
+
+func TestActivationCycleDecisionRequiresInterveningActiveObservationForEachGeneration(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := healthyActivationAccount()
+	fresh := *freshActivationQuota()
+	fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	accountKey := activationAccountKey(account)
+	predecessorKey := activationCycleKey(account, fresh)
+	reservedAt := fresh.ObservedAt - 20
+	activeAt := reservedAt + 5
+	refreshAt := reservedAt + 10
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after,active_observed_at,refresh_observed_at) VALUES (?,?,?,?,?,?,?,?,?)`, accountKey, predecessorKey, "run-old", "sent_unknown", reservedAt, reservedAt, 0, activeAt, refreshAt); err != nil {
+		t.Fatal(err)
+	}
+	fresh.ObservedAt = refreshAt
+	freshReset := fresh.ObservedAt + *fresh.Primary.LimitWindowSeconds
+	fresh.Primary.ResetAt = &freshReset
+	first, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+	if err != nil || first.Kind != activationCycleObservedResetSuccessor {
+		t.Fatalf("first successor=%+v err=%v", first, err)
+	}
+	if reserved, err := reserveActivationCycle(context.Background(), db, accountKey, first.CycleKey, "run-successor"); err != nil || !reserved {
+		t.Fatalf("reserve successor=%v err=%v", reserved, err)
+	}
+	repeated := fresh
+	repeated.ObservedAt++
+	repeatedReset := repeated.ObservedAt + *repeated.Primary.LimitWindowSeconds
+	repeated.Primary.ResetAt = &repeatedReset
+	blocked, err := activationCycleDecisionForQuota(context.Background(), db, account, repeated)
+	if err != nil || blocked.Kind != activationCycleSameCycleBlocked || blocked.CycleKey != first.CycleKey {
+		t.Fatalf("repeated fresh decision=%+v err=%v", blocked, err)
+	}
+
+	active := repeated
+	if err := db.QueryRow(`SELECT reserved_at FROM quota_activation_cycles WHERE account_key=? AND cycle_key=?`, accountKey, first.CycleKey).Scan(&active.ObservedAt); err != nil {
+		t.Fatal(err)
+	}
+	active.ObservedAt++
+	shorter := *active.Primary.LimitWindowSeconds - 5
+	active.Primary.ResetAfterSeconds = &shorter
+	activeReset := active.ObservedAt + shorter
+	active.Primary.ResetAt = &activeReset
+	if decision, err := activationCycleDecisionForQuota(context.Background(), db, account, active); err != nil || decision.Kind != activationCycleSameCycleBlocked {
+		t.Fatalf("active successor decision=%+v err=%v", decision, err)
+	}
+	nextFresh := repeated
+	nextFresh.ObservedAt = active.ObservedAt + 1
+	nextReset := nextFresh.ObservedAt + *nextFresh.Primary.LimitWindowSeconds
+	nextFresh.Primary.ResetAt = &nextReset
+	next, err := activationCycleDecisionForQuota(context.Background(), db, account, nextFresh)
+	if err != nil || next.Kind != activationCycleObservedResetSuccessor || next.CycleKey == first.CycleKey {
+		t.Fatalf("next generation=%+v err=%v", next, err)
+	}
+}
+
+func TestObservedResetSuccessorKeyStableAcrossRestartAndFailedBeforeSendRetry(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := healthyActivationAccount()
+	fresh := *freshActivationQuota()
+	fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	reservedAt := fresh.ObservedAt - 20
+	activeAt := reservedAt + 5
+	refreshAt := reservedAt + 10
+	accountKey := activationAccountKey(account)
+	predecessorKey := activationCycleKey(account, fresh)
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after,active_observed_at,refresh_observed_at) VALUES (?,?,?,?,?,?,?,?,?)`, accountKey, predecessorKey, "run-old", "sent_unknown", reservedAt, reservedAt, 0, activeAt, refreshAt); err != nil {
+		t.Fatal(err)
+	}
+	fresh.ObservedAt = refreshAt
+	reset := fresh.ObservedAt + *fresh.Primary.LimitWindowSeconds
+	fresh.Primary.ResetAt = &reset
+	first, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+	if err != nil || first.Kind != activationCycleObservedResetSuccessor {
+		t.Fatalf("first decision=%+v err=%v", first, err)
+	}
+	if reserved, err := reserveActivationCycle(context.Background(), db, accountKey, first.CycleKey, "run-failed"); err != nil || !reserved {
+		t.Fatalf("first reservation=%v err=%v", reserved, err)
+	}
+	if err := updateActivationCycle(context.Background(), db, accountKey, first.CycleKey, "failed_before_send"); err != nil {
+		t.Fatal(err)
+	}
+	s.close()
+	db, _, err = s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRestart, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+	if err != nil || afterRestart != first {
+		t.Fatalf("restart decision=%+v err=%v, want %+v", afterRestart, err, first)
+	}
+	if reserved, err := reserveActivationCycle(context.Background(), db, accountKey, afterRestart.CycleKey, "run-retry"); err != nil || !reserved {
+		t.Fatalf("failed-before-send retry=%v err=%v", reserved, err)
+	}
+	blocked, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+	if err != nil || blocked.Kind != activationCycleSameCycleBlocked || blocked.CycleKey != first.CycleKey {
+		t.Fatalf("post-retry repeated fresh=%+v err=%v", blocked, err)
+	}
+}
+
+func TestActivationCycleHistoryBackfillsThreeAmbiguousAndOnePartialPredecessor(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := []string{"sent_unknown", "sent_unknown", "sent_unknown", "partial"}
+	for index, status := range statuses {
+		account := healthyActivationAccount()
+		account.AuthIndex = "auth-index-" + strconv.Itoa(index+1)
+		account.AuthID = "auth-id-" + strconv.Itoa(index+1)
+		fresh := *freshActivationQuota()
+		fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+		reservedAt := fresh.ObservedAt - 20
+		accountKey := activationAccountKey(account)
+		predecessorKey := activationCycleKey(account, fresh)
+		boundary := int64(0)
+		if status == "sent_unknown" {
+			boundary = fresh.ObservedAt + int64((7 * 24 * time.Hour).Seconds())
+		}
+		if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,?)`, accountKey, predecessorKey, "run-old-"+strconv.Itoa(index), status, reservedAt, reservedAt, boundary); err != nil {
+			t.Fatal(err)
+		}
+		active := fresh
+		active.ObservedAt = reservedAt + 5
+		shorter := *active.Primary.LimitWindowSeconds - 5
+		active.Primary.ResetAfterSeconds = &shorter
+		activeReset := active.ObservedAt + shorter
+		active.Primary.ResetAt = &activeReset
+		insertActivationHistory(t, db, "history-"+strconv.Itoa(index), accountKey, &active, nil)
+		fresh.ObservedAt = reservedAt + 10
+		freshReset := fresh.ObservedAt + *fresh.Primary.LimitWindowSeconds
+		fresh.Primary.ResetAt = &freshReset
+		decision, err := activationCycleDecisionForQuota(context.Background(), db, account, fresh)
+		if err != nil || decision.Kind != activationCycleObservedResetSuccessor || decision.CycleKey == predecessorKey {
+			t.Fatalf("account %d status=%s decision=%+v err=%v", index, status, decision, err)
+		}
+	}
+}
+
+func TestActivationCycleHistoryRejectsMalformedAndOutOfOrderSnapshots(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := healthyActivationAccount()
+	fresh := *freshActivationQuota()
+	fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	reservedAt := fresh.ObservedAt - 20
+	predecessorKey := activationCycleKey(account, fresh)
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,0)`, activationAccountKey(account), predecessorKey, "run-old", "partial", reservedAt, reservedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO quota_activation_jobs(job_id,job_type,state,created_at,updated_at) VALUES ('malformed','preview','completed',?,?),('out-of-order','run','completed',?,?)`, reservedAt, reservedAt, reservedAt, reservedAt); err != nil {
+		t.Fatal(err)
+	}
+	historyFresh := fresh
+	historyFresh.ObservedAt = reservedAt + 1
+	historyFreshReset := historyFresh.ObservedAt + *historyFresh.Primary.LimitWindowSeconds
+	historyFresh.Primary.ResetAt = &historyFreshReset
+	active := fresh
+	active.ObservedAt = reservedAt + 5
+	shorter := *active.Primary.LimitWindowSeconds - 5
+	active.Primary.ResetAfterSeconds = &shorter
+	activeReset := active.ObservedAt + shorter
+	active.Primary.ResetAt = &activeReset
+	if _, err := db.Exec(`INSERT INTO quota_activation_job_accounts(job_id,account_key,before_quota_json,after_quota_json) VALUES ('malformed',?,'{bad',''),('out-of-order',?,?,?)`, activationAccountKey(account), activationAccountKey(account), marshalActivationQuota(&historyFresh), marshalActivationQuota(&active)); err != nil {
+		t.Fatal(err)
+	}
+	// The fresh "before" snapshot precedes the active "after" snapshot, so it
+	// cannot prove an active-to-fresh transition.
+	currentActive := active
+	currentActive.ObservedAt++
+	currentReset := currentActive.ObservedAt + shorter
+	currentActive.Primary.ResetAt = &currentReset
+	decision, err := activationCycleDecisionForQuota(context.Background(), db, account, currentActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != activationCycleSameCycleBlocked {
+		t.Fatalf("out-of-order history decision=%+v, want blocked", decision)
+	}
+}
+
+func insertActivationHistory(t *testing.T, db *sql.DB, jobID, accountKey string, before, after *quotaActivationQuota) {
+	t.Helper()
+	observedAt := int64(1)
+	if before != nil {
+		observedAt = before.ObservedAt
+	} else if after != nil {
+		observedAt = after.ObservedAt
+	}
+	if _, err := db.Exec(`INSERT INTO quota_activation_jobs(job_id,job_type,state,created_at,updated_at) VALUES (?,'preview','completed',?,?)`, jobID, observedAt, observedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO quota_activation_job_accounts(job_id,account_key,before_quota_json,after_quota_json) VALUES (?,?,?,?)`, jobID, accountKey, marshalActivationQuota(before), marshalActivationQuota(after)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -719,6 +1218,49 @@ func TestQuotaActivationPruningKeepsLatestAmbiguousCycleGuard(t *testing.T) {
 	}
 }
 
+func TestQuotaActivationPruningKeepsGuardBeforeFailedSuccessor(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-60 * 24 * time.Hour).Unix()
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after,active_observed_at,refresh_observed_at) VALUES ('account','predecessor','run-old','sent_unknown',?,?,0,0,0),('account','failed-successor','run-failed','failed_before_send',?,?,0,0,0)`, old, old, old+3, old+3); err != nil {
+		t.Fatal(err)
+	}
+	active := *freshActivationQuota()
+	active.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	active.ObservedAt = old + 1
+	shorter := *active.Primary.LimitWindowSeconds - 5
+	active.Primary.ResetAfterSeconds = &shorter
+	activeReset := active.ObservedAt + shorter
+	active.Primary.ResetAt = &activeReset
+	fresh := *freshActivationQuota()
+	fresh.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	fresh.ObservedAt = old + 2
+	freshReset := fresh.ObservedAt + *fresh.Primary.LimitWindowSeconds
+	fresh.Primary.ResetAt = &freshReset
+	insertActivationHistory(t, db, "retained-evidence", "account", &active, &fresh)
+	if _, err := pruneQuotaActivationState(context.Background(), db, time.Now().Add(-30*24*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	var key, status string
+	var activeAt, refreshAt int64
+	if err := db.QueryRow(`SELECT cycle_key,status,active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key='account'`).Scan(&key, &status, &activeAt, &refreshAt); err != nil {
+		t.Fatal(err)
+	}
+	if key != "predecessor" || status != "sent_unknown" || activeAt != old+1 || refreshAt != old+2 {
+		t.Fatalf("retained guard=%q/%q markers=%d/%d", key, status, activeAt, refreshAt)
+	}
+	var historyRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM quota_activation_job_accounts WHERE account_key='account'`).Scan(&historyRows); err != nil {
+		t.Fatal(err)
+	}
+	if historyRows != 0 {
+		t.Fatalf("retained historical job rows=%d, want evidence compacted into cycle markers", historyRows)
+	}
+}
+
 func TestQuotaProbeGateRejectsOverlappingRounds(t *testing.T) {
 	if !tryAcquireQuotaProbeGate() {
 		t.Fatal("shared quota probe gate was unexpectedly busy")
@@ -787,14 +1329,21 @@ func TestQuotaActivationManagementFlowUsesFixturesOnly(t *testing.T) {
 	if err := os.MkdirAll(authDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	authJSON := `{"provider":"codex","email":"shared@example.com","access_token":"fixture-access","chatgpt_account_id":"fixture-account"}`
+	authJSON := `{"provider":"codex","email":"shared@example.com","access_token":"fixture-access","chatgpt_account_id":"fixture-account-a"}`
+	authJSONB := `{"provider":"codex","email":"shared@example.com","access_token":"fixture-access","chatgpt_account_id":"fixture-account-b"}`
 	if err := os.WriteFile(filepath.Join(authDir, "seat-a.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir, "seat-b.json"), []byte(authJSONB), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	withCodexHostAuthSource(t, func(method string, payload any) (json.RawMessage, error) {
 		switch method {
 		case "host.auth.list":
-			return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{ID: "seat-a.json", AuthIndex: "index-a", Name: "seat-a.json", Provider: "codex", Email: "shared@example.com", Source: "file"}}})
+			return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{
+				{ID: "seat-a.json", AuthIndex: "index-a", Name: "seat-a.json", Provider: "codex", Email: "shared@example.com", Source: "file"},
+				{ID: "seat-b.json", AuthIndex: "index-b", Name: "seat-b.json", Provider: "codex", Email: "shared@example.com", Source: "file"},
+			}})
 		case "host.auth.get":
 			return json.Marshal(hostAuthGetResponse{AuthIndex: "index-a", Name: "seat-a.json", JSON: json.RawMessage(authJSON)})
 		default:
@@ -814,7 +1363,7 @@ func TestQuotaActivationManagementFlowUsesFixturesOnly(t *testing.T) {
 				t.Errorf("open store at dispatch: %v", err)
 			} else {
 				var cycleStatus string
-				if err := db.QueryRow(`SELECT status FROM quota_activation_cycles LIMIT 1`).Scan(&cycleStatus); err != nil {
+				if err := db.QueryRow(`SELECT status FROM quota_activation_cycles ORDER BY rowid DESC LIMIT 1`).Scan(&cycleStatus); err != nil {
 					t.Errorf("read cycle at dispatch: %v", err)
 				} else if cycleStatus != "dispatch_intent" {
 					t.Errorf("cycle status at network dispatch=%q, want dispatch_intent", cycleStatus)
@@ -837,6 +1386,47 @@ func TestQuotaActivationManagementFlowUsesFixturesOnly(t *testing.T) {
 	codexResponsesURLOverrideForTest = server.URL
 	globalQuotaActivation.configure(defaultPluginConfig())
 
+	// Seed the predecessor shape observed in live data: an ambiguous HTTP 200
+	// cycle with durable active evidence and a future scheduled boundary. The
+	// preview's one fresh quota read must reconcile that evidence and derive the
+	// same stable successor that run revalidation uses.
+	inventory, _, err := activationInventory()
+	if err != nil || len(inventory) != 2 {
+		t.Fatalf("fixture inventory=%d err=%v", len(inventory), err)
+	}
+	var account, blockedAccount configuredAccount
+	for _, item := range inventory {
+		switch item.AuthIndex {
+		case "index-a":
+			account = item
+		case "index-b":
+			blockedAccount = item
+		}
+	}
+	if account.AuthIndex == "" || blockedAccount.AuthIndex == "" {
+		t.Fatal("fixture accounts were not retained as exact seats")
+	}
+	db, _, err := globalStore.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservedAt := time.Now().Unix() - 100
+	predecessorKey := "fixture-predecessor-cycle"
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,?)`, activationAccountKey(account), predecessorKey, "fixture-predecessor-run", "sent_unknown", reservedAt, reservedAt, time.Now().Add(7*24*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	active := *freshActivationQuota()
+	active.Secondary = quotaActivationWindow{Presence: quotaWindowAbsent}
+	active.ObservedAt = reservedAt + 10
+	shorter := *active.Primary.LimitWindowSeconds - 5
+	active.Primary.ResetAfterSeconds = &shorter
+	activeReset := active.ObservedAt + shorter
+	active.Primary.ResetAt = &activeReset
+	insertActivationHistory(t, db, "fixture-active-history", activationAccountKey(account), &active, nil)
+	if _, err := db.Exec(`INSERT INTO quota_activation_cycles(account_key,cycle_key,run_id,status,reserved_at,updated_at,next_cycle_after) VALUES (?,?,?,?,?,?,?)`, activationAccountKey(blockedAccount), "fixture-blocked-cycle", "fixture-blocked-run", "sent_unknown", reservedAt, reservedAt, time.Now().Add(7*24*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+
 	previewResponse := handleQuotaActivationManagement(managementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginID + "/quota-activation/preview", Body: []byte(`{"force":false,"auth_indexes":[]}`)})
 	if previewResponse.StatusCode != http.StatusAccepted {
 		t.Fatalf("preview status=%d body=%s", previewResponse.StatusCode, previewResponse.Body)
@@ -849,11 +1439,30 @@ func TestQuotaActivationManagementFlowUsesFixturesOnly(t *testing.T) {
 		t.Fatalf("preview start response=%+v", started)
 	}
 	preview := waitActivationJob(t, "preview", started.PreviewID)
-	if preview.State != "completed" || preview.ExpiresAt == "" || preview.ConfirmationToken == "" || len(preview.Accounts) != 1 || !preview.Accounts[0].Eligible {
+	if preview.State != "completed" || preview.ExpiresAt == "" || preview.ConfirmationToken == "" || len(preview.Accounts) != 2 || preview.EligibleAccounts != 1 {
 		t.Fatalf("preview=%+v accounts=%+v", preview, preview.Accounts)
+	}
+	var eligibleRow, blockedRow *quotaActivationAccountResult
+	for index := range preview.Accounts {
+		switch preview.Accounts[index].AuthIndex {
+		case "index-a":
+			eligibleRow = &preview.Accounts[index]
+		case "index-b":
+			blockedRow = &preview.Accounts[index]
+		}
+	}
+	if eligibleRow == nil || !eligibleRow.Eligible || blockedRow == nil || blockedRow.Eligible || blockedRow.Reason != activationDuplicateCycle {
+		t.Fatalf("preview did not share observed-reset/duplicate decisions: %+v", preview.Accounts)
 	}
 	if compactCalls.Load() != 0 {
 		t.Fatal("preview sent a model request")
+	}
+	var activeObservedAt, refreshObservedAt int64
+	if err := db.QueryRow(`SELECT active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key=? AND cycle_key=?`, activationAccountKey(account), predecessorKey).Scan(&activeObservedAt, &refreshObservedAt); err != nil {
+		t.Fatal(err)
+	}
+	if activeObservedAt != active.ObservedAt || refreshObservedAt <= activeObservedAt {
+		t.Fatalf("preview markers=%d/%d, want active=%d followed by fresh", activeObservedAt, refreshObservedAt, active.ObservedAt)
 	}
 
 	runBody, _ := json.Marshal(quotaActivationRunRequest{PreviewID: preview.ID, ConfirmationToken: preview.ConfirmationToken, AuthIndexes: []string{"index-a"}})
@@ -874,6 +1483,16 @@ func TestQuotaActivationManagementFlowUsesFixturesOnly(t *testing.T) {
 	run := waitActivationJob(t, "run", started.RunID)
 	if len(run.Accounts) != 1 || run.Accounts[0].Status != "verified" || compactCalls.Load() != 1 {
 		t.Fatalf("run=%+v accounts=%+v calls=%d", run, run.Accounts, compactCalls.Load())
+	}
+	if run.Accounts[0].CycleKey == "" || run.Accounts[0].CycleKey == predecessorKey {
+		t.Fatalf("run cycle key did not use the observed-reset successor")
+	}
+	var successorActiveAt, successorRefreshAt int64
+	if err := db.QueryRow(`SELECT active_observed_at,refresh_observed_at FROM quota_activation_cycles WHERE account_key=? AND cycle_key=?`, activationAccountKey(account), run.Accounts[0].CycleKey).Scan(&successorActiveAt, &successorRefreshAt); err != nil {
+		t.Fatal(err)
+	}
+	if successorActiveAt == 0 || successorRefreshAt != 0 {
+		t.Fatalf("successor markers=%d/%d, want active with no refresh", successorActiveAt, successorRefreshAt)
 	}
 	raw, _ := json.Marshal(run)
 	for _, secret := range []string{"fixture-access", "Bearer ", "Authorization"} {
