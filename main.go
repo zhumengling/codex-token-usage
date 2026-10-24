@@ -368,7 +368,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if request != nil && requestLen > 0 {
 		req = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, err := handleMethod(C.GoString(method), req)
+	raw, err := handleMethodRecovered(C.GoString(method), req)
 	if err != nil {
 		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
 		return 1
@@ -439,6 +439,18 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(code))
 	}
 	return append(json.RawMessage(nil), env.Result...), nil
+}
+
+// handleMethodRecovered keeps a panic inside one plugin call from taking the
+// whole CPA process down: the plugin shares CPA's process, and an unrecovered
+// Go panic aborts it.
+func handleMethodRecovered(method string, request []byte) (raw []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			raw, err = nil, fmt.Errorf("panic in %s: %v", method, recovered)
+		}
+	}()
+	return handleMethod(method, request)
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
