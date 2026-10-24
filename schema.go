@@ -233,6 +233,18 @@ CREATE TABLE IF NOT EXISTS quota_activation_cycles (
   PRIMARY KEY(account_key, cycle_key)
 );
 CREATE INDEX IF NOT EXISTS idx_quota_activation_cycles_updated ON quota_activation_cycles(updated_at);
+CREATE TABLE IF NOT EXISTS claude_quota_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account TEXT NOT NULL DEFAULT '',
+  auth_index TEXT NOT NULL DEFAULT '',
+  auth_id TEXT NOT NULL DEFAULT '',
+  quota_window TEXT NOT NULL DEFAULT '',
+  observed_at_ms INTEGER NOT NULL,
+  utilization REAL NOT NULL,
+  reset_at INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_claude_quota_samples_observed ON claude_quota_samples(observed_at_ms);
 `
 
 const insertSQL = `
