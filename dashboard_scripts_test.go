@@ -53,6 +53,14 @@ func TestXAITabRequiresConfiguredAccount(t *testing.T) {
 	}
 }
 
+func TestPoolColumnToggleLabelSurvivesLocaleRefresh(t *testing.T) {
+	// applyLocale restores each text node from its cached source, so the pool
+	// label must be a new node rather than an in-place edit of the old one.
+	if !strings.Contains(dashboardScripts, `quotaToggle.parentElement.lastChild.replaceWith(document.createTextNode(`) {
+		t.Fatal("pool column toggle label must be replaced with a new text node")
+	}
+}
+
 func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
 	for _, marker := range []string{"r.xai_tier", "tier-free", "tier-super", "tier-heavy", "套餐分布"} {
 		if !strings.Contains(dashboardScripts+dashboardStyles, marker) {

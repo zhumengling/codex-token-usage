@@ -2724,7 +2724,8 @@ function renderPoolLabels(data){
   if(accountHeads[6])accountHeads[6].textContent=xai?'错误状态':'窗口 1';
   if(accountHeads[7])accountHeads[7].textContent=xai?'恢复时间':'窗口 2 / 额度预估';
   const quotaToggle=document.querySelector('#account-columns input[data-col="quota5h"]');
-  if(quotaToggle&&quotaToggle.parentElement.lastChild)quotaToggle.parentElement.lastChild.textContent=xai?'错误':'窗口 1';
+  // Replace the node: applyLocale caches each text node's source, so editing it in place gets reverted.
+  if(quotaToggle&&quotaToggle.parentElement.lastChild)quotaToggle.parentElement.lastChild.replaceWith(document.createTextNode(xai?'错误':'窗口 1'));
 	document.getElementById('invalid-auth-card').disabled=false;
 	document.getElementById('workspace-deactivated-card').disabled=false;
 	document.getElementById('autoban-release-card').disabled=false;
