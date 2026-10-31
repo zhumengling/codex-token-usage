@@ -36,7 +36,8 @@ const logExportStatusEl=document.getElementById('log-export-status-text');
 const quotaActivationModal=document.getElementById('quota-activation-modal');
 const quotaActivationStatusEl=document.getElementById('quota-activation-status');
 const quotaActivationResultsEl=document.getElementById('quota-activation-results');
-const cpaStoragePrefix='enc::v1::';
+const cpaStoragePrefix='enc::v2::';
+const cpaLegacyStoragePrefix='enc::v1::';
 const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
 let accountPage=1;
@@ -581,10 +582,13 @@ function parseStoredValue(value){
   try{return JSON.parse(value)}catch(e){return value}
 }
 function decodeCPAStorage(value){
-  if(!value||!value.startsWith(cpaStoragePrefix))return value;
+  if(!value)return value;
+  // Panels since 2026-10-30 write v2, keyed by host only; older ones wrote v1, keyed by host and user agent.
+  const prefix=[cpaStoragePrefix,cpaLegacyStoragePrefix].find(p=>value.startsWith(p));
+  if(!prefix)return value;
   try{
-    const data=Uint8Array.from(atob(value.slice(cpaStoragePrefix.length)),c=>c.charCodeAt(0));
-    const key=new TextEncoder().encode(cpaSecureStorageSalt+'|'+window.location.host+'|'+navigator.userAgent);
+    const data=Uint8Array.from(atob(value.slice(prefix.length)),c=>c.charCodeAt(0));
+    const key=new TextEncoder().encode(cpaSecureStorageSalt+'|'+window.location.host+(prefix===cpaLegacyStoragePrefix?'|'+navigator.userAgent:''));
     const out=new Uint8Array(data.length);
     for(let i=0;i<data.length;i++)out[i]=data[i]^key[i%key.length];
     return new TextDecoder().decode(out);
