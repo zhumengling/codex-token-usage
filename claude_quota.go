@@ -41,6 +41,14 @@ import (
 // windows, whose steps are too coarse for that, leave out each step that
 // overlaps one of them or that the shortest window has no steps for.
 //
+// Those steps are too coarse to tell cache hits from the rest as well: a 7d
+// step is several dollars, and a short run of them in one cycle can pull k far
+// from what the shortest window fits for the same requests. The other windows
+// price cache hits at the shortest window's k and fit only their limit.
+//
+// The steps of a segment are cumulative, so their errors are not independent.
+// Standard errors are clustered by segment, and never below the classical ones.
+//
 // None of this may disturb CPA: sampling runs on the asynchronous usage queue,
 // never fails the usage record and recovers from panics; estimation runs only
 // when the management route is read, and its result is cached.
@@ -325,7 +333,8 @@ type claudeQuotaChange struct {
 }
 
 // claudeQuotaTier is one way of pricing cache hits. CachePriceRatio is k, the
-// cache-hit price as a share of the API cache-read price. OtherUSD is the part
+// cache-hit price as a share of the API cache-read price; CachePriceFrom names
+// the window it was fitted in when that is another one. OtherUSD is the part
 // of the current cycle's utilization that CPA's requests do not account for:
 // usage of the subscription outside CPA.
 type claudeQuotaTier struct {
@@ -334,6 +343,7 @@ type claudeQuotaTier struct {
 	Method            string  `json:"method,omitempty"`
 	CachePriceRatio   float64 `json:"cache_price_ratio"`
 	CachePriceRatioSE float64 `json:"cache_price_ratio_se,omitempty"`
+	CachePriceFrom    string  `json:"cache_price_from,omitempty"`
 	Clamped           bool    `json:"clamped,omitempty"`
 	Confidence        string  `json:"confidence,omitempty"`
 	LimitUSD          float64 `json:"limit_usd"`
@@ -685,12 +695,17 @@ type claudeQuotaFit struct {
 // fitClaudeQuota regresses utilization on cumulative cost with one intercept
 // per segment (within-segment demeaning). The intercepts absorb each cycle's
 // unknown start offset, the rounding of the reported utilization and the
-// usage outside CPA in left-out steps. With fitCache false, base and
-// cache-read cost share one slope (k fixed to 1).
-func fitClaudeQuota(points []claudeQuotaPoint, fitCache bool) claudeQuotaFit {
-	m := claudeQuotaMomentsOf(points)
+// usage outside CPA in left-out steps. The columns are claudeQuotaColumns(true)
+// to fit the cache price, or a single column that fixes it, such as
+// claudeQuotaCacheAt(k).
+func fitClaudeQuota(points []claudeQuotaPoint, columns ...[2]float64) claudeQuotaFit {
+	segments := claudeQuotaSegmentMoments(points)
+	var m claudeQuotaMoments
+	for _, s := range segments {
+		m = m.plus(s)
+	}
 	failed := claudeQuotaFit{Points: m.rows}
-	beta, inv, rss, ok := m.solve(claudeQuotaColumns(fitCache)...)
+	beta, inv, rss, ok := m.solve(columns...)
 	if !ok {
 		return failed
 	}
@@ -698,23 +713,93 @@ func fitClaudeQuota(points []claudeQuotaPoint, fitCache bool) claudeQuotaFit {
 	if dof < 1 || beta[0] <= 0 {
 		return failed
 	}
-	sigma2 := rss / float64(dof)
-	fit := claudeQuotaFit{OK: true, A: beta[0], VarA: sigma2 * inv[0][0], K: 1, Points: m.rows}
-	if fitCache {
+	covs := claudeQuotaCovariances(segments, columns, beta, inv, rss/float64(dof))
+	fit := claudeQuotaFit{OK: true, A: beta[0], K: columns[0][1], Points: m.rows, RMSE: math.Sqrt(rss / float64(m.rows))}
+	for _, cov := range covs {
+		fit.VarA = math.Max(fit.VarA, cov[0][0])
+	}
+	if len(columns) == 2 {
 		a, b := beta[0], beta[1]
-		varK := sigma2*inv[1][1]/(a*a) + b*b*sigma2*inv[0][0]/math.Pow(a, 4) - 2*b*sigma2*inv[0][1]/math.Pow(a, 3)
-		fit.K, fit.KSE = b/a, math.Sqrt(math.Max(varK, 0))
+		fit.K = b / a
+		for _, cov := range covs {
+			varK := cov[1][1]/(a*a) + b*b*cov[0][0]/math.Pow(a, 4) - 2*b*cov[0][1]/math.Pow(a, 3)
+			fit.KSE = math.Max(fit.KSE, math.Sqrt(math.Max(varK, 0)))
+		}
 		if fit.K < 0 {
-			beta, inv, rss, ok = m.solve(claudeQuotaBaseCost)
-			if !ok || beta[0] <= 0 {
+			clamped := fitClaudeQuota(points, claudeQuotaBaseCost)
+			if !clamped.OK {
 				return failed
 			}
-			sigma2 = rss / float64(m.rows-m.segments-1)
-			fit.A, fit.VarA, fit.K, fit.Clamped = beta[0], sigma2*inv[0][0], 0, true
+			clamped.KSE, clamped.Clamped = fit.KSE, true
+			return clamped
 		}
 	}
-	fit.RMSE = math.Sqrt(rss / float64(m.rows))
 	return fit
+}
+
+// claudeQuotaCovariances returns the covariance of the slopes with independent
+// errors and, given two segments or more, clustered by segment: each step of
+// a segment is the sum of the ones before it, so they share their errors.
+func claudeQuotaCovariances(segments []claudeQuotaMoments, columns [][2]float64, beta []float64, inv [][]float64, sigma2 float64) [][][]float64 {
+	p := len(columns)
+	square := func() [][]float64 {
+		out := make([][]float64, p)
+		for i := range out {
+			out[i] = make([]float64, p)
+		}
+		return out
+	}
+	classical := square()
+	for i := range classical {
+		for j := range classical[i] {
+			classical[i][j] = sigma2 * inv[i][j]
+		}
+	}
+	// w prices base and cache-read cost as the fit does.
+	var w [2]float64
+	for c, column := range columns {
+		for a := range w {
+			w[a] += beta[c] * column[a]
+		}
+	}
+	meat, clusters := square(), 0
+	for _, s := range segments {
+		if s.rows < 2 {
+			continue
+		}
+		clusters++
+		// The segment's score: its regressors times its residuals.
+		score := make([]float64, p)
+		for i, column := range columns {
+			for a := range w {
+				residual := s.xy[a]
+				for b := range w {
+					residual -= s.xx[a][b] * w[b]
+				}
+				score[i] += column[a] * residual
+			}
+		}
+		for i := range score {
+			for j := range score {
+				meat[i][j] += score[i] * score[j]
+			}
+		}
+	}
+	if clusters < 2 {
+		return [][][]float64{classical}
+	}
+	scale := float64(clusters) / float64(clusters-1)
+	clustered := square()
+	for i := range clustered {
+		for j := range clustered[i] {
+			for a := range meat {
+				for b := range meat {
+					clustered[i][j] += scale * inv[i][a] * meat[a][b] * inv[b][j]
+				}
+			}
+		}
+	}
+	return [][][]float64{classical, clustered}
 }
 
 // Regression columns, as weights on base and cache-read cost.
@@ -723,6 +808,11 @@ var (
 	claudeQuotaCacheCost = [2]float64{0, 1}
 	claudeQuotaTotalCost = [2]float64{1, 1}
 )
+
+// claudeQuotaCacheAt prices cache hits at k times the API price.
+func claudeQuotaCacheAt(k float64) [2]float64 {
+	return [2]float64{1, k}
+}
 
 // claudeQuotaColumns prices cache hits freely or, with fitCache false, at
 // the API price (k fixed to 1).
@@ -813,6 +903,15 @@ func (m claudeQuotaMoments) plus(o claudeQuotaMoments) claudeQuotaMoments {
 }
 
 func claudeQuotaMomentsOf(points []claudeQuotaPoint) claudeQuotaMoments {
+	var m claudeQuotaMoments
+	for _, s := range claudeQuotaSegmentMoments(points) {
+		m = m.plus(s)
+	}
+	return m
+}
+
+// claudeQuotaSegmentMoments returns the moments of each segment of points.
+func claudeQuotaSegmentMoments(points []claudeQuotaPoint) []claudeQuotaMoments {
 	origins := map[int]claudeQuotaPoint{}
 	sums := map[int]*claudeQuotaSums{}
 	var order []int
@@ -825,11 +924,11 @@ func claudeQuotaMomentsOf(points []claudeQuotaPoint) claudeQuotaMoments {
 		}
 		s.add(point, origins[point.Segment])
 	}
-	var m claudeQuotaMoments
+	out := make([]claudeQuotaMoments, 0, len(order))
 	for _, segment := range order {
-		m = m.plus(sums[segment].moments())
+		out = append(out, sums[segment].moments())
 	}
-	return m
+	return out
 }
 
 // solve regresses utilization on the given cost columns by least squares and
@@ -868,23 +967,26 @@ func (m claudeQuotaMoments) solve(columns ...[2]float64) ([]float64, [][]float64
 }
 
 // claudeQuotaRecentPoints drops the steps before the most recent change in
-// how fast cost uses up the window. The change is looked for with the cache
-// price free when it can be fitted: with k fixed, a shift in the cache mix
-// alone would look like a change.
-func claudeQuotaRecentPoints(points []claudeQuotaPoint) ([]claudeQuotaPoint, *claudeQuotaChange) {
-	_, _, _, fitCache := claudeQuotaMomentsOf(points).solve(claudeQuotaColumns(true)...)
+// how fast cost uses up the window. Unless columns price cache hits, the
+// change is looked for with the cache price free when it can be fitted: with
+// k fixed, a shift in the cache mix alone would look like a change.
+func claudeQuotaRecentPoints(points []claudeQuotaPoint, columns [][2]float64) ([]claudeQuotaPoint, *claudeQuotaChange) {
+	if columns == nil {
+		_, _, _, fitCache := claudeQuotaMomentsOf(points).solve(claudeQuotaColumns(true)...)
+		columns = claudeQuotaColumns(fitCache)
+	}
 	var change *claudeQuotaChange
 	previous, start := 0, 0
 	for {
-		j, rate := findClaudeQuotaChange(points[start:], fitCache)
+		j, rate := findClaudeQuotaChange(points[start:], columns)
 		if j == 0 {
 			break
 		}
 		previous, start = start, start+j
 		change = &claudeQuotaChange{At: points[start].ObservedMs / 1000, DroppedPoints: start, RateRatio: rate}
 	}
-	if change != nil && fitCache {
-		if fit := fitClaudeQuota(points[previous:start], true); fit.OK && fit.Points >= claudeQuotaMinFitPoints {
+	if change != nil && len(columns) == 2 {
+		if fit := fitClaudeQuota(points[previous:start], columns...); fit.OK && fit.Points >= claudeQuotaMinFitPoints {
 			change.PreviousCachePriceRatio = &fit.K
 		}
 	}
@@ -897,8 +999,8 @@ func claudeQuotaRecentPoints(points []claudeQuotaPoint) ([]claudeQuotaPoint, *cl
 // claudeQuotaChangeMinShift away from 1, so that slow drift in the traffic is
 // not taken for a change. It returns the index of the first step after the
 // change, or 0, and the rate ratio.
-func findClaudeQuotaChange(points []claudeQuotaPoint, fitCache bool) (int, float64) {
-	j, wald, rate := bestClaudeQuotaSplit(points, fitCache)
+func findClaudeQuotaChange(points []claudeQuotaPoint, columns [][2]float64) (int, float64) {
+	j, wald, rate := bestClaudeQuotaSplit(points, columns)
 	if wald < claudeQuotaChangeMinWald || math.Abs(rate-1) < claudeQuotaChangeMinShift {
 		return 0, 0
 	}
@@ -909,12 +1011,11 @@ func findClaudeQuotaChange(points []claudeQuotaPoint, fitCache bool) (int, float
 // leaves claudeQuotaChangeMinPoints steps on each side, so a change can be
 // found once that many steps have followed it, and returns the split with the
 // largest Wald statistic (a sup-Wald test) and its rate ratio.
-func bestClaudeQuotaSplit(points []claudeQuotaPoint, fitCache bool) (int, float64, float64) {
+func bestClaudeQuotaSplit(points []claudeQuotaPoint, columns [][2]float64) (int, float64, float64) {
 	lo, hi := claudeQuotaChangeMinPoints, len(points)-claudeQuotaChangeMinPoints
 	if hi < lo {
 		return 0, 0, 0
 	}
-	columns := claudeQuotaColumns(fitCache)
 	// Runs of consecutive steps from one segment, with the moments and the cost
 	// of the runs after each, so that every split costs the same.
 	type run struct {
@@ -1281,11 +1382,14 @@ type claudeQuotaSpan struct {
 }
 
 // claudeQuotaScreen hands the steps of an account's shortest unscoped window
-// to its other windows, whose own steps are too coarse to screen. In time
-// order.
+// to its other windows, whose own steps are too coarse to screen, in time
+// order. When that window fitted a cache price, cache holds it, for the other
+// windows to price cache hits at.
 type claudeQuotaScreen struct {
 	steps   []claudeQuotaSpan
 	dropped []claudeQuotaSpan
+	window  string
+	cache   *claudeQuotaTier
 }
 
 func newClaudeQuotaScreen(points []claudeQuotaPoint, drop []bool) *claudeQuotaScreen {
@@ -1323,8 +1427,8 @@ func (s *claudeQuotaScreen) keeps(fromMs, toMs int64) bool {
 
 // buildClaudeQuotaWindow estimates one window. With screen nil the window
 // screens its own steps and, if it could, returns them as the screen for the
-// account's other windows; otherwise it leaves out the steps screen does not
-// keep.
+// account's other windows, with its cache price; otherwise it leaves out the
+// steps screen does not keep and prices cache hits at screen's cache price.
 func buildClaudeQuotaWindow(window string, samples []claudeQuotaSample, series func(string) *claudeCostSeries, prices map[string]modelPrice, nowMs int64, screen *claudeQuotaScreen) (claudeQuotaWindow, *claudeQuotaScreen) {
 	duration, scope, _ := claudeWindowSpec(window)
 	latest := samples[len(samples)-1]
@@ -1375,8 +1479,16 @@ func buildClaudeQuotaWindow(window string, samples []claudeQuotaSample, series f
 			next = newClaudeQuotaScreen(points, drop)
 		}
 	}
+	// cache is the cache price the shortest window fitted, when this is another
+	// window; it prices cache hits here, the change detection included.
+	var cache *claudeQuotaTier
+	var cacheColumns [][2]float64
+	if screen != nil && screen.cache != nil {
+		cache = screen.cache
+		cacheColumns = [][2]float64{claudeQuotaCacheAt(cache.CachePriceRatio)}
+	}
 	var recent []claudeQuotaPoint
-	recent, out.Change = claudeQuotaRecentPoints(claudeQuotaSegments(points, drop))
+	recent, out.Change = claudeQuotaRecentPoints(claudeQuotaSegments(points, drop), cacheColumns)
 	if out.Change != nil && screen == nil {
 		// The steps were screened against a fit across the change; screen the
 		// ones after it against their own.
@@ -1421,29 +1533,49 @@ func buildClaudeQuotaWindow(window string, samples []claudeQuotaSample, series f
 		return math.Max(0, limit*latest.Utilization/100-seenBase-k*seenCacheRead)
 	}
 
-	out.API = claudeQuotaTier{CachePriceRatio: 1, CycleCostUSD: out.CycleBaseCost + out.CycleCacheReadCost}
-	if fit := fitClaudeQuota(points, false); fit.OK && fit.Points >= claudeQuotaMinRegressionPoints {
-		out.API.Available = true
-		out.API.Method = "regression"
-		out.API.LimitUSD = 100 / fit.A
-		out.API.LimitUSDSE = 100 * math.Sqrt(math.Max(fit.VarA, 0)) / (fit.A * fit.A)
-		out.API.Points = fit.Points
-		out.API.RMSE = fit.RMSE
-	} else {
-		if latest.Utilization >= 1 && seenBase+seenCacheRead > 0 {
-			out.API.Available = true
-			out.API.Method = "ratio"
-			out.API.LimitUSD = (seenBase + seenCacheRead) / (latest.Utilization / 100)
+	// fixedTier prices cache hits at k and fits only the limit: by regression
+	// when there are enough steps, otherwise as the ratio of the latest reading
+	// to the cost before it.
+	fixedTier := func(k float64) claudeQuotaTier {
+		tier := claudeQuotaTier{CachePriceRatio: k, CycleCostUSD: out.CycleBaseCost + k*out.CycleCacheReadCost}
+		if fit := fitClaudeQuota(points, claudeQuotaCacheAt(k)); fit.OK && fit.Points >= claudeQuotaMinRegressionPoints {
+			tier.Available = true
+			tier.Method = "regression"
+			tier.LimitUSD = 100 / fit.A
+			tier.LimitUSDSE = 100 * math.Sqrt(math.Max(fit.VarA, 0)) / (fit.A * fit.A)
+			tier.Points = fit.Points
+			tier.RMSE = fit.RMSE
+		} else if seen := seenBase + k*seenCacheRead; latest.Utilization >= 1 && seen > 0 {
+			tier.Available = true
+			tier.Method = "ratio"
+			tier.LimitUSD = seen / (latest.Utilization / 100)
 		} else {
-			out.API.Reason = "insufficient_usage"
+			tier.Reason = "insufficient_usage"
 		}
+		if tier.Available {
+			tier.RemainingUSD = tier.LimitUSD * remainingShare
+			tier.OtherUSD = otherUSD(tier.LimitUSD, k)
+		}
+		return tier
 	}
-	if out.API.Available {
-		out.API.RemainingUSD = out.API.LimitUSD * remainingShare
-		out.API.OtherUSD = otherUSD(out.API.LimitUSD, 1)
-	}
+	out.API = fixedTier(1)
 
-	fit := fitClaudeQuota(points, true)
+	if cache != nil {
+		out.Fitted = fixedTier(cache.CachePriceRatio)
+		if out.Fitted.Available {
+			// The limit also moves as far as the error of k takes it.
+			high := fixedTier(cache.CachePriceRatio + cache.CachePriceRatioSE)
+			low := fixedTier(math.Max(cache.CachePriceRatio-cache.CachePriceRatioSE, 0))
+			out.Fitted.LimitUSDSE = math.Hypot(out.Fitted.LimitUSDSE, math.Abs(high.LimitUSD-low.LimitUSD)/2)
+		}
+		out.Fitted.CachePriceRatioSE = cache.CachePriceRatioSE
+		out.Fitted.CachePriceFrom = screen.window
+		out.Fitted.Clamped = cache.Clamped
+		out.Fitted.Confidence = cache.Confidence
+		out.Models = claudeQuotaModelPrices(modelTokens, prices, out.Fitted)
+		return out, nil
+	}
+	fit := fitClaudeQuota(points, claudeQuotaColumns(true)...)
 	switch {
 	case fit.Points < claudeQuotaMinFitPoints:
 		out.Fitted.Reason = "insufficient_points"
@@ -1470,6 +1602,10 @@ func buildClaudeQuotaWindow(window string, samples []claudeQuotaSample, series f
 			out.Fitted.Confidence = "high"
 		case fit.KSE < 0.3:
 			out.Fitted.Confidence = "medium"
+		}
+		if next != nil {
+			fitted := out.Fitted
+			next.window, next.cache = window, &fitted
 		}
 	}
 	out.Models = claudeQuotaModelPrices(modelTokens, prices, out.Fitted)

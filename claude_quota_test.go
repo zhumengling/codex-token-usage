@@ -250,6 +250,39 @@ func TestClaudeQuotaFitRecoversLimitAndCachePrice(t *testing.T) {
 	}
 }
 
+func TestClaudeQuotaFitErrorShowsCyclesThatDisagree(t *testing.T) {
+	// Each cycle charges cache hits at a share of its own, 0.3 on average but
+	// too close for a change. Every step of a cycle carries that cycle's
+	// error, so the error of the pooled k has to show how far apart the cycles
+	// are, not only how well each one fits.
+	const duration = 5 * 3600
+	var samples []claudeQuotaSample
+	var events []claudeCostEvent
+	var nowMs int64
+	for c, share := range []float64{0.27, 0.33, 0.27, 0.33, 0.27, 0.33} {
+		plan := claudeQuotaPlan{1500, share}
+		cycleSamples, cycleEvents, end := simulateClaudeQuotaPlans(int64(c+1), plan, plan, 0, 1, duration, true)
+		shift := int64(c) * duration
+		for _, sample := range cycleSamples {
+			sample.ObservedMs += shift * 1000
+			sample.ResetAt += shift
+			samples = append(samples, sample)
+		}
+		for _, event := range cycleEvents {
+			event.DoneMs += shift * 1000
+			events = append(events, event)
+		}
+		nowMs = end + shift*1000
+	}
+	w := claudeQuotaTestWindow(samples, events, nowMs)
+	if w.Change != nil {
+		t.Fatalf("the cycles were taken for a change: %+v", w.Change)
+	}
+	if f := w.Fitted; !f.Available || math.Abs(f.CachePriceRatio-0.3) > 2*f.CachePriceRatioSE {
+		t.Fatalf("cache share = %.3f ± %.3f, want 0.3 within two errors", f.CachePriceRatio, f.CachePriceRatioSE)
+	}
+}
+
 func TestClaudeQuotaFitClampsNegativeCachePrice(t *testing.T) {
 	samples, events, nowMs := simulateClaudeQuota(1500, 0, 3, 5*3600, true)
 	w := claudeQuotaTestWindow(samples, events, nowMs)
@@ -416,6 +449,11 @@ func TestClaudeQuotaScreensUsageOutsideCPA(t *testing.T) {
 	}
 	if !week.API.Available || math.Abs(week.API.LimitUSD-wantAPI)/wantAPI > 0.08 {
 		t.Fatalf("7d api tier = %+v, want limit near %.0f", week.API, wantAPI)
+	}
+	// The 7d window prices cache hits at the 5h window's k.
+	if f := week.Fitted; !f.Available || f.CachePriceFrom != "5h" || f.CachePriceRatio != five.Fitted.CachePriceRatio ||
+		f.CachePriceRatioSE != five.Fitted.CachePriceRatioSE || math.Abs(f.LimitUSD-sim.limit7d)/sim.limit7d > 0.03 {
+		t.Fatalf("7d fitted tier = %+v, want the 5h cache price and limit %.0f", f, sim.limit7d)
 	}
 	// Kept whole, the 7d steps take the outside usage for the requests' own.
 	keepAll := &claudeQuotaScreen{steps: []claudeQuotaSpan{{FromMs: 0, ToMs: math.MaxInt64}}}

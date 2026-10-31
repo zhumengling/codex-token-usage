@@ -102,6 +102,18 @@ func TestClaudeWindowShowsUsageOutsideCPA(t *testing.T) {
 	}
 }
 
+func TestClaudeWindowShowsWhereTheCachePriceComesFrom(t *testing.T) {
+	for _, marker := range []string{
+		"f.cache_price_from?' · 取自 '+f.cache_price_from+' 窗口'",
+		"f&&f.available&&!f.cache_price_from",
+		"' · 取自 ':' · from the '",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard script missing Claude cache price source marker %q", marker)
+		}
+	}
+}
+
 func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
 	for _, marker := range []string{"r.xai_tier", "tier-free", "tier-super", "tier-heavy", "套餐分布"} {
 		if !strings.Contains(dashboardScripts+dashboardStyles, marker) {

@@ -2464,6 +2464,8 @@ const i18nEn={
   '采样中':'Sampling',
   '需要至少 6 个额度变化点':'Needs at least 6 utilization steps',
   ' 窗口 · ±':' window · ±',
+  ' · 取自 ':' · from the ',
+  ' 窗口 · ':' window · ',
   '本周期用量不足 1%':'Less than 1% used this cycle',
   '额度变化点不足，继续采样':'Not enough utilization steps yet; still sampling',
   '缓存占比变化太小，暂时无法分离缓存价格':'Cache share has not varied enough to separate the cache price yet',
@@ -2776,7 +2778,8 @@ function claudeCacheLine(w){
   if(!f.available)return '';
   const conf={high:'可信度高',medium:'可信度中',low:'可信度低'}[f.confidence]||'';
   const title=(w.models||[]).map(m=>m.model+' API '+money(m.api_cache_read_per_m)+' → 实际 '+money(m.fitted_cache_read_per_m)+' / 百万').join('\n');
-  return '<span title="'+esc(title)+'">'+esc('缓存命中 '+(f.cache_price_ratio*100).toFixed(0)+'% × API 价 ±'+(f.cache_price_ratio_se*100).toFixed(0)+'% · '+conf+(f.clamped?' · 回归为负，按 0 计':''))+'</span>';
+  const from=f.cache_price_from?' · 取自 '+f.cache_price_from+' 窗口':'';
+  return '<span title="'+esc(title)+'">'+esc('缓存命中 '+(f.cache_price_ratio*100).toFixed(0)+'% × API 价 ±'+(f.cache_price_ratio_se*100).toFixed(0)+'%'+from+' · '+conf+(f.clamped?' · 回归为负，按 0 计':''))+'</span>';
 }
 function claudeChangeLine(w){
   const c=w.change;
@@ -3309,7 +3312,7 @@ function renderInsights(data){
     const line=(r,name)=>{const w=r&&claudeQuotaWindowOf(r,name);if(!w)return '暂无额度读数';const api=w.api||{};return pct(used(r,name))+(api.available?' · 余 '+money(api.remaining_usd)+'（API 价）':'')};
     const tone=(r,name)=>used(r,name)>=90?'tone-red':used(r,name)>=70?'tone-orange':'tone-green';
     const five=hottest('5h'), week=hottest('7d');
-    const fittedFrom=[[week,'7d'],[five,'5h']].find(([r,name])=>r&&(claudeQuotaWindowOf(r,name).fitted||{}).available);
+    const fittedFrom=[[week,'7d'],[five,'5h']].find(([r,name])=>{const f=r&&claudeQuotaWindowOf(r,name).fitted;return f&&f.available&&!f.cache_price_from});
     const fitted=fittedFrom?claudeQuotaWindowOf(fittedFrom[0],fittedFrom[1]).fitted:{};
     const fittedChange=fittedFrom&&claudeQuotaWindowOf(fittedFrom[0],fittedFrom[1]).change;
     const fittedBefore=fittedChange&&fittedChange.previous_cache_price_ratio!=null?' · 此前 '+(fittedChange.previous_cache_price_ratio*100).toFixed(0)+'%':'';
