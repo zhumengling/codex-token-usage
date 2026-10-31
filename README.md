@@ -18,6 +18,7 @@ Current version: `0.1.39`
 - Built-in price fallbacks plus automatic LiteLLM model price updates.
 - Manual Chinese / English language switch saved in the browser.
 - xAI account-pool dashboard for xAI OAuth JSON credentials, with xAI-specific 401/403/429 and free-usage-exhausted states.
+- Claude subscription pool: Claude OAuth logins get an account-pool page like Codex and xAI, with the 5h / 7d utilization from Claude response headers converted into a USD limit at API prices and at a fitted cache-hit price. Like Codex and xAI accounts, the logins leave the AI overview; Claude API keys stay there.
 - xAI accounts are read through CPA `host.auth.list/get/get_runtime` when available, with filesystem fallback for older CPA versions; account rows classify Free, Super, and Heavy tiers from auth metadata.
 - Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
 - Optional Codex/xAI Session affinity for scheduler requests: the same Session can stay on the same account; without a usable binding, filtered candidates follow CPA `routing.strategy` (`fill-first` or `round-robin`).
@@ -64,6 +65,7 @@ plugins:
       模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
       模型价格更新超时秒数: 20
 
+      开启 Claude 订阅额度估算: true
       用量保留天数: 90
       额度触发记录保留天数: 30
       请求明细保留天数: 30
@@ -97,6 +99,7 @@ model_price_auto_update_enabled: true
 model_price_update_interval_hours: 6
 model_price_update_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 model_price_update_timeout_seconds: 20
+claude_quota_enabled: true
 usage_retention_days: 90
 quota_trigger_retention_days: 30
 request_detail_retention_days: 30
@@ -147,6 +150,29 @@ Example preview body:
 A completed preview returns a short-lived one-time confirmation token. Pass that token, the preview ID, and an explicit subset of preview-eligible auth indexes to the run endpoint. Preview/run state and cycle reservations are persisted in the plugin SQLite database. Credentials, internal auth IDs/file names, authorization headers, cookies, and raw upstream bodies are not returned; credentials, headers, cookies, and raw bodies are not persisted. A periodic trigger round and a one-shot run share an exclusion gate and cannot dispatch concurrently.
 
 Rollback is local: disable/remove this plugin and restart CPA if required. This stops future actions but cannot undo a successful upstream request or its intended quota-window effect.
+
+## Claude subscription quota
+
+Anthropic reports a Claude subscription's usage only as a percentage per window (`anthropic-ratelimit-unified-5h-utilization`, `-7d-utilization`, and model-scoped windows such as `7d_sonnet`). CPA forwards these headers with every Claude usage record; the plugin stores a reading whenever a window's value or reset time changes, plus a heartbeat every ten minutes. It sends no extra upstream requests.
+
+The **Claude pool** tab (the account-pool page, like the Codex and xAI pools) shows the 5h and 7d windows in the account table and a 7-day quota card. It and `GET /v0/management/plugins/codex-token-usage/claude-quota` relate each reading to the API-priced cost of the same login's requests since the window started:
+
+```text
+utilization% = (base + k × cache_read) / limit × 100
+```
+
+`base` is input, output and cache-write cost, `cache_read` is cache-hit cost, both at the model price table's API prices. Two tiers are reported:
+
+- **API price** fixes `k = 1`, so cache hits count at the API cache-read price.
+- **Fitted cache price** solves for `k` by least squares over the moments the reported percentage stepped up, with one intercept per window cycle (or per part of one, see below). `k` is the share of the API cache-read price the subscription actually charges; it needs at least six steps and cycles in which the cache share varies, and reports a standard error and confidence.
+
+Both tiers give the window limit, the current cycle's spend and the remaining amount. Fits use the last 28 days. Windows scoped to something other than a model family (for example `7d_oi`) are shown without an estimate.
+
+Use of the same login outside this CPA (signed in directly, or on claude.ai) raises the percentage with no request here to account for it, which would make the limit look smaller. The shortest unscoped window (5h) therefore screens its steps: it fits them in blocks of five by least absolute deviations, leaves out each block that rose more than three robust standard deviations, and at least one percentage point, above the median block, and refits the rest until nothing changes. The 7d and model-scoped windows, whose steps are too coarse to screen, leave out every step that overlaps a left-out 5h step or that no 5h step covers. The steps after a left-out one get an intercept of their own. Each tier reports `other_usd`, the current cycle's usage the requests here do not account for (utilization × limit − spend), and each window `screened_steps`; the pool shows the outside usage under the window. A stretch at the start or end of the 28 days in which 80% of the blocks are left out, lasting 12 hours and 20 steps, is kept instead: outside usage comes and goes, and a faster rate that holds that long is more likely a change for the change detection below.
+
+Anthropic can change a window's limit or the price of cache hits at any time, and a fit over steps on both sides of such a change blends the two. Both tiers therefore fit only the steps after the most recent change, if one is found. A change is the split of the screened steps that best explains the residuals of one shared fit (a sup-Wald test). It counts once 20 steps have followed it, the statistic reaches 100, and the fit after it charges the steps since the change at least 10% more or less than the fit before it does. Slow drift in the traffic mix stays below that bar in simulations. The steps after a change are screened again against a fit of their own. The route reports a change as `change` (when it happened, the steps left out, the rate ratio and the earlier cache price), and the pool shows it under the window.
+
+Disable sampling with `claude_quota_enabled: false` (or `开启 Claude 订阅额度估算: false`). Samples follow `usage_retention_days`.
 
 ## Model Price Table
 

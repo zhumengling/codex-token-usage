@@ -53,6 +53,67 @@ func TestXAITabRequiresConfiguredAccount(t *testing.T) {
 	}
 }
 
+func TestPoolColumnToggleLabelSurvivesLocaleRefresh(t *testing.T) {
+	// applyLocale restores each text node from its cached source, so the pool
+	// label must be a new node rather than an in-place edit of the old one.
+	if !strings.Contains(dashboardScripts, `quotaToggle.parentElement.lastChild.replaceWith(document.createTextNode(`) {
+		t.Fatal("pool column toggle label must be replaced with a new text node")
+	}
+}
+
+func TestClaudePoolTabRequiresClaudeAccounts(t *testing.T) {
+	if !strings.Contains(dashboardBody, `data-target="claude" role="tab" aria-selected="false" hidden`) {
+		t.Fatal("Claude pool tab must start hidden until Claude usage is loaded")
+	}
+	if !strings.Contains(dashboardScripts, `const claudeVisible=(data.claude_accounts||[]).length>0;`) {
+		t.Fatal("Claude pool tab visibility must depend on Claude subscription accounts")
+	}
+	if !strings.Contains(dashboardScripts, `if(!claudeVisible&&activePage==='claude')activePage='codex';`) {
+		t.Fatal("losing Claude usage must return the dashboard to Codex")
+	}
+	if !strings.Contains(dashboardScripts, `const contentPage=activePage==='xai'||activePage==='claude'?'codex':activePage;`) {
+		t.Fatal("Claude pool must reuse the account-pool page")
+	}
+}
+
+func TestClaudeWindowShowsAPlanChange(t *testing.T) {
+	for _, marker := range []string{
+		"claudeCacheLine(w)+claudeChangeLine(w)",
+		"c.previous_cache_price_ratio!=null",
+		"'额度消耗速度变为此前的 ':'Quota now burns at '",
+		"'回归已去掉变化前的 ':'The fit leaves out the earlier '",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard script missing Claude plan change marker %q", marker)
+		}
+	}
+}
+
+func TestClaudeWindowShowsUsageOutsideCPA(t *testing.T) {
+	for _, marker := range []string{
+		"claudeOtherLine(w)+claudeCacheLine(w)",
+		"api.other_usd>=api.limit_usd/100",
+		"w.screened_steps>0",
+		"'其他来源 约 ':'Outside CPA ~'",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard script missing Claude outside-usage marker %q", marker)
+		}
+	}
+}
+
+func TestClaudeWindowShowsWhereTheCachePriceComesFrom(t *testing.T) {
+	for _, marker := range []string{
+		"f.cache_price_from?' · 取自 '+f.cache_price_from+' 窗口'",
+		"f&&f.available&&!f.cache_price_from",
+		"' · 取自 ':' · from the '",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard script missing Claude cache price source marker %q", marker)
+		}
+	}
+}
+
 func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
 	for _, marker := range []string{"r.xai_tier", "tier-free", "tier-super", "tier-heavy", "套餐分布"} {
 		if !strings.Contains(dashboardScripts+dashboardStyles, marker) {

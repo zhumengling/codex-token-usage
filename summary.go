@@ -921,6 +921,41 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	}
 	xaiAccounts = mergeConfiguredAccounts(xaiAccounts, configuredXAIAccounts)
 	xaiAccounts = filterCurrentConfiguredAccounts(xaiAccounts, configuredXAIAccounts, globalXAIAuthSource.authoritative())
+	var claudeTotals totalsRow
+	var claudeAccounts []accountRow
+	var claudeModels []modelRow
+	var claudeTrend []trendPoint
+	var claudeRecent []recentRow
+	claudeHasUsage, err := queryHasClaudeUsage(ctx, db, since)
+	if err != nil {
+		return nil, err
+	}
+	if claudeHasUsage {
+		if claudeTotals, err = queryOneTotals(ctx, db, since, "claude"); err != nil {
+			return nil, err
+		}
+		if err := applyCosts(ctx, db, since, &claudeTotals, prices, "claude"); err != nil {
+			return nil, err
+		}
+		if claudeAccounts, err = queryAccounts(ctx, db, since, limit, "claude"); err != nil {
+			return nil, err
+		}
+		if err := applyScopedAccountCosts(ctx, db, since, claudeAccounts, prices, "claude"); err != nil {
+			return nil, err
+		}
+		if claudeModels, err = queryModels(ctx, db, since, limit, "claude"); err != nil {
+			return nil, err
+		}
+		if err := applyModelCosts(ctx, db, since, claudeModels, prices, "claude"); err != nil {
+			return nil, err
+		}
+		if claudeTrend, err = queryTrend(ctx, db, since, label, "claude"); err != nil {
+			return nil, err
+		}
+		if claudeRecent, err = queryRecent(ctx, db, since, 30, "claude", prices); err != nil {
+			return nil, err
+		}
+	}
 	xaiStates, err := queryActiveXAIStates(ctx, db, now)
 	if err != nil {
 		return nil, err
@@ -1037,6 +1072,11 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		"totals":                      totals,
 		"provider_totals":             providerTotals,
 		"xai_totals":                  xaiTotals,
+		"claude_totals":               claudeTotals,
+		"claude_accounts":             claudeAccounts,
+		"claude_models":               claudeModels,
+		"claude_trend":                claudeTrend,
+		"claude_recent":               claudeRecent,
 		"accounts":                    accounts,
 		"xai_accounts":                xaiAccounts,
 		"providers":                   providers,
@@ -1549,13 +1589,19 @@ AND COALESCE(NULLIF(source,''), '') NOT LIKE 'sk-%'
 AND COALESCE(NULLIF(source,''), '') NOT LIKE 'Bearer sk-%')`
 	codexAPIKey := codexAPIKeyProviderScopeSQL(entries)
 	xaiAccount := `(LOWER(COALESCE(NULLIF(provider,''), '')) = 'xai' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%xai%')`
+	claudeAccount := `(LOWER(COALESCE(NULLIF(provider,''), '')) = 'claude'
+AND LOWER(COALESCE(NULLIF(auth_type,''), '')) NOT IN ('apikey', 'api_key', 'api-key', 'key'))`
 	switch strings.ToLower(strings.TrimSpace(scope)) {
 	case "codex":
 		return codexAccount
 	case "other":
-		return "((NOT " + codexAccount + ") AND (NOT " + xaiAccount + ") AND (NOT (LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key')) OR " + codexAPIKey + "))"
+		return "((NOT " + codexAccount + ") AND (NOT " + xaiAccount + ") AND (NOT " + claudeAccount + ") AND (NOT (LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key')) OR " + codexAPIKey + "))"
 	case "xai":
 		return xaiAccount
+	case "claude":
+		// Claude subscription logins. Like Codex and xAI accounts they are
+		// left out of "other"; Claude API keys stay there.
+		return claudeAccount
 	default:
 		return "1=1"
 	}
@@ -1602,6 +1648,19 @@ FROM usage_events WHERE requested_at >= ? AND ` + usageScopeSQL(scope)
 		&row.AverageLatencyMs, &row.AverageTTFTMs, &row.OutputTokensPerSecond, &row.SlowRequests, &row.SlowTTFTRequests,
 	)
 	return row, err
+}
+
+func queryHasClaudeUsage(ctx context.Context, db *sql.DB, since int64) (bool, error) {
+	var found int
+	err := db.QueryRowContext(ctx, `
+SELECT 1
+FROM usage_events INDEXED BY idx_usage_events_provider_requested
+WHERE provider IN ('claude','Claude') AND requested_at >= ?
+LIMIT 1`, since).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func queryHasXAIUsage(ctx context.Context, db *sql.DB, since int64) (bool, error) {

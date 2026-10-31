@@ -10,6 +10,7 @@ const managementAuthImportPreviewApi='/v0/management/plugins/__PLUGIN_ID__/auth-
 const managementAuthImportCommitApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/commit';
 const managementQuotaActivationPreviewApi='/v0/management/plugins/__PLUGIN_ID__/quota-activation/preview';
 const managementQuotaActivationRunApi='/v0/management/plugins/__PLUGIN_ID__/quota-activation/run';
+const managementClaudeQuotaApi='/v0/management/plugins/__PLUGIN_ID__/claude-quota';
 const managementAuthFilesApi='/v0/management/auth-files';
 const managementAuthFileStatusApi='/v0/management/auth-files/status';
 const managementAuthFieldsApi='/v0/management/auth-files/fields';
@@ -39,6 +40,7 @@ const quotaActivationResultsEl=document.getElementById('quota-activation-results
 const cpaStoragePrefix='enc::v1::';
 const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
+let claudeQuotaData=null;
 let accountPage=1;
 let accountPageSize=25;
 let autobanPage=1;
@@ -131,6 +133,7 @@ function applyAccountColumns(){
 function currentLogExportScope(){
   if(activePage==='codex')return {scope:'codex',provider:''};
   if(activePage==='xai')return {scope:'xai',provider:''};
+  if(activePage==='claude')return {scope:'claude',provider:''};
   if(activePage==='providers')return {scope:'providers',provider:''};
   const page=document.querySelector('.tab[data-target="'+activePage+'"]');
   return {scope:'provider',provider:page?firstText(page.childNodes[0]&&page.childNodes[0].nodeValue,page.textContent).replace(/\\s*[0-9.,KMB]+$/,''):''};
@@ -322,6 +325,7 @@ function logExportContextRows(){
   const ctx=currentLogExportScope();
   if(ctx.scope==='codex')return {accounts:data.accounts||[],recent:data.recent||[],providers:[],models:data.models||[]};
   if(ctx.scope==='xai')return {accounts:data.xai_accounts||[],recent:data.xai_recent||[],providers:[],models:data.xai_models||[]};
+  if(ctx.scope==='claude')return {accounts:data.claude_accounts||[],recent:data.claude_recent||[],providers:[],models:data.claude_models||[]};
   if(ctx.scope==='provider'){
     const name=ctx.provider;
     return {
@@ -1781,9 +1785,9 @@ function switchPage(page){
     btn.classList.toggle('active',on);
     btn.setAttribute('aria-selected',on?'true':'false');
   });
-  const contentPage=activePage==='xai'?'codex':activePage;
+  const contentPage=activePage==='xai'||activePage==='claude'?'codex':activePage;
   document.querySelectorAll('[data-page]').forEach(el=>el.classList.toggle('page-on',el.dataset.page===contentPage));
-  if(lastData&&(activePage==='codex'||activePage==='xai')){
+  if(lastData&&(activePage==='codex'||activePage==='xai'||activePage==='claude')){
     renderPoolPage(lastData);
     applyLocale();
   }
@@ -1857,7 +1861,7 @@ function renderProviderTabsAndPages(data){
   document.getElementById('provider-tabs').innerHTML=tabs;
   document.getElementById('provider-pages').innerHTML=selectedProviders.filter(name=>providerMap.has(name)).map(name=>providerPageHTML(name)).join('');
   selectedProviders.filter(name=>providerMap.has(name)).forEach(name=>renderSingleProviderPage(data,name));
-  if(activePage!=='codex'&&activePage!=='xai'&&activePage!=='providers'&&!document.querySelector('[data-page="'+activePage+'"]'))switchPage('providers');
+  if(activePage!=='codex'&&activePage!=='xai'&&activePage!=='claude'&&activePage!=='providers'&&!document.querySelector('[data-page="'+activePage+'"]'))switchPage('providers');
   switchPage(activePage);
 }
 function providerPageHTML(name){
@@ -2375,7 +2379,57 @@ const i18nEn={
   '未发现一号多卖迹象':'No shared-account signal found',
   '暂无账号':'No accounts',
   '暂无额度快照':'No quota snapshots',
-  '次':'times'
+  '次':'times',
+  'Claude 账号池':'Claude pool',
+  'Claude 账号池合计':'Claude pool total',
+  '仅 Claude 账号池':'Claude pool only',
+  'Claude 最近 30 条':'Latest 30 Claude requests',
+  '按账号聚合 Claude 订阅 usage：Token 消耗、缓存率、请求健康，以及 5 小时 / 7 天额度和按 API 价、实际缓存价两档推算的金额。':'Claude subscription usage by account: tokens, cache rate, request health, and 5-hour / 7-day quota with amounts at API price and at the actual cache price.',
+  '7 天额度估算':'7-day quota estimate',
+  '7 天 / 额度预估':'7 days / quota estimate',
+  '5 小时额度':'5-hour quota',
+  '7 天额度':'7-day quota',
+  '5 小时':'5 hours',
+  '7 天':'7 days',
+  '尚未采样':'Not sampled yet',
+  '已重置，等待新读数':'Reset; waiting for a new reading',
+  '暂无额度读数':'No quota reading yet',
+  '等待 Claude 响应头里的 7 天额度':'Waiting for the 7-day quota in Claude response headers',
+  'API 价 · 总额 ':'API price · total ',
+  '实际缓存价采样中':'actual cache price still sampling',
+  '实际缓存价':'Actual cache price',
+  'API 价':'API price',
+  '（API 价）':' (API price)',
+  '本周期花费 ':'Cycle spend ',
+  '按当前周期比值':'current-cycle ratio',
+  '回归 ':'fit on ',
+  '个变化点':' steps',
+  '缓存命中 ':'Cache hits ',
+  ' → 实际 ':' → actual ',
+  ' / 百万':' / 1M',
+  '可信度高':'high confidence',
+  '可信度中':'medium confidence',
+  '可信度低':'low confidence',
+  '回归为负，按 0 计':'fit was negative; using 0',
+  '额度消耗速度变为此前的 ':'Quota now burns at ',
+  ' 倍 · 变化于 ':'× the earlier rate · changed ',
+  '回归已去掉变化前的 ':'The fit leaves out the earlier ',
+  '；此前缓存命中 ':'; earlier cache hits ',
+  '其他来源 约 ':'Outside CPA ~',
+  'CPA 没看到的用量，如订阅直连、claude.ai；按 API 价':'Usage CPA did not see, such as the subscription used directly or on claude.ai; at API price',
+  '，实际缓存价 ':', at the actual cache price ',
+  ' · 回归已跳过受其影响的 ':' · the fit skips the affected ',
+  ' · 此前 ':' · earlier ',
+  '采样中':'Sampling',
+  '需要至少 6 个额度变化点':'Needs at least 6 utilization steps',
+  ' 窗口 · ±':' window · ±',
+  ' · 取自 ':' · from the ',
+  ' 窗口 · ':' window · ',
+  '本周期用量不足 1%':'Less than 1% used this cycle',
+  '额度变化点不足，继续采样':'Not enough utilization steps yet; still sampling',
+  '缓存占比变化太小，暂时无法分离缓存价格':'Cache share has not varied enough to separate the cache price yet',
+  '该窗口的计费范围未知，只显示百分比':'Unknown scope; percentage only',
+  '缺少重置时间，无法估算':'No reset time; cannot estimate'
 };
 function tr(text){
   const source=String(text??'');
@@ -2580,6 +2634,7 @@ async function load(forceRefresh=false,syncRefresh=false,options={}){
     lastData=data;
     summaryWindowCache.set(summaryWindowCacheKey(win),data);
     renderAll();
+    loadClaudeQuota(key,forceRefresh);
     st.textContent=summaryStatusText(lastData);
     if(lastData.precompute&&lastData.precompute.stale)scheduleStaleSummaryRefresh(win);
     return data;
@@ -2600,8 +2655,26 @@ async function fetchSummary(win,key,forceRefresh=false,syncRefresh=false,signal=
 }
 function isXAIPool(){return activePage==='xai'}
 function xaiStateLabel(state){return state==='unauthorized'?'401 失效':state==='forbidden'?'403 拒绝':state==='free_usage_exhausted'?'免费额度耗尽':state==='rate_limited'?'短期限流':state||'-'}
+function isClaudePool(){return activePage==='claude'}
+// Claude subscription quota comes from the claude-quota route; join it onto the
+// account rows by the same login key the backend uses (source, then index, then id).
+function claudeQuotaKey(r){return firstText(r&&r.source,r&&r.auth_index,r&&r.auth_id).trim().toLowerCase()}
+function claudeQuotaWindowOf(r,name){const q=r&&r.claude_quota;return q&&(q.windows||[]).find(w=>w.window===name)||null}
+function claudePoolAccounts(rows){
+  const quotas=(claudeQuotaData&&claudeQuotaData.accounts)||[];
+  return (rows||[]).map(r=>{
+    const quota=quotas.find(q=>q.account===claudeQuotaKey(r));
+    if(!quota)return r;
+    const out=Object.assign({},r,{claude_quota:quota});
+    const five=claudeQuotaWindowOf(out,'5h'), week=claudeQuotaWindowOf(out,'7d');
+    if(five){out.primary_used_percent=five.reset_passed?0:five.utilization;out.primary_reset_at=five.reset_at}
+    if(week){out.secondary_used_percent=week.reset_passed?0:week.utilization;out.secondary_reset_at=week.reset_at}
+    return out;
+  });
+}
 function poolData(source){
   const data=source||lastData||{};
+  if(isClaudePool())return {totals:data.claude_totals||{},accounts:claudePoolAccounts(data.claude_accounts),models:data.claude_models||[],trend:data.claude_trend||[],recent:data.claude_recent||[],autobans:[],provider:'claude'};
   if(!isXAIPool())return {totals:data.totals||{},accounts:data.accounts||[],models:data.models||[],trend:data.trend||[],recent:data.recent||[],autobans:data.autobans||[],forbidden_auths:data.forbidden_auths||[],quota_trigger:data.quota_trigger||{},provider:'codex'};
   const states=(data.xai_states||[]).map(r=>Object.assign({},r,{window:xaiStateLabel(r.state),banned_at_text:r.observed_at_text,reset_at_text:r.reset_at_text}));
   return {totals:data.xai_totals||{},accounts:data.xai_accounts||[],models:data.xai_models||[],trend:data.xai_trend||[],recent:data.xai_recent||[],autobans:states,provider:'xai'};
@@ -2612,6 +2685,11 @@ function renderAll(){
   const xaiVisible=(data.xai_accounts||[]).some(r=>r.configured);
   if(xaiTab){xaiTab.hidden=!xaiVisible;xaiTab.setAttribute('aria-hidden',xaiVisible?'false':'true');xaiTab.tabIndex=xaiVisible?0:-1}
   if(!xaiVisible&&activePage==='xai')activePage='codex';
+  const claudeTab=document.querySelector('.tab[data-target="claude"]');
+  const claudeVisible=(data.claude_accounts||[]).length>0;
+  if(claudeTab){claudeTab.hidden=!claudeVisible;claudeTab.setAttribute('aria-hidden',claudeVisible?'false':'true');claudeTab.tabIndex=claudeVisible?0:-1}
+  if(!claudeVisible&&activePage==='claude')activePage='codex';
+  document.getElementById('tab-claude-count').textContent=fmt((data.claude_accounts||[]).length);
   document.getElementById('tab-codex-count').textContent=fmt((data.accounts||[]).length);
   document.getElementById('tab-xai-count').textContent=fmt((data.xai_accounts||[]).length);
   document.getElementById('tab-provider-count').textContent=fmt((data.providers||[]).length);
@@ -2620,6 +2698,80 @@ function renderAll(){
   renderProviderTabsAndPages(data);
   renderOpenManagementModals();
   applyLocale();
+}
+async function loadClaudeQuota(key,refresh=false){
+  if(!key)return;
+  try{
+    const res=await fetch(managementClaudeQuotaApi+(refresh?'?refresh=1':''),{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    claudeQuotaData=await res.json();
+  }catch(e){if(window.console)console.error(e);return}
+  // A broken quota payload must not stop the rest of the dashboard from rendering.
+  try{if(lastData&&isClaudePool()){renderPoolPage(lastData);applyLocale()}}catch(e){if(window.console)console.error(e)}
+}
+function claudeQuotaReasonText(reason,points){
+  if(reason==='insufficient_usage')return '本周期用量不足 1%';
+  if(reason==='insufficient_points')return '额度变化点不足，继续采样（'+fmt(points)+' / 6）';
+  if(reason==='fit_failed')return '缓存占比变化太小，暂时无法分离缓存价格';
+  return reason||'—';
+}
+function claudeQuotaNoteText(note){
+  if(note==='unscoped_window')return '该窗口的计费范围未知，只显示百分比';
+  if(note==='no_reset_header')return '缺少重置时间，无法估算';
+  return note||'';
+}
+function claudeQuotaBar(label,w){
+  if(!w)return '<span class="metric-stack"><b class="muted">-</b><span>尚未采样</span></span>';
+  const used=w.reset_passed?0:Number(w.utilization||0), width=Math.min(100,used);
+  const reset=w.reset_passed?'已重置，等待新读数':resetText(w.reset_at);
+  return '<div class="quota-compact" title="'+esc(reset)+'"><span>'+esc(label)+'</span><div class="bar"><span style="--color:'+colorForPct(width)+';width:'+width.toFixed(1)+'%"></span></div><b class="'+health(width)+'">'+esc(pct(used))+'</b></div>';
+}
+function claudeTierLine(name,tier,w){
+  if(!tier||!tier.available)return '<span class="muted">'+esc(name+'：'+claudeQuotaReasonText(tier&&tier.reason,w.points))+'</span>';
+  const how=tier.method==='ratio'?'按当前周期比值':'回归 '+fmt(tier.points)+' 个变化点';
+  const title='本周期花费 '+money(tier.cycle_cost_usd)+' · '+how;
+  return '<span title="'+esc(title)+'">'+esc(name+' 余 '+money(tier.remaining_usd)+' / 总 '+money(tier.limit_usd)+(tier.limit_usd_se>0?' ±'+money(tier.limit_usd_se):''))+'</span>';
+}
+function claudeCacheLine(w){
+  const f=w.fitted||{};
+  if(!f.available)return '';
+  const conf={high:'可信度高',medium:'可信度中',low:'可信度低'}[f.confidence]||'';
+  const title=(w.models||[]).map(m=>m.model+' API '+money(m.api_cache_read_per_m)+' → 实际 '+money(m.fitted_cache_read_per_m)+' / 百万').join('\n');
+  const from=f.cache_price_from?' · 取自 '+f.cache_price_from+' 窗口':'';
+  return '<span title="'+esc(title)+'">'+esc('缓存命中 '+(f.cache_price_ratio*100).toFixed(0)+'% × API 价 ±'+(f.cache_price_ratio_se*100).toFixed(0)+'%'+from+' · '+conf+(f.clamped?' · 回归为负，按 0 计':''))+'</span>';
+}
+function claudeChangeLine(w){
+  const c=w.change;
+  if(!c)return '';
+  const before=c.previous_cache_price_ratio!=null?'；此前缓存命中 '+(c.previous_cache_price_ratio*100).toFixed(0)+'% × API 价':'';
+  const title='回归已去掉变化前的 '+fmt(c.dropped_points)+' 个变化点'+before;
+  return '<span class="warn" title="'+esc(title)+'">'+esc('额度消耗速度变为此前的 '+Number(c.rate_ratio||0).toFixed(2)+' 倍 · 变化于 '+new Date(c.at*1000).toLocaleString())+'</span>';
+}
+// Usage outside CPA shows once it reaches the 1% the utilization is reported in.
+function claudeOtherLine(w){
+  const api=w.api||{};
+  if(!api.available||!(api.other_usd>=api.limit_usd/100))return '';
+  const fitted=w.fitted&&w.fitted.available?'，实际缓存价 '+money(w.fitted.other_usd):'';
+  const skipped=w.screened_steps>0?' · 回归已跳过受其影响的 '+fmt(w.screened_steps)+' 个变化点':'';
+  const title='CPA 没看到的用量，如订阅直连、claude.ai；按 API 价'+fitted+skipped;
+  return '<span title="'+esc(title)+'">'+esc('其他来源 约 '+money(api.other_usd)+' · 占比 '+pct(ratio(api.other_usd,api.limit_usd*Number(w.utilization||0)/100)))+'</span>';
+}
+function claudeWindowCell(r,name,label){
+  const w=claudeQuotaWindowOf(r,name);
+  if(!w)return claudeQuotaBar(label,null);
+  if(!w.estimated)return '<div class="metric-stack">'+claudeQuotaBar(label,w)+'<span class="muted">'+esc(claudeQuotaNoteText(w.note))+'</span></div>';
+  return '<div class="metric-stack">'+claudeQuotaBar(label,w)+claudeTierLine('API 价',w.api,w)+claudeTierLine('实际缓存价',w.fitted,w)+claudeOtherLine(w)+claudeCacheLine(w)+claudeChangeLine(w)+'</div>';
+}
+function claudeQuotaCardText(accounts){
+  const seen=new Set(); let n=0,fitN=0,apiRemain=0,apiTotal=0,fitRemain=0,fitTotal=0;
+  (accounts||[]).forEach(r=>{
+    const q=r.claude_quota; if(!q||seen.has(q.account))return; seen.add(q.account);
+    const w=claudeQuotaWindowOf(r,'7d'); if(!w||!w.api||!w.api.available)return;
+    n++; apiRemain+=w.api.remaining_usd; apiTotal+=w.api.limit_usd;
+    if(w.fitted&&w.fitted.available){fitN++;fitRemain+=w.fitted.remaining_usd;fitTotal+=w.fitted.limit_usd}
+  });
+  if(!n)return {value:'-',sub:'等待 Claude 响应头里的 7 天额度'};
+  return {value:money(apiRemain),sub:'API 价 · 总额 '+money(apiTotal)+(fitN===n?' · 实际缓存价 余 '+money(fitRemain)+' / '+money(fitTotal):' · 实际缓存价采样中')};
 }
 function renderOpenManagementModals(){
   if(!invalidAuthModal.hidden)renderInvalidAuthModal();
@@ -2644,8 +2796,16 @@ function renderPoolPage(source){
   document.getElementById('m-429').textContent=fmt(t.rate_limited);
   document.getElementById('m-bans').textContent=fmt(data.autobans.length);
   document.getElementById('m-accounts').textContent=fmt((data.accounts||[]).length);
+  if(data.provider==='claude'){
+    const card=claudeQuotaCardText(data.accounts);
+    document.getElementById('m-7d-remaining').textContent=card.value;
+    document.getElementById('m-7d-remaining-sub').textContent=card.sub;
+    document.getElementById('m-7d-remaining-sub').title=card.sub;
+  }else{
+  document.getElementById('m-7d-remaining-sub').removeAttribute('title');
   document.getElementById('m-7d-remaining').textContent=quotaValue(t.secondary_quota_remaining_estimate);
   document.getElementById('m-7d-remaining-sub').textContent=(t.secondary_quota_estimated_accounts||0)>0?'覆盖 '+fmt(t.secondary_quota_estimated_accounts)+' 个账号 · 总额 '+quotaValue(t.secondary_quota_total_estimate):'等待窗口 2 额度快照';
+  }
   const qt=(source&&source.quota_trigger)||{};
   document.getElementById('m-trigger').textContent=qt.enabled?(qt.running?'运行中':'已开启'):'已关闭';
   document.getElementById('m-trigger-sub').textContent=qt.enabled?('模式 '+(qt.mode||'quota')+' · '+(qt.interval_minutes||10)+'m · 成功 '+fmt(qt.last_success||0)+' / 失败 '+fmt(qt.last_failed||0)+' / 跳过 '+fmt(qt.last_skipped||0)):'默认关闭 · quota 查询不保证启动动态额度窗口';
@@ -2665,37 +2825,42 @@ function renderPoolPage(source){
   renderRecent('recent',data.recent,data.provider==='xai'?'xai':'codex');
 }
 function renderPoolLabels(data){
-  const xai=data.provider==='xai';
-  document.getElementById('pool-hero-hint').textContent=xai?'按账号聚合 xAI usage：Token 消耗、缓存率、请求健康和 xAI 专属错误状态。':'按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、账号当前上报的动态额度窗口和最近异常。';
-  document.getElementById('m-total-sub').textContent=xai?'xAI 账号池合计':'Codex 账号池合计';
+  const xai=data.provider==='xai', claude=data.provider==='claude';
+  document.getElementById('pool-hero-hint').textContent=claude?'按账号聚合 Claude 订阅 usage：Token 消耗、缓存率、请求健康，以及 5 小时 / 7 天额度和按 API 价、实际缓存价两档推算的金额。':xai?'按账号聚合 xAI usage：Token 消耗、缓存率、请求健康和 xAI 专属错误状态。':'按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、账号当前上报的动态额度窗口和最近异常。';
+  document.getElementById('m-total-sub').textContent=claude?'Claude 账号池合计':xai?'xAI 账号池合计':'Codex 账号池合计';
   document.getElementById('m-429-sub').textContent=xai?'免费额度耗尽 / 短期限流':'限流/额度打满';
   document.getElementById('m-bans-label').textContent=xai?'不可用状态':'自动禁用';
   document.getElementById('m-bans-sub').textContent=xai?'401 / 403 / xAI 429':'Codex 429 Auto Ban';
+  document.getElementById('m-bans').closest('.metric').hidden=claude;
   document.getElementById('m-quota-card').hidden=xai;
-  document.getElementById('m-trigger-card').hidden=xai;
-  const modelMini=document.getElementById('models').closest('.section').querySelector('.mini'); if(modelMini)modelMini.textContent=xai?'仅 xAI 账号池':'仅 Codex 账号池';
-  const recentMini=document.getElementById('recent').closest('.section').querySelector('.mini'); if(recentMini)recentMini.textContent=xai?'xAI 最近 30 条':'Codex 最近 30 条';
+  document.getElementById('m-quota-card').querySelector('.label').textContent=claude?'7 天额度估算':'窗口 2 额度估算';
+  document.getElementById('m-trigger-card').hidden=xai||claude;
+  const modelMini=document.getElementById('models').closest('.section').querySelector('.mini'); if(modelMini)modelMini.textContent=claude?'仅 Claude 账号池':xai?'仅 xAI 账号池':'仅 Codex 账号池';
+  const recentMini=document.getElementById('recent').closest('.section').querySelector('.mini'); if(recentMini)recentMini.textContent=claude?'Claude 最近 30 条':xai?'xAI 最近 30 条':'Codex 最近 30 条';
   const stateSection=document.getElementById('autobans').closest('.section');
+  stateSection.hidden=claude;
   const stateTitle=stateSection.querySelector('h2 span:first-child'); const stateMini=stateSection.querySelector('h2 .mini');
   if(stateTitle)stateTitle.textContent=xai?'xAI 账号状态':'自动禁用状态';
   if(stateMini)stateMini.textContent=xai?'401/403 更换认证后解除，免费额度耗尽按 24 小时恢复，普通 429 短期退避':'429 按 reset_at 恢复，401/402 处理认证文件后解除';
   const accountHeads=document.querySelectorAll('.account-table thead th');
-  if(accountHeads[6])accountHeads[6].textContent=xai?'错误状态':'窗口 1';
-  if(accountHeads[7])accountHeads[7].textContent=xai?'恢复时间':'窗口 2 / 额度预估';
+  if(accountHeads[6])accountHeads[6].textContent=claude?'5 小时':xai?'错误状态':'窗口 1';
+  if(accountHeads[7])accountHeads[7].textContent=claude?'7 天 / 额度预估':xai?'恢复时间':'窗口 2 / 额度预估';
   const quotaToggle=document.querySelector('#account-columns input[data-col="quota5h"]');
-  if(quotaToggle&&quotaToggle.parentElement.lastChild)quotaToggle.parentElement.lastChild.textContent=xai?'错误':'窗口 1';
+  // Replace the node: applyLocale caches each text node's source, so editing it in place gets reverted.
+  if(quotaToggle&&quotaToggle.parentElement.lastChild)quotaToggle.parentElement.lastChild.replaceWith(document.createTextNode(claude?'5 小时':xai?'错误':'窗口 1'));
 	document.getElementById('invalid-auth-card').disabled=false;
 	document.getElementById('workspace-deactivated-card').disabled=false;
 	document.getElementById('autoban-release-card').disabled=false;
   document.getElementById('invalid-auth-card').querySelector('span').textContent=xai?'401 失效':'401 失效';
   document.getElementById('workspace-deactivated-card').querySelector('span').textContent=xai?'403 拒绝':'402 工作区';
   document.getElementById('autoban-release-card').querySelector('span').textContent=xai?'429 状态':'429 禁用';
-  document.getElementById('account-external-use').parentElement.hidden=xai;
-  document.getElementById('account-trigger-failed').parentElement.hidden=xai;
+  ['invalid-auth-card','workspace-deactivated-card','autoban-release-card'].forEach(id=>{document.getElementById(id).hidden=claude});
+  document.getElementById('account-external-use').parentElement.hidden=xai||claude;
+  document.getElementById('account-trigger-failed').parentElement.hidden=xai||claude;
   document.getElementById('account-quota-hot').parentElement.hidden=xai;
   const sort=document.getElementById('account-sort');
-  Array.from(sort.options).forEach(option=>{if(['quotaRemain','quotaTotal','workspace','external','trigger','quota'].includes(option.value))option.hidden=xai});
-  if(xai&&sort.selectedOptions[0]&&sort.selectedOptions[0].hidden)sort.value='tokens';
+  Array.from(sort.options).forEach(option=>{option.hidden=xai&&['quotaRemain','quotaTotal','workspace','external','trigger','quota'].includes(option.value)||claude&&['quotaRemain','quotaTotal','invalid','workspace','external','trigger'].includes(option.value)});
+  if((xai||claude)&&sort.selectedOptions[0]&&sort.selectedOptions[0].hidden)sort.value='tokens';
 }
 function renderProviderPage(data){
   const t=data.provider_totals||{}; const total=t.total_tokens||0; const okReq=(t.requests||0)-(t.failed||0);
@@ -2896,8 +3061,8 @@ function renderAccountTable(rows,total){
     td(perfCell(r),'num','perf')+
     td(tokenCostStack(r,total),'num')+
     td(metricStack(pct(cacheRate(r)),compact(cacheTokens(r))),'num','cache')+
-    td(isXAIPool()?xaiAccountStateCell(r):quotaWindowCell(r,'primary'),'num','quota5h')+
-    td(isXAIPool()?xaiAccountResetCell(r):quotaWindow2Cell(r),'num')+
+    td(isClaudePool()?claudeWindowCell(r,'5h','5h'):isXAIPool()?xaiAccountStateCell(r):quotaWindowCell(r,'primary'),'num','quota5h')+
+    td(isClaudePool()?claudeWindowCell(r,'7d','7d'):isXAIPool()?xaiAccountResetCell(r):quotaWindow2Cell(r),'num')+
     td('<span class="'+((r.rate_limited||0)>0?'danger':'ok')+'">'+fmt(r.rate_limited||0)+'</span>','num')+
     td(esc(r.last_seen||'-'))+td(accountStatus(r),'','status')+
   '</tr>').join('') || '<tr><td colspan="11" class="muted">没有匹配的账号。</td></tr>';
@@ -2984,6 +3149,30 @@ function renderKeySummaries(rows){
 function costCell(r){return r.cost_available||Number(r.cost_usd||0)>0?'<span class="'+(r.cost_available?'ok':'muted')+'">'+money(r.cost_usd)+'</span>':'<span class="muted">缺价格</span>'}
 function renderInsights(data){
   const accounts=[...(data.accounts||[])]; const t=data.totals||{}; const total=t.total_tokens||0; const bans=data.autobans||[];
+  if(data.provider==='claude'){
+    const top=accounts[0];
+    const hottest=name=>accounts.filter(r=>claudeQuotaWindowOf(r,name)).sort((a,b)=>Number(claudeQuotaWindowOf(b,name).utilization||0)-Number(claudeQuotaWindowOf(a,name).utilization||0))[0];
+    const used=(r,name)=>{const w=r&&claudeQuotaWindowOf(r,name);return w&&!w.reset_passed?Number(w.utilization||0):0};
+    const line=(r,name)=>{const w=r&&claudeQuotaWindowOf(r,name);if(!w)return '暂无额度读数';const api=w.api||{};return pct(used(r,name))+(api.available?' · 余 '+money(api.remaining_usd)+'（API 价）':'')};
+    const tone=(r,name)=>used(r,name)>=90?'tone-red':used(r,name)>=70?'tone-orange':'tone-green';
+    const five=hottest('5h'), week=hottest('7d');
+    const fittedFrom=[[week,'7d'],[five,'5h']].find(([r,name])=>{const f=r&&claudeQuotaWindowOf(r,name).fitted;return f&&f.available&&!f.cache_price_from});
+    const fitted=fittedFrom?claudeQuotaWindowOf(fittedFrom[0],fittedFrom[1]).fitted:{};
+    const fittedChange=fittedFrom&&claudeQuotaWindowOf(fittedFrom[0],fittedFrom[1]).change;
+    const fittedBefore=fittedChange&&fittedChange.previous_cache_price_ratio!=null?' · 此前 '+(fittedChange.previous_cache_price_ratio*100).toFixed(0)+'%':'';
+    const lowCache=[...accounts].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0];
+    const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0];
+    const items=[
+      ['Token 集中度',top?accountName(top):'-',top?'Top 占 '+pct(ratio(top.total_tokens,total)):'暂无账号',ratio(top?.total_tokens||0,total)>50?'tone-orange':''],
+      ['5 小时额度',five?accountName(five):'-',line(five,'5h'),tone(five,'5h')],
+      ['7 天额度',week?accountName(week):'-',line(week,'7d'),tone(week,'7d')],
+      ['实际缓存价',fitted.available?(fitted.cache_price_ratio*100).toFixed(0)+'% × API 价':'采样中',fitted.available?fittedFrom[1]+' 窗口 · ±'+(fitted.cache_price_ratio_se*100).toFixed(0)+'% · 回归 '+fmt(fitted.points)+' 个变化点'+fittedBefore:'需要至少 6 个额度变化点',''],
+      ['缓存最低',lowCache?accountName(lowCache):'-',lowCache?'缓存率 '+pct(cacheRate(lowCache))+' · 输入 '+compact(lowCache.input_tokens):'暂无输入 Token',lowCache&&cacheRate(lowCache)<30?'tone-orange':'']
+    ];
+    if(noisy&&(noisy.rate_limited||0)>0)items.push(['429 最多',accountName(noisy),fmt(noisy.rate_limited)+' 次 · 失败 '+fmt(noisy.failed),'tone-red']);
+    document.getElementById('insights').innerHTML=items.map(r=>'<div class="insight '+r[3]+'"><span>'+r[0]+'</span><b title="'+esc(r[1])+'">'+esc(r[1])+'</b><span>'+r[2]+'</span></div>').join('');
+    return;
+  }
   if(data.provider==='xai'){
     const top=accounts[0]; const unauthorized=accounts.find(r=>r.xai_state==='unauthorized'); const forbidden=accounts.find(r=>r.xai_state==='forbidden'); const exhausted=accounts.find(r=>r.xai_state==='free_usage_exhausted'); const limited=accounts.find(r=>r.xai_state==='rate_limited'); const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0];const tierCounts={free:0,super:0,heavy:0};accounts.forEach(r=>{const tier=String(r.xai_tier||'free').toLowerCase();tierCounts[tier]=(tierCounts[tier]||0)+1});
     const items=[

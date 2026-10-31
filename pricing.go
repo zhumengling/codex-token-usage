@@ -393,10 +393,22 @@ func addCost(sum *costSummary, row costTokenRow, prices map[string]modelPrice) {
 }
 
 func costForTokens(row costTokenRow, prices map[string]modelPrice) (float64, bool) {
+	base, cacheRead, ok := costComponentsForTokens(row, prices)
+	return base + cacheRead, ok
+}
+
+// costComponentsForTokens splits costForTokens into cache-read cost and the
+// rest (input, output and cache write), so callers can reprice cache hits.
+func costComponentsForTokens(row costTokenRow, prices map[string]modelPrice) (float64, float64, bool) {
 	price, ok := resolveModelPrice(row, prices)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
+	base, cacheRead := costComponentsWithPrice(row, price)
+	return base, cacheRead, true
+}
+
+func costComponentsWithPrice(row costTokenRow, price modelPrice) (float64, float64) {
 	inputTokens := maxInt64(row.InputTokens, 0)
 	outputTokens := maxInt64(row.OutputTokens, 0)
 	cache := normalizeCacheTokens(row.CachedTokens, row.CacheReadTokens, row.CacheCreationTokens)
@@ -407,11 +419,10 @@ func costForTokens(row costTokenRow, prices map[string]modelPrice) (float64, boo
 	price = effectiveModelPriceForServiceTier(price, row.Model, row.ServiceTier)
 	cacheReadPrice := effectiveCacheReadPrice(price)
 	cacheCreationPrice := effectiveCacheCreationPrice(price)
-	cost := float64(promptTokens)*price.Prompt/1_000_000.0 +
+	base := float64(promptTokens)*price.Prompt/1_000_000.0 +
 		float64(outputTokens)*price.Completion/1_000_000.0 +
-		float64(cache.Read)*cacheReadPrice/1_000_000.0 +
 		float64(cache.Creation)*cacheCreationPrice/1_000_000.0
-	return cost, true
+	return base, float64(cache.Read) * cacheReadPrice / 1_000_000.0
 }
 
 func resolveModelPrice(row costTokenRow, prices map[string]modelPrice) (modelPrice, bool) {

@@ -76,7 +76,7 @@ func TestXAIOrdinaryRateLimitHonorsShortRetryAfter(t *testing.T) {
 func TestXAIUsageScopeIsSeparateFromOtherProviders(t *testing.T) {
 	db := newProtectionTestDB(t)
 	now := time.Now().Unix()
-	for _, provider := range []string{"codex", "xai", "claude"} {
+	for _, provider := range []string{"codex", "xai", "gemini"} {
 		if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, total_tokens) VALUES (?, ?, ?, ?, 10)`, now, provider, provider, provider); err != nil {
 			t.Fatal(err)
 		}

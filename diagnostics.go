@@ -231,6 +231,10 @@ func (r *retentionCleaner) run(ctx context.Context, cfg pluginConfig) {
 		r.record(err, usageDeleted, triggerDeleted, before, databaseFileSize(path))
 		return
 	}
+	if _, err := execDelete(ctx, db, `DELETE FROM claude_quota_samples WHERE observed_at_ms < ?`, usageCutoff*1000); err != nil {
+		r.record(err, usageDeleted, triggerDeleted, before, databaseFileSize(path))
+		return
+	}
 	r.record(nil, usageDeleted, triggerDeleted, before, databaseFileSize(path))
 }
 
@@ -701,6 +705,8 @@ func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, 
 		where = append(where, usageScopeSQL("other"))
 	case "xai":
 		where = append(where, usageScopeSQL("xai"))
+	case "claude":
+		where = append(where, usageScopeSQL("claude"))
 	default:
 		where = append(where, usageScopeSQL("codex"))
 	}
