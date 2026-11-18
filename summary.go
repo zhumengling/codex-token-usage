@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"hash/fnv"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -595,6 +594,9 @@ WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&raw, &cachedAt, &duration
 		if err := json.Unmarshal([]byte(raw), &data); err != nil {
 			return summaryCacheLoadResult{}, err
 		}
+		if data["version"] != pluginVersion {
+			return summaryCacheLoadResult{}, nil
+		}
 		return summaryCacheLoadResult{
 			entry: summaryCacheEntry{
 				data:       data,
@@ -796,6 +798,7 @@ WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.Next
 		"b:" + strconv.FormatInt(r.BanActive, 10) + ":" + strconv.FormatInt(r.BanMaxChanged, 10) + ":" + strconv.FormatInt(r.NextBanResetAt, 10),
 		"x:" + strconv.FormatInt(r.XAIStateActive, 10) + ":" + strconv.FormatInt(r.XAIStateChanged, 10) + ":" + strconv.FormatInt(r.NextXAIResetAt, 10),
 		"a:" + r.AuthFilesRevision,
+		"p:" + readProviderInventory().revision,
 	}, "|")
 	return r, nil
 }
@@ -958,6 +961,10 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		return nil, err
 	}
 	providers = mergeConfiguredProviders(providers, readConfiguredProviderNames())
+	providerQuotas, err := queryProviderQuotas(ctx, db, readConfiguredProviderEntries())
+	if err != nil {
+		return nil, err
+	}
 	keySummaries, err := queryKeySummaries(ctx, db, since, limit)
 	if err != nil {
 		return nil, err
@@ -1040,6 +1047,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		"accounts":                    accounts,
 		"xai_accounts":                xaiAccounts,
 		"providers":                   providers,
+		"provider_quotas":             providerQuotas,
 		"key_summaries":               keySummaries,
 		"models":                      models,
 		"provider_models":             providerModels,
@@ -1200,7 +1208,7 @@ type accountRow struct {
 	Name                            string   `json:"name,omitempty"`
 	AuthFile                        string   `json:"auth_file,omitempty"`
 	AuthFileMTime                   int64    `json:"auth_file_mtime,omitempty"`
-	AuthSourceKind                 string   `json:"auth_source_kind,omitempty"`
+	AuthSourceKind                  string   `json:"auth_source_kind,omitempty"`
 	ChatGPTAccountID                string   `json:"chatgpt_account_id,omitempty"`
 	Configured                      bool     `json:"configured"`
 	Priority                        int      `json:"priority,omitempty"`
@@ -1542,39 +1550,18 @@ func usageScopeSQL(scope string) string {
 }
 
 func usageScopeSQLWithEntries(scope string, entries []providerConfigEntry) string {
-	codexAccount := `((LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%codex%')
-AND LOWER(COALESCE(NULLIF(auth_type,''), '')) NOT IN ('apikey', 'api_key', 'key')
-AND LOWER(COALESCE(NULLIF(auth_id,''), '')) NOT LIKE 'codex:apikey:%'
-AND COALESCE(NULLIF(source,''), '') NOT LIKE 'sk-%'
-AND COALESCE(NULLIF(source,''), '') NOT LIKE 'Bearer sk-%')`
-	codexAPIKey := codexAPIKeyProviderScopeSQL(entries)
+	codexAccount := "(" + codexUsageSQL + " AND NOT " + codexAPIKeyUsageSQL(entries) + ")"
 	xaiAccount := `(LOWER(COALESCE(NULLIF(provider,''), '')) = 'xai' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%xai%')`
 	switch strings.ToLower(strings.TrimSpace(scope)) {
 	case "codex":
 		return codexAccount
 	case "other":
-		return "((NOT " + codexAccount + ") AND (NOT " + xaiAccount + ") AND (NOT (LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key')) OR " + codexAPIKey + "))"
+		return "(NOT " + codexAccount + " AND NOT " + xaiAccount + ")"
 	case "xai":
 		return xaiAccount
 	default:
 		return "1=1"
 	}
-}
-
-func codexAPIKeyProviderScopeSQL(entries []providerConfigEntry) string {
-	var parts []string
-	for _, entry := range entries {
-		if !strings.EqualFold(entry.Provider, "Codex") || strings.TrimSpace(entry.APIKey) == "" {
-			continue
-		}
-		key := strings.TrimSpace(entry.APIKey)
-		parts = append(parts, "source = "+sqlQuote(key))
-		parts = append(parts, "source = "+sqlQuote("Bearer "+key))
-	}
-	if len(parts) == 0 {
-		return "0=1"
-	}
-	return "(LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key') AND (" + strings.Join(parts, " OR ") + "))"
 }
 
 func throughputSQL() string {
@@ -1871,12 +1858,11 @@ func configuredAuthDir() string {
 	if dir := strings.TrimSpace(os.Getenv("CPA_AUTH_DIR")); dir != "" {
 		return resolveConfiguredAuthDir(dir)
 	}
-	configPath := configuredConfigPath()
-	raw, err := os.ReadFile(configPath)
-	if err != nil {
+	inventory := readProviderInventory()
+	if inventory.status == "missing" || inventory.status == "unreadable" || inventory.status == "invalid" {
 		return ""
 	}
-	dir := yamlScalar(string(raw), "auth-dir", "auth_dir")
+	dir := inventory.authDir
 	if dir == "" {
 		dir = "~/.cli-proxy-api"
 	}
@@ -1901,239 +1887,6 @@ func resolveConfiguredAuthDir(path string) string {
 	}
 	remainder = strings.ReplaceAll(remainder, "\\", "/")
 	return filepath.Clean(filepath.Join(home, filepath.FromSlash(remainder)))
-}
-
-func readConfiguredProviderNames() []string {
-	entries := readConfiguredProviderEntries()
-	out := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		out = append(out, entry.Name)
-	}
-	return out
-}
-
-type providerConfigEntryCacheState struct {
-	mu      sync.Mutex
-	path    string
-	modTime int64
-	size    int64
-	entries []providerConfigEntry
-}
-
-var configuredProviderEntriesCache providerConfigEntryCacheState
-
-func readConfiguredProviderEntries() []providerConfigEntry {
-	path := configuredConfigPath()
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil
-	}
-	modTime := info.ModTime().UnixNano()
-	size := info.Size()
-	configuredProviderEntriesCache.mu.Lock()
-	if configuredProviderEntriesCache.path == path && configuredProviderEntriesCache.modTime == modTime && configuredProviderEntriesCache.size == size {
-		entries := cloneProviderConfigEntries(configuredProviderEntriesCache.entries)
-		configuredProviderEntriesCache.mu.Unlock()
-		return entries
-	}
-	configuredProviderEntriesCache.mu.Unlock()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	entries := configuredProviderEntriesFromYAML(string(raw))
-	configuredProviderEntriesCache.mu.Lock()
-	configuredProviderEntriesCache.path = path
-	configuredProviderEntriesCache.modTime = modTime
-	configuredProviderEntriesCache.size = size
-	configuredProviderEntriesCache.entries = cloneProviderConfigEntries(entries)
-	configuredProviderEntriesCache.mu.Unlock()
-	return entries
-}
-
-func cloneProviderConfigEntries(entries []providerConfigEntry) []providerConfigEntry {
-	if len(entries) == 0 {
-		return nil
-	}
-	return append([]providerConfigEntry(nil), entries...)
-}
-
-func configuredProviderNamesFromYAML(raw string) []string {
-	entries := configuredProviderEntriesFromYAML(raw)
-	out := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		out = append(out, entry.Name)
-	}
-	return out
-}
-
-func configuredProviderEntriesFromYAML(raw string) []providerConfigEntry {
-	blocks := map[string]string{
-		"openai-compatibility": "OpenAI",
-		"openai-compatible":    "OpenAI",
-		"codex-api-key":        "Codex",
-		"claude-api-key":       "Claude",
-		"anthropic-api-key":    "Claude",
-		"gemini-api-key":       "Gemini",
-		"antigravity-api-key":  "Antigravity",
-		"antigravity-oauth":    "Antigravity",
-		"anthropic-oauth":      "Claude",
-	}
-	var out []providerConfigEntry
-	seen := map[string]bool{}
-	add := func(provider, name, apiKey string) {
-		name = strings.TrimSpace(strings.Trim(name, `"'`))
-		key := normalizeAccountAlias(name)
-		if name != "" && !seen[key] {
-			seen[key] = true
-			out = append(out, providerConfigEntry{Name: name, Provider: provider, APIKey: strings.TrimSpace(strings.Trim(apiKey, `"'`))})
-		}
-	}
-	var current *providerConfigBlock
-	blockIndent := -1
-	itemIndent := -1
-	itemName := ""
-	itemBaseURL := ""
-	itemAPIKey := ""
-	flushItem := func() {
-		if current == nil || itemIndent < 0 {
-			return
-		}
-		add(current.DisplayName, providerConfigEntryName(current.DisplayName, itemName, itemBaseURL), itemAPIKey)
-		itemIndent = -1
-		itemName = ""
-		itemBaseURL = ""
-		itemAPIKey = ""
-	}
-	for _, line := range strings.Split(raw, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-		if indent == 0 && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "-") {
-			flushItem()
-			current = nil
-			itemIndent = -1
-			blockIndent = indent
-			key, value := yamlKeyValue(trimmed)
-			if display, ok := blocks[key]; ok {
-				current = &providerConfigBlock{Key: key, DisplayName: display}
-				if yamlScalarHasValue(value) {
-					add(display, display, "")
-				}
-			}
-			continue
-		}
-		if current == nil {
-			continue
-		}
-		if indent <= blockIndent && !strings.HasPrefix(trimmed, "-") {
-			flushItem()
-			current = nil
-			continue
-		}
-		if strings.HasPrefix(trimmed, "- ") && indent > blockIndent && (itemIndent < 0 || indent <= itemIndent) {
-			flushItem()
-			itemIndent = indent
-			inline := strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
-			key, value := yamlKeyValue(inline)
-			switch key {
-			case "name":
-				itemName = value
-			case "base-url", "base_url":
-				itemBaseURL = value
-			case "api-key", "api_key":
-				itemAPIKey = value
-			}
-			continue
-		}
-		if itemIndent >= 0 && indent == itemIndent+2 {
-			key, value := yamlKeyValue(trimmed)
-			switch key {
-			case "name":
-				itemName = value
-			case "base-url", "base_url":
-				itemBaseURL = value
-			case "api-key", "api_key":
-				itemAPIKey = value
-			}
-		}
-		if itemIndent >= 0 && indent > itemIndent && itemAPIKey == "" {
-			key, value := yamlKeyValue(strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")))
-			if key == "api-key" || key == "api_key" {
-				itemAPIKey = value
-			}
-		}
-	}
-	flushItem()
-	return out
-}
-
-type providerConfigBlock struct {
-	Key         string
-	DisplayName string
-}
-
-type providerConfigEntry struct {
-	Name     string
-	Provider string
-	APIKey   string
-}
-
-func yamlKeyValue(line string) (string, string) {
-	key, value, ok := strings.Cut(line, ":")
-	if !ok {
-		return "", ""
-	}
-	value = strings.TrimSpace(value)
-	if i := strings.Index(value, " #"); i >= 0 {
-		value = strings.TrimSpace(value[:i])
-	}
-	return strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(strings.Trim(value, `"'`))
-}
-
-func yamlScalarHasValue(value string) bool {
-	value = strings.TrimSpace(strings.Trim(value, `"'`))
-	if value == "" {
-		return false
-	}
-	switch strings.ToLower(value) {
-	case "[]", "{}", "null", "~":
-		return false
-	default:
-		return true
-	}
-}
-
-func providerConfigEntryName(provider, name, baseURL string) string {
-	name = strings.TrimSpace(strings.Trim(name, `"'`))
-	if name != "" {
-		return name
-	}
-	host := hostFromURL(baseURL)
-	if host != "" {
-		return strings.TrimSpace(provider + " · " + host)
-	}
-	return strings.TrimSpace(provider)
-}
-
-func hostFromURL(value string) string {
-	value = strings.TrimSpace(strings.Trim(value, `"'`))
-	if value == "" {
-		return ""
-	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Host == "" {
-		if parsed, err = url.Parse("https://" + strings.TrimPrefix(value, "//")); err != nil || parsed.Host == "" {
-			return ""
-		}
-	}
-	host := parsed.Hostname()
-	if host == "" {
-		host = parsed.Host
-	}
-	return host
 }
 
 func authFileStateForRecord(rec usageRecord) (string, int64) {
@@ -2213,31 +1966,6 @@ func configuredAuthDirectoryReadable() bool {
 	}
 	_, err := os.ReadDir(authDir)
 	return err == nil
-}
-
-func yamlScalar(raw string, keys ...string) string {
-	lines := strings.Split(raw, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		for _, key := range keys {
-			prefix := key + ":"
-			if !strings.HasPrefix(line, prefix) {
-				continue
-			}
-			value := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-			if i := strings.Index(value, " #"); i >= 0 {
-				value = strings.TrimSpace(value[:i])
-			}
-			value = strings.Trim(value, `"'`)
-			if value != "" {
-				return value
-			}
-		}
-	}
-	return ""
 }
 
 func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccount) []accountRow {
@@ -3832,7 +3560,7 @@ LIMIT ?`
 		); err != nil {
 			return nil, err
 		}
-		r.KeyID = safeExportLabel(r.RawKeyID)
+		r.KeyID = maskExportCredential(r.RawKeyID)
 		r.ProviderNames = normalizeKeyProviderNames(providers)
 		r.Provider = firstKeyProviderName(r.ProviderNames)
 		r.QuotaUsedTokens = r.TotalTokens
@@ -3902,22 +3630,22 @@ func cpaProviderSQLWithEntries(entries []providerConfigEntry) string {
 		if provider == "" || apiKey == "" || name == "" {
 			continue
 		}
-		if !providerSupportsAPIKeyEndpointName(provider) {
+		if !providerSupportsAPIKeyEndpointName(provider) || provider == "Codex" {
 			continue
 		}
 		apiKeyCases.WriteString("WHEN ")
 		apiKeyCases.WriteString(providerSQLPredicate(provider))
-		apiKeyCases.WriteString(" AND lower(auth_type) IN ('apikey', 'api_key', 'key') AND source = ")
-		apiKeyCases.WriteString(sqlQuote(apiKey))
+		apiKeyCases.WriteString(" AND " + apiKeyAuthTypeSQL + " AND " + usageKeyMatchSQL("source", apiKey))
 		apiKeyCases.WriteString(" THEN ")
 		apiKeyCases.WriteString(sqlQuote(name))
 		apiKeyCases.WriteString("\n")
 	}
 	return `CASE
+WHEN ` + codexAPIKeyUsageSQL(entries) + ` THEN ` + codexProviderNameSQL(entries) + `
 WHEN auth_id LIKE 'openai-compatibility:%:%' THEN substr(` + tail + `, 1, instr(` + tail + `, ':') - 1)
 WHEN provider LIKE 'openai-compatible-%' THEN substr(provider, length('openai-compatible-') + 1)
 WHEN provider LIKE 'openai-compatibility-%' THEN substr(provider, length('openai-compatibility-') + 1)
-WHEN lower(provider) IN ('openai-compatible', 'openai-compatibility') AND source <> '' AND source NOT LIKE 'sk-%' AND source NOT LIKE 'ark-%' AND source NOT LIKE 'Bearer %' THEN source
+WHEN lower(provider) IN ('openai-compatible', 'openai-compatibility') AND NOT ` + apiKeyAuthTypeSQL + ` AND source <> '' AND source NOT LIKE 'sk-%' AND source NOT LIKE 'ark-%' AND source NOT LIKE 'Bearer %' THEN source
 ` + apiKeyCases.String() + `
 WHEN lower(provider) IN ('anthropic', 'claude') THEN 'Claude'
 WHEN lower(provider) LIKE 'gemini%' THEN 'Gemini'

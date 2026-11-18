@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.43"
+	pluginVersion    = "0.1.44"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -326,13 +326,15 @@ type usageFailure struct {
 }
 
 type usageDetail struct {
-	InputTokens         int64 `json:"InputTokens"`
-	OutputTokens        int64 `json:"OutputTokens"`
-	ReasoningTokens     int64 `json:"ReasoningTokens"`
-	CachedTokens        int64 `json:"CachedTokens"`
-	CacheReadTokens     int64 `json:"CacheReadTokens"`
-	CacheCreationTokens int64 `json:"CacheCreationTokens"`
-	TotalTokens         int64 `json:"TotalTokens"`
+	InputTokens           int64 `json:"InputTokens"`
+	OutputTokens          int64 `json:"OutputTokens"`
+	ReasoningTokens       int64 `json:"ReasoningTokens"`
+	CachedTokens          int64 `json:"CachedTokens"`
+	CacheReadTokens       int64 `json:"CacheReadTokens"`
+	CacheCreationTokens   int64 `json:"CacheCreationTokens"`
+	CacheCreation5mTokens int64 `json:"CacheCreation5mTokens"`
+	CacheCreation1hTokens int64 `json:"CacheCreation1hTokens"`
+	TotalTokens           int64 `json:"TotalTokens"`
 }
 
 const forbiddenInvalidAuthThreshold = 3
@@ -2584,6 +2586,9 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if rec.RequestedAt.IsZero() {
 		rec.RequestedAt = time.Now()
 	}
+	if rec.Detail.CacheCreationTokens <= 0 {
+		rec.Detail.CacheCreationTokens = maxInt64(rec.Detail.CacheCreation5mTokens, 0) + maxInt64(rec.Detail.CacheCreation1hTokens, 0)
+	}
 	total := fallbackUsageTotal(rec)
 	primaryPct := headerFloat(rec.ResponseHeaders, "x-codex-primary-used-percent")
 	secondaryPct := headerFloat(rec.ResponseHeaders, "x-codex-secondary-used-percent")
@@ -2594,6 +2599,10 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	status := rec.Failure.StatusCode
 	if rec.Failed && status == 0 {
 		status = 599
+	}
+	if isCodexAPIKeyUsageRecord(rec) {
+		primaryPct, primaryReset = providerQuotaHeaders(rec, status, "primary")
+		secondaryPct, secondaryReset = providerQuotaHeaders(rec, status, "secondary")
 	}
 	latencyMs := durationToMilliseconds(rec.Latency)
 	ttftMs := durationToMilliseconds(rec.TTFT)

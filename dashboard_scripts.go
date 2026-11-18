@@ -1879,11 +1879,19 @@ function providerPageHTML(name){
       '</div></div></section>'+
       '<section class="section"><h2><span>Token 结构</span><span class="mini">'+esc(name)+'</span></h2><div class="section-body"><div class="mix" id="'+id+'-mix"></div></div></section>'+
     '</div>'+
+    '<section class="section" style="margin-top:8px" id="'+id+'-quota" hidden><h2><span>Codex 上游额度</span><span class="mini">来自上游响应，不是本地 Token 统计</span></h2><div class="section-body"><div class="cards" id="'+id+'-quota-windows"></div></div></section>'+
     '<section class="section" style="margin-top:8px"><h2><span>模型排行</span><span class="mini">'+esc(name)+'</span></h2><div class="scroll model-table-wrap"><table><thead><tr><th>模型</th><th>别名</th><th>Provider</th><th>请求</th><th>总 Token</th><th>费用</th><th>性能</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存率</th></tr></thead><tbody id="'+id+'-models"></tbody></table></div></section>'+
     '<section class="section" style="margin-top:8px"><h2><span>最近请求</span><span class="mini">'+esc(name)+' 最近 30 条</span></h2><div class="scroll recent-table-wrap"><table><thead><tr><th>模型</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th></tr></thead><tbody id="'+id+'-recent"></tbody></table></div></section>'+
   '</section>';
 }
 const i18nEn={
+  'Codex 上游额度':'Upstream Codex quota',
+  '来自上游响应，不是本地 Token 统计':'Reported by the upstream, separate from local token counts',
+  '上游未提供':'Not reported by the upstream',
+  '额度快照已过期':'Quota observation expired',
+  '观测时间':'Observed at',
+  '主额度窗口':'Primary quota window',
+  '次额度窗口':'Secondary quota window',
   '一次性启动额度窗口':'Activate quota windows once',
   '一次性启动 Codex 额度窗口':'Activate Codex quota windows once',
   '关闭一次性额度启动':'Close one-shot quota activation',
@@ -2729,6 +2737,27 @@ function renderProviderPage(data){
   renderRecent('provider-recent',(data.provider_recent||[]).slice(0,30),'provider');
 }
 function providerEquals(row,name){return providerLabel(row.provider)===name}
+function providerQuotaWindowPresentation(window,now){
+  if(!window||window.used_percent==null)return {value:tr('上游未提供'),detail:'',expired:false};
+  const reset=Number(window.reset_at||0),observed=Number(window.observed_at||0);
+  const expired=reset>0&&reset<=now;
+  const detail=[observed>0?tr('观测时间')+' '+new Date(observed*1000).toLocaleString():'',tr(resetText(reset))];
+  if(expired)detail.unshift(tr('额度快照已过期'));
+  return {value:pct(window.used_percent),detail:detail.filter(Boolean).join(' · '),expired};
+}
+function renderProviderQuota(data,name,id){
+  const quota=(data.provider_quotas||[]).find(row=>providerEquals(row,name));
+  const panel=document.getElementById(id+'-quota');
+  panel.hidden=!quota;
+  const windows=document.getElementById(id+'-quota-windows');
+  windows.innerHTML='';
+  if(!quota)return;
+  const now=Date.now()/1000;
+  windows.innerHTML=[['primary','主额度窗口'],['secondary','次额度窗口']].map(([slot,label])=>{
+    const entry=providerQuotaWindowPresentation(quota[slot],now);
+    return '<div class="metric" style="--accent:var(--cyan)"><div class="label">'+esc(tr(label))+'</div><div class="'+(entry.expired?'sub':'value')+'">'+esc(entry.value)+'</div><div class="sub">'+esc(entry.detail)+'</div></div>';
+  }).join('');
+}
 function renderSingleProviderPage(data,name){
   const id=providerID(name);
   const p=(data.providers||[]).find(r=>providerEquals(r,name))||{};
@@ -2757,6 +2786,7 @@ function renderSingleProviderPage(data,name){
   set('-ttft-sub','慢首包 '+fmt(p.slow_ttft_requests||0));
   set('-throughput',avgThroughput(p.output_tokens_per_second));
   renderTokenMix(id+'-mix',p);
+  renderProviderQuota(data,name,id);
   renderModels(id+'-models',models);
   renderRecent(id+'-recent',recent,'provider');
 }

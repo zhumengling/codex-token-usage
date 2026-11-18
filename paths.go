@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -83,7 +84,24 @@ func legacyModelPriceFilePath() string {
 }
 
 func configuredConfigPath() string {
-	return configuredConfigPathForArgs(os.Args[1:])
+	return configuredConfigPathForArgs(processConfigArgs(os.Args))
+}
+
+func processConfigArgs(args []string) []string {
+	if len(args) > 0 && commandLineConfigPath(args[1:]) != "" {
+		return args[1:]
+	}
+	if runtime.GOOS == "linux" {
+		if raw, err := os.ReadFile("/proc/self/cmdline"); err == nil {
+			if processArgs := strings.Split(string(raw), "\x00"); len(processArgs) > 1 && commandLineConfigPath(processArgs[1:]) != "" {
+				return processArgs[1:]
+			}
+		}
+	}
+	if len(args) > 0 {
+		return args[1:]
+	}
+	return nil
 }
 
 func configuredConfigPathForArgs(args []string) string {

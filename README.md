@@ -2,12 +2,14 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.39`
+Current version: `0.1.44`
 
 ## Features
 
 - Codex account pool dashboard with pagination, saved sorting, quota bars, 7d/month quota estimates, cost estimates, and light/dark compatible UI.
 - AI provider pages grouped by CPA endpoint name, separated from Codex OAuth account-pool pricing and quota calculations.
+- CPA v8 grouped `api-keys.codex` and legacy `codex-api-key` support. Codex API-key traffic is attributed per configured credential; unattributed traffic remains in provider totals, not the OAuth pool.
+- Codex provider pages and provider exports expose the last explicitly reported primary and secondary quota percentages, observation times and reset times. Missing quota is not zero usage; this feature sends no quota probes. Samples use Unix seconds under `provider_quotas` in the summary API.
 - Codex 429 auto-ban support with `reset_at` based recovery.
 - 401 invalid-auth protection until the auth JSON file is replaced or removed.
 - Suspicious external quota consumption detection for shared or resold accounts.
@@ -190,11 +192,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.39_linux_amd64.zip
-codex-token-usage_0.1.39_linux_arm64.zip
-codex-token-usage_0.1.39_windows_amd64.zip
-codex-token-usage_0.1.39_darwin_amd64.zip
-codex-token-usage_0.1.39_darwin_arm64.zip
+codex-token-usage_0.1.44_linux_amd64.zip
+codex-token-usage_0.1.44_linux_arm64.zip
+codex-token-usage_0.1.44_windows_amd64.zip
+codex-token-usage_0.1.44_darwin_amd64.zip
+codex-token-usage_0.1.44_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -212,6 +214,8 @@ checksums.txt
 - `401`: the auth JSON is invalid and will not be used until replaced or removed.
 - `429`: the account is temporarily auto-banned until the observed reset time.
 - Provider not visible: confirm the endpoint still exists in CPA config and refresh the dashboard.
+- If the summary diagnostics report `providers.config_status: missing`, `unreadable` or `invalid`, set `CPA_CONFIG_PATH` in the CPA service to the absolute path of its readable YAML config. The value should point to the same file as CPA's `-config` argument. `partial` means a provider block could not be interpreted.
+- An HTTP 402 is a failed request, not an observed quota percentage. Verify the error through the upstream provider's own dashboard or logs. Restarting or changing the plugin does not restore upstream service or balance.
 - Price missing: check `model_prices.cache` status in the summary JSON and the model price update error if present.
 
 ## License

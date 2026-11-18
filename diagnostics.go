@@ -94,6 +94,7 @@ func (t *schedulerDiagnosticsTracker) status(activeBans int) schedulerDiagnostic
 }
 
 type providerDiagnostics struct {
+	ConfigStatus            string   `json:"config_status"`
 	Configured              int      `json:"configured"`
 	Observed                int      `json:"observed"`
 	Matched                 int      `json:"matched"`
@@ -374,12 +375,16 @@ func count429Autobans(autobans []autobanRow) int {
 }
 
 func buildProviderDiagnostics(providers []providerRow) providerDiagnostics {
-	configured := readConfiguredProviderEntries()
-	out := providerDiagnostics{Configured: len(configured), Observed: len(providers)}
+	inventory := readProviderInventory()
+	configured := inventory.entries
+	out := providerDiagnostics{ConfigStatus: inventory.status, Configured: len(configured)}
 	observed := map[string]bool{}
 	for _, provider := range providers {
-		observed[normalizeAccountAlias(providerLabelForBackend(provider.Provider))] = true
+		if provider.Requests > 0 {
+			observed[normalizeAccountAlias(providerLabelForBackend(provider.Provider))] = true
+		}
 	}
+	out.Observed = len(observed)
 	typeSet := map[string]bool{}
 	for _, entry := range configured {
 		typeSet[entry.Provider] = true
@@ -663,7 +668,7 @@ func exportHeaders(contentType, name string) map[string][]string {
 func exportRecords(data map[string]any, kind string) ([]map[string]string, []string) {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "providers":
-		return providerExportRows(anySlice[providerRow](data["providers"])), []string{"provider", "requests", "success_rate", "total_tokens", "cost_usd", "avg_latency_ms", "rate_limited", "last_seen"}
+		return providerExportRows(anySlice[providerRow](data["providers"]), anySlice[providerQuotaRow](data["provider_quotas"])), []string{"provider", "requests", "success_rate", "total_tokens", "cost_usd", "avg_latency_ms", "rate_limited", "last_seen", "primary_used_percent", "primary_observed_at", "primary_reset_at", "secondary_used_percent", "secondary_observed_at", "secondary_reset_at"}
 	case "models":
 		rows := append(anySlice[modelRow](data["models"]), anySlice[modelRow](data["provider_models"])...)
 		return modelExportRows(rows), []string{"provider", "model", "alias", "requests", "total_tokens", "cost_usd", "avg_latency_ms", "cache_rate"}
@@ -737,7 +742,7 @@ func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, 
 SELECT requested_at,
 CASE WHEN ` + usageScopeSQL("codex") + ` THEN 'codex' WHEN ` + usageScopeSQL("xai") + ` THEN 'xai' ELSE 'providers' END AS scope_key,
 ` + providerExpr + ` AS provider_key,
-api_key, auth_id, auth_index, source, model, alias, reasoning_effort, service_tier,
+api_key, ` + publicUsageIdentitySQL("auth_id") + `, ` + publicUsageIdentitySQL("auth_index") + `, ` + publicUsageIdentitySQL("source") + `, model, alias, reasoning_effort, service_tier,
 latency_ms, ttft_ms, status_code, failed, input_tokens, output_tokens, reasoning_tokens,
 cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens
 FROM usage_events
@@ -802,7 +807,7 @@ LIMIT ?`
 			}
 			errorSummary = "http " + strconv.Itoa(status)
 		}
-		account := safeExportLabel(firstNonEmptyString(apiKey, authIndex, authID, source))
+		account := firstNonEmptyString(maskExportCredential(apiKey), safeExportLabel(firstNonEmptyString(authIndex, authID, source)))
 		if maskedAccountFilter && account != accountFilter {
 			continue
 		}
@@ -811,7 +816,7 @@ LIMIT ?`
 			"scope":                    scope,
 			"provider":                 provider,
 			"account":                  account,
-			"api_key":                  safeExportLabel(apiKey),
+			"api_key":                  maskExportCredential(apiKey),
 			"auth_id":                  safeExportLabel(authID),
 			"auth_index":               safeExportLabel(authIndex),
 			"source":                   safeExportLabel(source),
@@ -872,10 +877,14 @@ func accountExportRows(rows []accountRow) []map[string]string {
 	return out
 }
 
-func providerExportRows(rows []providerRow) []map[string]string {
+func providerExportRows(rows []providerRow, quotas []providerQuotaRow) []map[string]string {
+	quotaByProvider := make(map[string]providerQuotaRow, len(quotas))
+	for _, quota := range quotas {
+		quotaByProvider[quota.Provider] = quota
+	}
 	out := make([]map[string]string, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, map[string]string{
+		export := map[string]string{
 			"provider":       r.Provider,
 			"requests":       strconv.FormatInt(r.Requests, 10),
 			"success_rate":   fmt.Sprintf("%.2f", successRateBackend(r.Requests, r.Failed)),
@@ -884,9 +893,23 @@ func providerExportRows(rows []providerRow) []map[string]string {
 			"avg_latency_ms": fmt.Sprintf("%.0f", r.AverageLatencyMs),
 			"rate_limited":   strconv.FormatInt(r.RateLimited, 10),
 			"last_seen":      r.LastSeen,
-		})
+		}
+		if quota, ok := quotaByProvider[r.Provider]; ok {
+			addProviderQuotaExport(export, "primary", quota.Primary)
+			addProviderQuotaExport(export, "secondary", quota.Secondary)
+		}
+		out = append(out, export)
 	}
 	return out
+}
+
+func addProviderQuotaExport(row map[string]string, slot string, window *providerQuotaWindow) {
+	if window == nil {
+		return
+	}
+	row[slot+"_used_percent"] = strconv.FormatFloat(window.UsedPercent, 'f', -1, 64)
+	row[slot+"_observed_at"] = unixTime(window.ObservedAt)
+	row[slot+"_reset_at"] = unixTime(window.ResetAt)
 }
 
 func modelExportRows(rows []modelRow) []map[string]string {
@@ -951,13 +974,31 @@ func safeExportLabel(value string) string {
 	value = strings.TrimSpace(value)
 	lower := strings.ToLower(value)
 	if strings.HasPrefix(lower, "sk-") || strings.HasPrefix(lower, "bearer sk-") {
-		plain := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
+		plain := value
+		if strings.HasPrefix(lower, "bearer ") {
+			plain = strings.TrimSpace(value[len("bearer "):])
+		}
 		if len(plain) <= 7 {
 			return "sk-****"
 		}
 		return plain[:3] + "****" + plain[len(plain)-4:]
 	}
 	return value
+}
+
+func maskExportCredential(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if masked := safeExportLabel(value); masked != value {
+		return masked
+	}
+	characters := []rune(value)
+	if len(characters) < 9 {
+		return "****"
+	}
+	return "****" + string(characters[len(characters)-4:])
 }
 
 func successRateBackend(requests, failed int64) float64 {

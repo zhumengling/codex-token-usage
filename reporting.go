@@ -51,7 +51,7 @@ LIMIT 240`, format, since)
 
 func queryRecent(ctx context.Context, db *sql.DB, since int64, limit int, scope string, prices map[string]modelPrice) ([]recentRow, error) {
 	query := `
-SELECT requested_at, ` + cpaProviderSQL() + ` AS provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
+SELECT requested_at, ` + cpaProviderSQL() + ` AS provider_key, ` + publicUsageIdentitySQL("auth_index") + `, ` + publicUsageIdentitySQL("source") + `, model, alias, reasoning_effort, service_tier,
 latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
 cached_tokens, cache_read_tokens, cache_creation_tokens
 FROM usage_events
@@ -88,7 +88,7 @@ FROM (
   SELECT provider_events.*,
   row_number() OVER (PARTITION BY provider_key ORDER BY requested_at DESC, id DESC) AS provider_rank
   FROM (
-    SELECT id, requested_at, ` + providerExpr + ` AS provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
+    SELECT id, requested_at, ` + providerExpr + ` AS provider_key, ` + publicUsageIdentitySQL("auth_index") + `, ` + publicUsageIdentitySQL("source") + `, model, alias, reasoning_effort, service_tier,
     latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
     cached_tokens, cache_read_tokens, cache_creation_tokens
     FROM usage_events
