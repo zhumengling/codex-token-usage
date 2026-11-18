@@ -50,15 +50,19 @@ LIMIT 240`, format, since)
 }
 
 func queryRecent(ctx context.Context, db *sql.DB, since int64, limit int, scope string, prices map[string]modelPrice) ([]recentRow, error) {
+	return queryRecentPage(ctx, db, cpaProviderSQL(), "requested_at >= ? AND "+usageScopeSQL(scope), []any{since}, limit, 0, prices)
+}
+
+func queryRecentPage(ctx context.Context, db *sql.DB, providerExpr, where string, args []any, limit, offset int, prices map[string]modelPrice) ([]recentRow, error) {
 	query := `
-SELECT requested_at, ` + cpaProviderSQL() + ` AS provider_key, ` + publicUsageIdentitySQL("auth_index") + `, ` + publicUsageIdentitySQL("source") + `, model, alias, reasoning_effort, service_tier,
+SELECT requested_at, ` + providerExpr + ` AS provider_key, provider, ` + publicUsageIdentitySQL("auth_index") + `, ` + publicUsageIdentitySQL("source") + `, model, alias, reasoning_effort, service_tier,
 latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
 cached_tokens, cache_read_tokens, cache_creation_tokens
 FROM usage_events
-WHERE requested_at >= ? AND ` + usageScopeSQL(scope) + `
+WHERE ` + where + `
 ORDER BY requested_at DESC, id DESC
-LIMIT ?`
-	rows, err := db.QueryContext(ctx, query, since, limit)
+LIMIT ? OFFSET ?`
+	rows, err := db.QueryContext(ctx, query, append(append([]any(nil), args...), limit, offset)...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,14 +85,14 @@ func queryProviderRecent(ctx context.Context, db *sql.DB, since int64, perProvid
 	}
 	providerExpr := cpaProviderSQL()
 	query := `
-SELECT requested_at, provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
+SELECT requested_at, provider_key, provider, auth_index, source, model, alias, reasoning_effort, service_tier,
 latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
 cached_tokens, cache_read_tokens, cache_creation_tokens
 FROM (
   SELECT provider_events.*,
   row_number() OVER (PARTITION BY provider_key ORDER BY requested_at DESC, id DESC) AS provider_rank
   FROM (
-    SELECT id, requested_at, ` + providerExpr + ` AS provider_key, ` + publicUsageIdentitySQL("auth_index") + `, ` + publicUsageIdentitySQL("source") + `, model, alias, reasoning_effort, service_tier,
+    SELECT id, requested_at, ` + providerExpr + ` AS provider_key, provider, ` + publicUsageIdentitySQL("auth_index") + `, ` + publicUsageIdentitySQL("source") + `, model, alias, reasoning_effort, service_tier,
     latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
     cached_tokens, cache_read_tokens, cache_creation_tokens
     FROM usage_events
@@ -112,8 +116,9 @@ func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, 
 		var r recentRow
 		var ts int64
 		var failed int
+		var rawProvider string
 		if err := rows.Scan(
-			&ts, &r.Provider, &r.AuthIndex, &r.Source, &r.Model, &r.Alias, &r.ReasoningEffort, &r.ServiceTier,
+			&ts, &r.Provider, &rawProvider, &r.AuthIndex, &r.Source, &r.Model, &r.Alias, &r.ReasoningEffort, &r.ServiceTier,
 			&r.LatencyMs, &r.TTFTMs, &r.StatusCode, &failed, &r.TotalTokens, &r.InputTokens, &r.OutputTokens,
 			&r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens,
 		); err != nil {
@@ -125,7 +130,7 @@ func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, 
 		costRow := costTokenRow{
 			Model:               r.Model,
 			Alias:               r.Alias,
-			Provider:            r.Provider,
+			Provider:            rawProvider,
 			ServiceTier:         r.ServiceTier,
 			InputTokens:         r.InputTokens,
 			OutputTokens:        r.OutputTokens,

@@ -9,7 +9,8 @@ Current version: `0.1.44`
 - Codex account pool dashboard with pagination, saved sorting, quota bars, 7d/month quota estimates, cost estimates, and light/dark compatible UI.
 - AI provider pages grouped by CPA endpoint name, separated from Codex OAuth account-pool pricing and quota calculations.
 - CPA v8 grouped `api-keys.codex` and legacy `codex-api-key` support. Codex API-key traffic is attributed per configured credential; unattributed traffic remains in provider totals, not the OAuth pool.
-- Codex provider pages and provider exports expose the last explicitly reported primary and secondary quota percentages, observation times and reset times. Missing quota is not zero usage; this feature sends no quota probes. Samples use Unix seconds under `provider_quotas` in the summary API.
+- Codex provider pages and exports show the last explicitly reported primary and secondary quota percentages, observation times and reset times. The summary API also returns `expires_at` (Unix seconds): the upstream reset time when available, otherwise observation time plus 24 hours. An expired observation remains visible as historical data. Missing quota is not zero; this feature sends no quota probes.
+- Per-provider operations pages show status counts (including 401, 402, 403, 429 and 5xx), usage and estimated cost trends, paginated models and requests, and a shared monthly USD budget.
 - Codex 429 auto-ban support with `reset_at` based recovery.
 - 401 invalid-auth protection until the auth JSON file is replaced or removed.
 - Suspicious external quota consumption detection for shared or resold accounts.
@@ -70,6 +71,9 @@ plugins:
       额度触发记录保留天数: 30
       请求明细保留天数: 30
 
+      provider_budgets_usd:
+        "Codex · My Endpoint": 100.00
+
       开启账号保护调度（可能会影响缓存）: false
       Free 并发上限: 2
       Plus 并发上限: 5
@@ -118,6 +122,12 @@ account_protection_reservation_ttl_seconds: 900
 ```
 
 Quota trigger defaults to off and is not recommended for large account pools. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. Probe results are account-health inputs: 401 and 402 update invalid-auth state, 403 follows the same repeated-failure threshold as normal traffic, 429 creates an auto-ban, and a successful probe clears recovered state. Accounts already restricted by 401, 402, 403, or 429 remain eligible for health rechecks after the configured cooldown, including when an older quota snapshot is still full. The legacy Chinese key `开启定时额度触发` and the legacy `quota` mode remain accepted for compatibility.
+
+## Provider Operations and Budgets
+
+- `GET /v0/management/plugins/codex-token-usage/provider-report?provider=<exact-provider-id>&window=24h&model_page=1&recent_page=1` requires CPA Management authentication. Use the exact `providers[].provider` value from the summary API. The response includes `totals`, `statuses`, hourly or daily `trend`, `models` (20 per page), `recent` (30 per page), page flags, and `budget`.
+- Set a budget from the provider page or in CPA's `provider_budgets_usd` mapping; leave the amount blank in the dashboard to remove it. It is saved on the server and shared by all management clients. CPA replaces the budget mapping as a whole when patching it; avoid editing budgets simultaneously from different sessions.
+- Budgets use the CPA server's local calendar month regardless of the selected report window. The dashboard warns at 80% and marks the budget reached at 100%. Unpriced tokens are reported separately. Cost uses current model prices and retained usage; configure at least 31 days of usage retention to cover a full calendar month. Estimates are not upstream charges or balances. Budgets do not send requests or alerts and do not block traffic.
 
 ## One-shot quota-window activation
 
@@ -180,6 +190,8 @@ CPA_MODEL_PRICE_FILE=/path/to/model_prices.json
 - Exported account labels that look like API keys are masked as `sk-****abcd`.
 - Local alert data is generated inside summary/export responses only; this version does not send webhooks.
 - Auth JSON files are read only for account identity, provider classification, quota trigger access, and replacement detection. Tokens are used in memory for trigger requests and are not written to summary/export data.
+- For compatibility, the local usage database still retains raw client API keys for per-key statistics. Restrict direct access and backups accordingly. On Unix, new plugin data directories use `0700` and SQLite database files, sidecars, and new SQLite repair backups use `0600`. Existing directory permissions and Windows ACLs remain administrator-managed.
+- CSV text cells that could be interpreted as spreadsheet formulas are prefixed with an apostrophe. `diagnostics.database.ingestion` exposes process-local counters for usage write failures and separate post-insert state update failures.
 
 ## Build
 
@@ -192,11 +204,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.44_linux_amd64.zip
-codex-token-usage_0.1.44_linux_arm64.zip
-codex-token-usage_0.1.44_windows_amd64.zip
-codex-token-usage_0.1.44_darwin_amd64.zip
-codex-token-usage_0.1.44_darwin_arm64.zip
+codex-token-usage_0.1.45_linux_amd64.zip
+codex-token-usage_0.1.45_linux_arm64.zip
+codex-token-usage_0.1.45_windows_amd64.zip
+codex-token-usage_0.1.45_darwin_amd64.zip
+codex-token-usage_0.1.45_darwin_arm64.zip
 checksums.txt
 ```
 

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,7 +137,9 @@ plugins:
 	}()
 	base := "http://127.0.0.1:" + strconv.Itoa(port)
 	client := &http.Client{Timeout: 5 * time.Second}
-	request := func(method, path, key, body string) ([]byte, int, error) {
+	observer := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}}
+	t.Cleanup(observer.CloseIdleConnections)
+	requestFrom := func(client *http.Client, method, path, key, body string) ([]byte, int, error) {
 		req, err := http.NewRequestWithContext(context.Background(), method, base+path, strings.NewReader(body))
 		if err != nil {
 			return nil, 0, err
@@ -155,7 +158,12 @@ plugins:
 		raw, err := io.ReadAll(response.Body)
 		return raw, response.StatusCode, err
 	}
+	request := func(method, path, key, body string) ([]byte, int, error) {
+		return requestFrom(client, method, path, key, body)
+	}
 	const summaryPath = "/v0/management/plugins/codex-token-usage/summary?window=24h&limit=50"
+	const reportPath = "/v0/management/plugins/codex-token-usage/provider-report?window=24h&provider="
+	const configEndpoint = "/v0/management/plugins/codex-token-usage/config"
 	var summary struct {
 		Version   string             `json:"version"`
 		Providers []providerRow      `json:"providers"`
@@ -190,6 +198,9 @@ plugins:
 	})
 	if _, code, err := request(http.MethodGet, summaryPath, "", ""); err != nil || code != http.StatusUnauthorized {
 		t.Fatalf("management authorization: status=%d, err=%v", code, err)
+	}
+	if _, code, err := request(http.MethodGet, reportPath+url.QueryEscape("Codex · Fixture A"), "", ""); err != nil || code != http.StatusUnauthorized {
+		t.Fatalf("provider report authorization: status=%d, err=%v", code, err)
 	}
 	if body, code, err := request(http.MethodGet, "/v0/resource/plugins/codex-token-usage/dashboard", managementSecret, ""); err != nil || code != http.StatusOK || !strings.Contains(string(body), "provider_quotas") {
 		t.Fatalf("dashboard resource: status=%d, err=%v", code, err)
@@ -235,5 +246,32 @@ plugins:
 	})
 	if snapshot := summary.Quotas[0].Primary; snapshot == nil || snapshot.UsedPercent != 0 || summary.Quotas[1].Primary != nil {
 		t.Fatal("upstream failures without quota headers changed the quota observations")
+	}
+	for _, fixture := range []struct{ provider, status string }{{first.Provider, "429"}, {second.Provider, "402"}} {
+		raw, code, err := request(http.MethodGet, reportPath+url.QueryEscape(fixture.provider), managementSecret, "")
+		var report providerReport
+		if err != nil || code != http.StatusOK || json.Unmarshal(raw, &report) != nil || report.Provider != fixture.provider ||
+			report.Totals.Requests != 2 || report.Totals.TotalTokens != 13 || report.Statuses[fixture.status] != 1 || report.Statuses["ok"] != 1 || len(report.Recent) != 2 {
+			t.Fatalf("provider report for %s: status=%d, err=%v, body=%s", fixture.provider, code, err, raw)
+		}
+	}
+	patch := fmt.Sprintf(`{"provider_budgets_usd":{%q:12.5,%q:7}}`, first.Provider, second.Provider)
+	if raw, code, err := request(http.MethodPatch, configEndpoint, managementSecret, patch); err != nil || code != http.StatusOK {
+		t.Fatalf("budget config update: status=%d, err=%v, body=%s", code, err, raw)
+	}
+	waitFor("live shared budget reload", func() bool {
+		for _, reader := range []*http.Client{client, observer} {
+			raw, code, err := requestFrom(reader, http.MethodGet, reportPath+url.QueryEscape(first.Provider), managementSecret, "")
+			var report providerReport
+			if err != nil || code != http.StatusOK || json.Unmarshal(raw, &report) != nil || report.Budget.LimitUSD != 12.5 {
+				return false
+			}
+		}
+		return true
+	})
+	var saved map[string]any
+	raw, code, err := requestFrom(observer, http.MethodGet, configEndpoint, managementSecret, "")
+	if err != nil || code != http.StatusOK || json.Unmarshal(raw, &saved) != nil || saved["summary_precompute_enabled"] != false || saved["model_price_auto_update_enabled"] != false {
+		t.Fatalf("budget update changed other settings: status=%d, err=%v, body=%s", code, err, raw)
 	}
 }

@@ -55,10 +55,34 @@ func usageDBPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create plugin data directory %q: %w", dir, err)
 	}
 	return filepath.Join(dir, "usage.db"), nil
+}
+
+func secureUsageFiles(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	modeErr := file.Chmod(0600)
+	closeErr := file.Close()
+	if modeErr != nil {
+		return modeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Chmod(path+suffix, 0600); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func modelPriceFilePath() string {

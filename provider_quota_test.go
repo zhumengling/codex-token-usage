@@ -122,7 +122,8 @@ api-keys:
 	if err != nil || len(quotas) != 2 {
 		t.Fatalf("quotas=%+v; err=%v", quotas, err)
 	}
-	if got := quotas[0]; got.Primary == nil || got.Primary.UsedPercent != 0 || got.Primary.ResetAt != old.Unix()+60 || got.Secondary == nil || got.Secondary.UsedPercent != 98.5 {
+	if got := quotas[0]; got.Primary == nil || got.Primary.UsedPercent != 0 || got.Primary.ResetAt != old.Unix()+60 || got.Primary.ExpiresAt != old.Unix()+60 ||
+		got.Secondary == nil || got.Secondary.UsedPercent != 98.5 || got.Secondary.ResetAt != 0 || got.Secondary.ExpiresAt != now.Add(24*time.Hour).Unix() {
 		t.Fatalf("first credential observations: %+v", got)
 	}
 	if got := quotas[1]; got.Primary != nil || got.Secondary != nil {

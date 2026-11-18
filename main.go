@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.44"
+	pluginVersion    = "0.1.45"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -463,6 +463,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okJSON(managementRegistrationResponse{
 			Routes: []managementRoute{
 				{Method: "GET", Path: "/plugins/codex-token-usage/summary", Description: "Token usage summary JSON."},
+				{Method: "GET", Path: "/plugins/codex-token-usage/provider-report", Description: "Provider usage, cost, and shared budget report."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/invalid-auths/resolve", Description: "Resolve deleted, replaced, or runtime-disabled Codex 401 records."},
@@ -487,10 +488,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case "usage.handle":
 		var rec usageRecord
 		if err := json.Unmarshal(request, &rec); err != nil {
-			return okJSON(map[string]any{"ignored": true, "error": err.Error()})
+			return errorEnvelope("invalid_usage_record", "Invalid usage record"), nil
 		}
 		if err := globalStore.recordUsage(context.Background(), rec); err != nil {
-			return okJSON(map[string]any{"stored": false, "error": err.Error()})
+			return errorEnvelope("usage_write_failed", "Could not persist usage record"), nil
 		}
 		return okJSON(map[string]any{"stored": true})
 	case "scheduler.pick":
@@ -561,6 +562,9 @@ func pluginConfigFields() []configField {
 }
 
 func handleManagement(req managementRequest) managementResponse {
+	if req.Path == "/v0/management/plugins/"+pluginID+"/provider-report" {
+		return handleProviderReport(req)
+	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/quota-activation/") {
 		return handleQuotaActivationManagement(req)
 	}
@@ -1071,6 +1075,8 @@ func configurePlugin(request []byte) error {
 	if len(raw) > 0 {
 		cfg = parsePluginConfigYAML(raw, cfg)
 	}
+	budgets := parseProviderBudgets(raw)
+	sharedProviderBudgets.Store(&budgets)
 	cfg = normalizePluginConfig(cfg)
 	if !cfg.SchedulerSessionAffinityEnabled {
 		globalSchedulerAffinity.reset()
@@ -1351,10 +1357,11 @@ func jsonResponse(status int, v any) managementResponse {
 }
 
 type store struct {
-	mu       sync.Mutex
-	repairMu sync.Mutex
-	db       *sql.DB
-	dbPath   string
+	mu        sync.Mutex
+	repairMu  sync.Mutex
+	db        *sql.DB
+	dbPath    string
+	ingestion usageIngestionDiagnostics
 }
 
 func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
@@ -1387,6 +1394,9 @@ func (s *store) openWithoutRepairLock(ctx context.Context) (*sql.DB, string, err
 }
 
 func openSQLiteDB(path string) (*sql.DB, error) {
+	if err := secureUsageFiles(path); err != nil {
+		return nil, err
+	}
 	return sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
 }
 
@@ -2578,7 +2588,13 @@ func (m *quotaTriggerManager) runRound(ctx context.Context, cfg pluginConfig) {
 	m.mu.Unlock()
 }
 
-func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
+func (s *store) recordUsage(ctx context.Context, rec usageRecord) (writeErr error) {
+	defer func() {
+		if writeErr != nil {
+			s.ingestion.writeFailures.Add(1)
+			s.ingestion.lastWriteFailure.Store(time.Now().Unix())
+		}
+	}()
 	db, _, err := s.open(ctx)
 	if err != nil {
 		return err
@@ -2621,23 +2637,18 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err != nil {
 		return err
 	}
-	if err := releaseProtectionReservation(ctx, db, rec); err != nil {
-		return err
-	}
-	if err := recordXAIStateIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if err := recordRepeatedForbiddenIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if err := clearRecoveredAuthStateIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if err := recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset); err != nil {
-		return err
+	for _, effect := range []error{
+		releaseProtectionReservation(ctx, db, rec),
+		recordXAIStateIfNeeded(ctx, db, rec, status),
+		recordInvalidAuthIfNeeded(ctx, db, rec, status),
+		recordRepeatedForbiddenIfNeeded(ctx, db, rec, status),
+		clearRecoveredAuthStateIfNeeded(ctx, db, rec, status),
+		recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset),
+	} {
+		if effect != nil {
+			s.ingestion.effectFailures.Add(1)
+			s.ingestion.lastEffectFailure.Store(time.Now().Unix())
+		}
 	}
 	return nil
 }

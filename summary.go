@@ -1159,7 +1159,10 @@ func providerRecentLimit(limit int) int {
 }
 
 func windowStart(window string) (int64, string) {
-	now := time.Now()
+	return windowStartAt(window, time.Now())
+}
+
+func windowStartAt(window string, now time.Time) (int64, string) {
 	switch strings.ToLower(strings.TrimSpace(window)) {
 	case "today":
 		y, m, d := now.Date()
@@ -3474,8 +3477,13 @@ func normalizeInt64Ptr(value *int64) {
 }
 
 func queryProviders(ctx context.Context, db *sql.DB, since int64, limit int, scope string) ([]providerRow, error) {
+	entries := readConfiguredProviderEntries()
+	configured := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		configured[normalizeAccountAlias(entry.Name)] = true
+	}
 	query := `
-SELECT ` + cpaProviderSQL() + ` AS provider_key,
+SELECT ` + cpaProviderSQLWithEntries(entries) + ` AS provider_key,
 COUNT(*), COALESCE(SUM(failed),0), COALESCE(SUM(CASE WHEN status_code=429 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
 COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
@@ -3491,9 +3499,8 @@ MAX(requested_at)
 FROM usage_events
 WHERE requested_at >= ? AND ` + usageScopeSQL(scope) + `
 GROUP BY provider_key
-ORDER BY SUM(total_tokens) DESC
-LIMIT ?`
-	rows, err := db.QueryContext(ctx, query, since, limit)
+ORDER BY SUM(total_tokens) DESC, provider_key`
+	rows, err := db.QueryContext(ctx, query, since)
 	if err != nil {
 		return nil, err
 	}
@@ -3511,7 +3518,9 @@ LIMIT ?`
 			return nil, err
 		}
 		r.LastSeen = unixTime(last)
-		out = append(out, r)
+		if limit < 0 || len(out) < limit || configured[normalizeAccountAlias(r.Provider)] {
+			out = append(out, r)
+		}
 	}
 	return out, rows.Err()
 }
@@ -3702,8 +3711,12 @@ func mergeConfiguredProviders(rows []providerRow, names []string) []providerRow 
 }
 
 func queryModels(ctx context.Context, db *sql.DB, since int64, limit int, scope string) ([]modelRow, error) {
+	return queryModelPage(ctx, db, cpaProviderSQL(), "requested_at >= ? AND "+usageScopeSQL(scope), []any{since}, limit, 0)
+}
+
+func queryModelPage(ctx context.Context, db *sql.DB, providerExpr, where string, args []any, limit, offset int) ([]modelRow, error) {
 	query := `
-SELECT model, alias, ` + cpaProviderSQL() + ` AS provider_key, COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(input_tokens),0),
+SELECT model, alias, ` + providerExpr + ` AS provider_key, COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(input_tokens),0),
 COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
 COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
 COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END),0),
@@ -3712,11 +3725,11 @@ COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
 COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0)
 FROM usage_events
-WHERE requested_at >= ? AND ` + usageScopeSQL(scope) + `
+WHERE ` + where + `
 GROUP BY model, alias, provider_key
-ORDER BY SUM(total_tokens) DESC
-LIMIT ?`
-	rows, err := db.QueryContext(ctx, query, since, limit)
+ORDER BY SUM(total_tokens) DESC, model, alias, provider_key
+LIMIT ? OFFSET ?`
+	rows, err := db.QueryContext(ctx, query, append(append([]any(nil), args...), limit, offset)...)
 	if err != nil {
 		return nil, err
 	}

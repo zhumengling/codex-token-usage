@@ -7,6 +7,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -14,19 +15,21 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type databaseDiagnostics struct {
-	Path                 string `json:"path"`
-	SizeBytes            int64  `json:"size_bytes"`
-	UsageEvents          int64  `json:"usage_events"`
-	QuotaTriggerRuns     int64  `json:"quota_trigger_runs"`
-	AutobanRows          int64  `json:"autoban_rows"`
-	InvalidAuthRows      int64  `json:"invalid_auth_rows"`
-	LatestEventAt        string `json:"latest_event_at,omitempty"`
-	LatestEventAgeSecs   int64  `json:"latest_event_age_seconds,omitempty"`
-	LatestTriggerAt      string `json:"latest_trigger_at,omitempty"`
-	LatestTriggerAgeSecs int64  `json:"latest_trigger_age_seconds,omitempty"`
+	Ingestion            usageIngestionStatus `json:"ingestion"`
+	Path                 string               `json:"path"`
+	SizeBytes            int64                `json:"size_bytes"`
+	UsageEvents          int64                `json:"usage_events"`
+	QuotaTriggerRuns     int64                `json:"quota_trigger_runs"`
+	AutobanRows          int64                `json:"autoban_rows"`
+	InvalidAuthRows      int64                `json:"invalid_auth_rows"`
+	LatestEventAt        string               `json:"latest_event_at,omitempty"`
+	LatestEventAgeSecs   int64                `json:"latest_event_age_seconds,omitempty"`
+	LatestTriggerAt      string               `json:"latest_trigger_at,omitempty"`
+	LatestTriggerAgeSecs int64                `json:"latest_trigger_age_seconds,omitempty"`
 }
 
 type authDiagnostics struct {
@@ -280,6 +283,7 @@ func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts [
 func queryDatabaseDiagnostics(ctx context.Context, db *sql.DB, path string) databaseDiagnostics {
 	now := time.Now().Unix()
 	out := databaseDiagnostics{
+		Ingestion:        globalStore.ingestion.status(),
 		Path:             path,
 		SizeBytes:        databaseFileSize(path),
 		UsageEvents:      queryCount(ctx, db, `SELECT COUNT(*) FROM usage_events`),
@@ -960,7 +964,7 @@ func recordsToCSV(headers []string, records []map[string]string) ([]byte, error)
 	for _, record := range records {
 		row := make([]string, len(headers))
 		for i, header := range headers {
-			row[i] = record[header]
+			row[i] = safeCSVCell(header, record[header])
 		}
 		if err := writer.Write(row); err != nil {
 			return nil, err
@@ -968,6 +972,23 @@ func recordsToCSV(headers []string, records []map[string]string) ([]byte, error)
 	}
 	writer.Flush()
 	return buf.Bytes(), writer.Error()
+}
+
+func safeCSVCell(header, value string) string {
+	trimmed := strings.TrimLeftFunc(value, func(character rune) bool {
+		return unicode.IsSpace(character) || unicode.IsControl(character) || character == '\ufeff'
+	})
+	if trimmed == "" || !strings.ContainsRune("=+-@＝＋－＠", []rune(trimmed)[0]) && !strings.HasPrefix(value, "\t") && !strings.HasPrefix(value, "\r") && !strings.HasPrefix(value, "\n") {
+		return value
+	}
+	switch header {
+	case "requests", "success_rate", "cache_rate", "rate_limited", "status_code", "cost_usd", "avg_latency_ms", "latency_ms", "ttft_ms", "quota_total_estimate", "quota_remaining_estimate",
+		"primary_used_percent", "secondary_used_percent", "total_tokens", "input_tokens", "output_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "reasoning_tokens":
+		if number, err := strconv.ParseFloat(value, 64); err == nil && !math.IsNaN(number) && !math.IsInf(number, 0) {
+			return value
+		}
+	}
+	return "'" + value
 }
 
 func safeExportLabel(value string) string {

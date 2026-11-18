@@ -25,3 +25,22 @@ jobs:
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
+      - name: Verify native CPA compatibility
+        run: |
+          fixture_dir="$(mktemp -d)"
+          while read -r version sha256; do
+            archive="CLIProxyAPI_${version}_linux_amd64.tar.gz"
+            mkdir -p "$fixture_dir/$version"
+            curl --fail --silent --show-error --location --retry 3 \
+              "https://github.com/router-for-me/CLIProxyAPI/releases/download/v${version}/${archive}" \
+              --output "$fixture_dir/$archive"
+            printf '%s  %s\n' "$sha256" "$fixture_dir/$archive" | sha256sum -c -
+            tar -xzf "$fixture_dir/$archive" -C "$fixture_dir/$version" cli-proxy-api
+          done <<'RELEASES'
+          8.0.76 3cdd1218e8e7566613d98f393e4d9f5fd96043dc0f1cc568358646d3dd9eefd0
+          8.0.77 1a7ea3f968c414ed9839facfdb1c0efe34cf3038b75b2e118db143d04de1aeb3
+          RELEASES
+          bash ./build.sh
+          CPA_TEST_BINARIES="$fixture_dir/8.0.76/cli-proxy-api:$fixture_dir/8.0.77/cli-proxy-api" \
+            CPA_TEST_PLUGIN="$PWD/codex-token-usage.so" \
+            go test -run '^TestCPAProviderIntegration$' -count=1 -v ./...

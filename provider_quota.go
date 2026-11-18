@@ -13,6 +13,7 @@ type providerQuotaWindow struct {
 	UsedPercent float64 `json:"used_percent"`
 	ObservedAt  int64   `json:"observed_at"`
 	ResetAt     int64   `json:"reset_at,omitempty"`
+	ExpiresAt   int64   `json:"expires_at"`
 }
 
 type providerQuotaRow struct {
@@ -22,6 +23,14 @@ type providerQuotaRow struct {
 }
 
 const maxProviderQuotaTimestamp = 253402300799
+const providerQuotaWithoutResetTTL = 24 * 60 * 60
+
+func (window *providerQuotaWindow) expiry() int64 {
+	if window.ResetAt > 0 {
+		return window.ResetAt
+	}
+	return window.ObservedAt + providerQuotaWithoutResetTTL
+}
 
 func providerQuotaHeaders(rec usageRecord, status int, window string) (*float64, *int64) {
 	if status != http.StatusTooManyRequests && (rec.Failed || (status != 0 && (status < 200 || status >= 300))) {
@@ -107,6 +116,7 @@ func queryProviderQuotas(ctx context.Context, db *sql.DB, entries []providerConf
 		if reset.Valid && reset.Int64 > 0 && reset.Int64 <= maxProviderQuotaTimestamp {
 			observation.ResetAt = reset.Int64
 		}
+		observation.ExpiresAt = observation.expiry()
 		if index, exists := indexes[endpoint]; exists {
 			if slot == 1 {
 				quotas[index].Primary = &observation

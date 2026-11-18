@@ -3,6 +3,8 @@ package main
 const dashboardScripts = `
 const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
+const providerReportApi='/v0/management/plugins/__PLUGIN_ID__/provider-report';
+const providerBudgetConfigApi='/v0/management/plugins/__PLUGIN_ID__/config';
 const managementAutobanReleaseApi='/v0/management/plugins/__PLUGIN_ID__/autobans/release';
 const managementInvalidAuthResolveApi='/v0/management/plugins/__PLUGIN_ID__/invalid-auths/resolve';
 const managementXAIStateResolveApi='/v0/management/plugins/__PLUGIN_ID__/xai-states/resolve';
@@ -39,6 +41,8 @@ const quotaActivationResultsEl=document.getElementById('quota-activation-results
 const cpaStoragePrefix='enc::v1::';
 const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
+let activeProviderReport=null;
+let providerBudgetSaving=false;
 let accountPage=1;
 let accountPageSize=25;
 let autobanPage=1;
@@ -133,7 +137,7 @@ function currentLogExportScope(){
   if(activePage==='xai')return {scope:'xai',provider:''};
   if(activePage==='providers')return {scope:'providers',provider:''};
   const page=document.querySelector('.tab[data-target="'+activePage+'"]');
-  return {scope:'provider',provider:page?firstText(page.childNodes[0]&&page.childNodes[0].nodeValue,page.textContent).replace(/\\s*[0-9.,KMB]+$/,''):''};
+  return {scope:'provider',provider:page?.dataset.provider||''};
 }
 function initLogExportControl(){
   document.getElementById('log-export-close').onclick=closeLogExportModal;
@@ -1787,6 +1791,8 @@ function switchPage(page){
     renderPoolPage(lastData);
     applyLocale();
   }
+  if(activePage.startsWith('provider-'))loadActiveProviderReport();
+  else if(activeProviderReport&&activeProviderReport.controller)activeProviderReport.controller.abort();
 }
 function providerStorageKey(){return 'cpa_token_usage_provider_pages'}
 function providerKnownStorageKey(){return 'cpa_token_usage_provider_known'}
@@ -1794,7 +1800,7 @@ function loadSelectedProviders(){const raw=safeStorageGet(safeLocalStorage(),pro
 function saveSelectedProviders(){providerSelectionSaved=true;safeStorageSet(safeLocalStorage(),providerStorageKey(),JSON.stringify(selectedProviders))}
 function loadKnownProviders(){try{return JSON.parse(safeStorageGet(safeLocalStorage(),providerKnownStorageKey())||'[]').filter(Boolean)}catch(e){return []}}
 function saveKnownProviders(names){safeStorageSet(safeLocalStorage(),providerKnownStorageKey(),JSON.stringify(names))}
-function providerID(name){return 'provider-'+btoa(unescape(encodeURIComponent(name||'unknown'))).replace(/=+$/,'').replace(/[^a-zA-Z0-9_-]/g,'')}
+function providerID(name){return 'provider-'+btoa(unescape(encodeURIComponent(name||'unknown'))).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_')}
 function providerLabel(name){
   name=String(name||'unknown').trim()||'unknown';
   if(name.startsWith('openai-compatible-'))return name.slice('openai-compatible-'.length)||name;
@@ -1806,11 +1812,12 @@ function providerLabel(name){
   return name;
 }
 function ensureProviderSelection(providers){
-  const names=[...new Set(providers.map(p=>providerLabel(p.provider)).filter(Boolean))];
+  const names=[...new Set(providers.map(p=>p.provider).filter(Boolean))];
   const valid=new Set(names);
-  const known=loadKnownProviders().map(providerLabel).filter(name=>valid.has(name));
+  const resolve=name=>valid.has(name)?name:names.find(key=>providerLabel(key)===name);
+  const known=loadKnownProviders().map(resolve).filter(Boolean);
   const knownSet=new Set(known);
-  selectedProviders=selectedProviders.map(providerLabel).filter(name=>valid.has(name));
+  selectedProviders=[...new Set(selectedProviders.map(resolve).filter(Boolean))];
   if(!providerSelectionSaved&&!selectedProviders.length){
     selectedProviders=names.slice(0,Math.min(4,names.length));
     saveSelectedProviders();
@@ -1831,8 +1838,8 @@ function renderProviderPicker(providers){
   const selected=new Set(selectedProviders);
   document.getElementById('provider-picker-button').innerHTML='显示接入点 <span class="tab-count">'+fmt(selectedProviders.length)+'/'+fmt(providers.length)+'</span>';
   document.getElementById('provider-picker-panel').innerHTML=providers.map(p=>{
-    const name=providerLabel(p.provider);
-    return '<label class="picker-row" title="'+esc(name)+'"><input type="checkbox" data-provider="'+esc(name)+'" '+(selected.has(name)?'checked':'')+'><span class="picker-name">'+esc(name)+'</span><span class="picker-meta">'+compact(p.total_tokens)+' tok</span></label>';
+    const name=p.provider;
+    return '<label class="picker-row" title="'+esc(name)+'"><input type="checkbox" data-provider="'+esc(name)+'" '+(selected.has(name)?'checked':'')+'><span class="picker-name">'+esc(providerLabel(name))+'</span><span class="picker-meta">'+compact(p.total_tokens)+' tok</span></label>';
   }).join('') || '<div class="muted" style="padding:6px">暂无其他 AI Provider</div>';
   document.querySelectorAll('#provider-picker-panel input[data-provider]').forEach(input=>input.onchange=e=>{
     const name=e.target.dataset.provider;
@@ -1849,10 +1856,10 @@ function renderProviderPicker(providers){
 function renderProviderTabsAndPages(data){
   const providers=data.providers||[];
   renderProviderPicker(providers);
-  const providerMap=new Map(providers.map(p=>[providerLabel(p.provider),p]));
+  const providerMap=new Map(providers.map(p=>[p.provider,p]));
   const tabs=selectedProviders.filter(name=>providerMap.has(name)).map(name=>{
     const p=providerMap.get(name);
-    return '<button class="tab" data-target="'+providerID(name)+'" role="tab" aria-selected="false" title="'+esc(name)+'">'+esc(name)+'<span class="tab-count">'+compact(p.total_tokens)+'</span></button>';
+    return '<button class="tab" data-target="'+providerID(name)+'" data-provider="'+esc(name)+'" role="tab" aria-selected="false" title="'+esc(name)+'">'+esc(providerLabel(name))+'<span class="tab-count">'+compact(p.total_tokens)+'</span></button>';
   }).join('');
   document.getElementById('provider-tabs').innerHTML=tabs;
   document.getElementById('provider-pages').innerHTML=selectedProviders.filter(name=>providerMap.has(name)).map(name=>providerPageHTML(name)).join('');
@@ -1880,11 +1887,37 @@ function providerPageHTML(name){
       '<section class="section"><h2><span>Token 结构</span><span class="mini">'+esc(name)+'</span></h2><div class="section-body"><div class="mix" id="'+id+'-mix"></div></div></section>'+
     '</div>'+
     '<section class="section" style="margin-top:8px" id="'+id+'-quota" hidden><h2><span>Codex 上游额度</span><span class="mini">来自上游响应，不是本地 Token 统计</span></h2><div class="section-body"><div class="cards" id="'+id+'-quota-windows"></div></div></section>'+
+    '<section class="section" style="margin-top:8px"><h2><span>供应商运营</span><button type="button" id="'+id+'-edit-budget">编辑共享预算</button></h2><div class="section-body"><p class="muted" id="'+id+'-report-status" role="status"></p><div class="cards" id="'+id+'-report-cards"></div><h3>费用与用量趋势</h3><div class="scroll model-table-wrap" style="max-height:320px"><table><thead><tr><th>时间</th><th>请求</th><th>总 Token</th><th>估算费用</th><th>未定价 Token</th></tr></thead><tbody id="'+id+'-report-trend"></tbody></table></div></div></section>'+
     '<section class="section" style="margin-top:8px"><h2><span>模型排行</span><span class="mini">'+esc(name)+'</span></h2><div class="scroll model-table-wrap"><table><thead><tr><th>模型</th><th>别名</th><th>Provider</th><th>请求</th><th>总 Token</th><th>费用</th><th>性能</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存率</th></tr></thead><tbody id="'+id+'-models"></tbody></table></div></section>'+
     '<section class="section" style="margin-top:8px"><h2><span>最近请求</span><span class="mini">'+esc(name)+' 最近 30 条</span></h2><div class="scroll recent-table-wrap"><table><thead><tr><th>模型</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th></tr></thead><tbody id="'+id+'-recent"></tbody></table></div></section>'+
-  '</section>';
+    '<div class="pager" id="'+id+'-report-pages"></div></section>';
 }
 const i18nEn={
+  '供应商运营':'Provider operations',
+  '编辑共享预算':'Edit shared budget',
+  '费用与用量趋势':'Cost and usage over time',
+  '估算费用':'Estimated cost',
+  '未定价 Token':'Unpriced tokens',
+  '当前统计窗口暂无请求':'No requests in the selected period',
+  '额度未被观测到':'No quota observation',
+  '共享月预算（USD，留空删除；仅提示）':'Shared monthly budget (USD; leave blank to remove; advisory only)',
+  '正在加载供应商报表...':'Loading provider report...',
+  '供应商报表加载失败':'Failed to load provider report',
+  '共享预算保存失败':'Failed to save shared budget',
+  '共享预算已保存，稍后生效':'Shared budget saved; waiting for configuration reload',
+  '其他管理员已更新此预算，请刷新后重试':'Another administrator changed this budget; refresh and retry',
+  '预算金额无效':'Invalid budget amount',
+  '共享月预算':'Shared monthly budget',
+  '未设置预算':'No budget configured',
+  '预算配置无效':'Invalid budget configuration',
+  '估算不完整':'Incomplete estimate',
+  '接近预算':'Approaching budget',
+  '达到或超过预算':'At or above budget',
+  '预算内':'Within budget',
+  '仅估算，不是实际上游账单':'Estimate only, not the actual supplier bill',
+  '其他状态':'Other statuses',
+  '模型排行':'Top models',
+  '最近请求':'Recent requests',
   'Codex 上游额度':'Upstream Codex quota',
   '来自上游响应，不是本地 Token 统计':'Reported by the upstream, separate from local token counts',
   '上游未提供':'Not reported by the upstream',
@@ -2736,11 +2769,12 @@ function renderProviderPage(data){
   renderModels('provider-models',data.provider_models||[]);
   renderRecent('provider-recent',(data.provider_recent||[]).slice(0,30),'provider');
 }
-function providerEquals(row,name){return providerLabel(row.provider)===name}
-function providerQuotaWindowPresentation(window,now){
-  if(!window||window.used_percent==null)return {value:tr('上游未提供'),detail:'',expired:false};
+function providerEquals(row,name){return row.provider===name}
+function providerQuotaWindowPresentation(window,now,requests){
+  if(!window||window.used_percent==null)return {value:tr(requests>0?'额度未被观测到':'当前统计窗口暂无请求'),detail:'',expired:false};
   const reset=Number(window.reset_at||0),observed=Number(window.observed_at||0);
-  const expired=reset>0&&reset<=now;
+  const expiry=Number(window.expires_at||reset||(observed>0?observed+86400:0));
+  const expired=expiry>0&&expiry<=now;
   const detail=[observed>0?tr('观测时间')+' '+new Date(observed*1000).toLocaleString():'',tr(resetText(reset))];
   if(expired)detail.unshift(tr('额度快照已过期'));
   return {value:pct(window.used_percent),detail:detail.filter(Boolean).join(' · '),expired};
@@ -2754,7 +2788,8 @@ function renderProviderQuota(data,name,id){
   if(!quota)return;
   const now=Date.now()/1000;
   windows.innerHTML=[['primary','主额度窗口'],['secondary','次额度窗口']].map(([slot,label])=>{
-    const entry=providerQuotaWindowPresentation(quota[slot],now);
+    const current=(data.providers||[]).find(row=>providerEquals(row,name));
+    const entry=providerQuotaWindowPresentation(quota[slot],now,current&&current.requests);
     return '<div class="metric" style="--accent:var(--cyan)"><div class="label">'+esc(tr(label))+'</div><div class="'+(entry.expired?'sub':'value')+'">'+esc(entry.value)+'</div><div class="sub">'+esc(entry.detail)+'</div></div>';
   }).join('');
 }
@@ -2763,8 +2798,6 @@ function renderSingleProviderPage(data,name){
   const p=(data.providers||[]).find(r=>providerEquals(r,name))||{};
   const total=p.total_tokens||0;
   const okReq=(p.requests||0)-(p.failed||0);
-  const models=(data.provider_models||[]).filter(r=>providerEquals(r,name));
-  const recent=(data.provider_recent||[]).filter(r=>providerEquals(r,name)).slice(0,30);
   const set=(suffix,value)=>{const el=document.getElementById(id+suffix);if(el)el.textContent=value};
   set('-requests',fmt(p.requests));
   set('-success','成功率 '+pct(ratio(okReq,p.requests)));
@@ -2779,7 +2812,7 @@ function renderSingleProviderPage(data,name){
   set('-cache',compact(cache));
   set('-cache-share','缓存率 '+pct(cacheRate(p))+' · 占总 '+pct(ratio(cache,total)));
   set('-429',fmt(p.rate_limited));
-  set('-models-count',fmt(models.length));
+  set('-models-count',fmt(p.models));
   set('-latency',fmtLatencyMs(p.avg_latency_ms));
   set('-latency-sub','慢请求 '+fmt(p.slow_requests||0));
   set('-ttft',fmtLatencyMs(p.avg_ttft_ms));
@@ -2787,8 +2820,101 @@ function renderSingleProviderPage(data,name){
   set('-throughput',avgThroughput(p.output_tokens_per_second));
   renderTokenMix(id+'-mix',p);
   renderProviderQuota(data,name,id);
-  renderModels(id+'-models',models);
-  renderRecent(id+'-recent',recent,'provider');
+}
+async function loadActiveProviderReport(force=false){
+  const provider=lastData&&(lastData.providers||[]).find(row=>providerID(row.provider)===activePage);
+  if(!provider)return;
+  const window=document.getElementById('window').value;
+  if(!activeProviderReport||activeProviderReport.provider!==provider.provider||activeProviderReport.window!==window){
+    if(activeProviderReport&&activeProviderReport.controller)activeProviderReport.controller.abort();
+    activeProviderReport={provider:provider.provider,window,modelPage:1,recentPage:1,report:null,loaded:0,controller:null};
+  }
+  const state=activeProviderReport;
+  renderProviderReport(state);
+  if(!force&&(state.controller||Date.now()-state.loaded<14000))return;
+  if(state.controller)state.controller.abort();
+  const controller=new AbortController();
+  state.controller=controller;
+  setProviderReportStatus(state,'正在加载供应商报表...');
+  const params=new URLSearchParams({provider:state.provider,window:state.window,model_page:state.modelPage,recent_page:state.recentPage});
+  try{
+    const response=await fetch(providerReportApi+'?'+params,{headers:{Authorization:'Bearer '+managementKey(),Accept:'application/json'},signal:controller.signal});
+    if(!response.ok)throw new Error(String(response.status));
+    const report=await response.json();
+    if(state!==activeProviderReport||controller!==state.controller)return;
+    state.report=report;
+    state.loaded=Date.now();
+    renderProviderReport(state);
+    setProviderReportStatus(state,'');
+    applyLocale();
+  }catch(error){
+    if(error.name!=='AbortError'&&controller===state.controller)setProviderReportStatus(state,'供应商报表加载失败');
+  }finally{
+    if(controller===state.controller)state.controller=null;
+  }
+}
+function setProviderReportStatus(state,message){
+  state.message=message;
+  const target=document.getElementById(providerID(state.provider)+'-report-status');
+  if(target)target.textContent=tr(message);
+}
+function renderProviderReport(state){
+  const report=state.report;
+  const id=providerID(state.provider);
+  const edit=document.getElementById(id+'-edit-budget');
+  if(!edit)return;
+  setProviderReportStatus(state,state.message||'');
+  edit.disabled=!report||providerBudgetSaving;
+  edit.onclick=()=>editProviderBudget(state);
+  if(!report)return;
+  const budget=report.budget||{};
+  const budgetLabels={not_configured:'未设置预算',invalid_config:'预算配置无效',warning:'接近预算',over:'达到或超过预算',under:'预算内',incomplete:'估算不完整'};
+  const budgetText=budget.limit_usd>0?money(budget.cost_usd)+' / '+money(budget.limit_usd):tr(budgetLabels[budget.status]);
+  const details=[budget.month,budget.limit_usd>0?tr(budgetLabels[budget.status]):'',budget.unpriced_tokens>0&&budget.status!=='incomplete'?tr('估算不完整'):'',tr('仅估算，不是实际上游账单')].filter(Boolean).join(' · ');
+  const card=(label,value,detail='',tone='')=>'<div class="metric"><div class="label">'+esc(label)+'</div><div class="value '+tone+'">'+esc(value)+'</div><div class="sub">'+esc(detail)+'</div></div>';
+  const statusLabels={ok:'成功','401':'HTTP 401','402':'HTTP 402','403':'HTTP 403','429':'HTTP 429','5xx':'HTTP 5xx',other:'其他状态'};
+  document.getElementById(id+'-report-cards').innerHTML=card(tr('共享月预算'),budgetText,details,budget.status==='over'?'bad':budget.status==='warning'?'warn':'')+Object.keys(statusLabels).map(status=>card(tr(statusLabels[status]),fmt((report.statuses||{})[status]))).join('');
+  document.getElementById(id+'-report-trend').innerHTML=(report.trend||[]).slice().reverse().map(point=>'<tr><td>'+esc(point.bucket)+'</td><td>'+fmt(point.requests)+'</td><td>'+compact(point.total_tokens)+'</td><td>'+esc(money(point.cost_usd))+'</td><td>'+compact(point.unpriced_tokens)+'</td></tr>').join('')||'<tr><td colspan="5">'+esc(tr('暂无趋势数据'))+'</td></tr>';
+  renderModels(id+'-models',report.models||[]);
+  renderRecent(id+'-recent',report.recent||[],'provider');
+  const pages=document.getElementById(id+'-report-pages');
+  pages.replaceChildren();
+  for(const [field,label,number,more] of [['modelPage','模型排行',report.model_page,report.more_models],['recentPage','最近请求',report.recent_page,report.more_recent]]){
+    const group=document.createElement('span');
+    group.textContent=tr(label)+' · '+number+' ';
+    for(const [delta,caption,enabled] of [[-1,'上一页',number>1],[1,'下一页',more]]){
+      const button=document.createElement('button');
+      button.type='button';button.textContent=tr(caption);button.disabled=!enabled;
+      button.onclick=()=>{state[field]=number+delta;loadActiveProviderReport(true)};
+      group.append(button);
+    }
+    pages.append(group);
+  }
+}
+async function editProviderBudget(state){
+  if(providerBudgetSaving||!state.report)return;
+  const previous=Number(state.report.budget.limit_usd)||0;
+  const input=prompt(tr('共享月预算（USD，留空删除；仅提示）'),previous?String(previous):'');
+  if(input===null)return;
+  const amount=Number(input.trim());
+  if(input.trim()&&(!/^\d+(\.\d{1,2})?$/.test(input.trim())||!Number.isFinite(amount)||amount<=0||amount>1e9)){setProviderReportStatus(state,'预算金额无效');return}
+  providerBudgetSaving=true;
+  renderProviderReport(state);
+  const headers={Authorization:'Bearer '+managementKey(),Accept:'application/json'};
+  try{
+    const current=await fetch(providerBudgetConfigApi,{headers,cache:'no-store'});
+    if(!current.ok)throw new Error();
+    const config=await current.json();
+    const budgets=Object.assign(Object.create(null),config.provider_budgets_usd||{});
+    if((Number(budgets[state.provider])||0)!==previous){setProviderReportStatus(state,'其他管理员已更新此预算，请刷新后重试');return}
+    if(amount>0)budgets[state.provider]=amount;
+    else delete budgets[state.provider];
+    const update=await fetch(providerBudgetConfigApi,{method:'PATCH',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({provider_budgets_usd:budgets})});
+    if(!update.ok)throw new Error();
+    setProviderReportStatus(state,'共享预算已保存，稍后生效');
+    if(activeProviderReport===state)setTimeout(()=>{if(activeProviderReport===state)loadActiveProviderReport(true)},1200);
+  }catch(error){setProviderReportStatus(state,'共享预算保存失败')}
+  finally{providerBudgetSaving=false;renderProviderReport(state)}
 }
 function renderTokenMix(target,t){
   const total=t.total_tokens||0;
