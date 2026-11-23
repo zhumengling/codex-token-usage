@@ -180,6 +180,7 @@ type pluginConfig struct {
 	SummaryCacheMaxAgeSeconds               int
 	SummaryMaintenanceIntervalSeconds       int
 	SummaryPrecomputeActiveWindowTTLSeconds int
+	ClaudeQuotaEnabled                      bool
 }
 
 type quotaTriggerState struct {
@@ -368,7 +369,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if request != nil && requestLen > 0 {
 		req = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, err := handleMethod(C.GoString(method), req)
+	raw, err := handleMethodRecovered(C.GoString(method), req)
 	if err != nil {
 		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
 		return 1
@@ -441,6 +442,18 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 	return append(json.RawMessage(nil), env.Result...), nil
 }
 
+// handleMethodRecovered keeps a panic inside one plugin call from taking the
+// whole CPA process down: the plugin shares CPA's process, and an unrecovered
+// Go panic aborts it.
+func handleMethodRecovered(method string, request []byte) (raw []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			raw, err = nil, fmt.Errorf("panic in %s: %v", method, recovered)
+		}
+	}()
+	return handleMethod(method, request)
+}
+
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
@@ -474,6 +487,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: "GET", Path: "/plugins/codex-token-usage/quota-activation/preview", Description: "Poll a quota activation preview."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/quota-activation/run", Description: "Run one confirmed Codex quota-window activation."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/quota-activation/run", Description: "Poll a one-shot quota activation run."},
+				{Method: "GET", Path: "/plugins/codex-token-usage/claude-quota", Description: "Claude subscription quota estimate JSON."},
 			},
 			Resources: []resourceRoute{
 				{Path: "/dashboard", Menu: "Token Usage", Description: "Account token usage dashboard."},
@@ -545,6 +559,7 @@ func pluginConfigFields() []configField {
 		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "summary 缓存直接复用秒数；revision 变化时会先返回短期旧缓存并异步刷新。默认 30。"},
 		{Name: "summary_maintenance_interval_seconds", Type: "number", Description: "后台状态维护间隔，单位秒；无数据变化会跳过。默认 180。"},
 		{Name: "summary_precompute_active_window_ttl_seconds", Type: "number", Description: "窗口被访问后保留为活跃预计算窗口的时间。默认 120。"},
+		{Name: "开启 Claude 订阅额度估算", Type: "boolean", Description: "从 Claude 响应头记录 5h/7d 额度百分比，结合本地用量估算订阅额度（API 价与推算缓存价两档）。只读响应头，不发额外请求。默认开启。"},
 		{Name: "开启账号保护调度（可能会影响缓存）", Type: "boolean", Description: "按套餐并发保护和 Token 软降级；接管账号选择时可能降低长会话缓存命中率。默认关闭。"},
 		{Name: "Free 并发上限", Type: "number", Description: "Free 账号最大同时在途请求数。默认 2。"},
 		{Name: "Plus 并发上限", Type: "number", Description: "Plus 或未知套餐账号最大同时在途请求数。默认 5。"},
@@ -567,6 +582,9 @@ func handleManagement(req managementRequest) managementResponse {
 	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/quota-activation/") {
 		return handleQuotaActivationManagement(req)
+	}
+	if req.Path == "/v0/management/plugins/"+pluginID+"/claude-quota" {
+		return handleClaudeQuotaManagement(req)
 	}
 	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/dashboard") {
 		return managementResponse{
@@ -1057,6 +1075,7 @@ func defaultPluginConfig() pluginConfig {
 		SummaryCacheMaxAgeSeconds:               30,
 		SummaryMaintenanceIntervalSeconds:       180,
 		SummaryPrecomputeActiveWindowTTLSeconds: 120,
+		ClaudeQuotaEnabled:                      true,
 	}
 }
 
@@ -1089,6 +1108,7 @@ func configurePlugin(request []byte) error {
 	globalDBHealth.configure(cfg)
 	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
+	globalClaudeQuota.configure(cfg)
 	if err := globalStore.refreshSchedulerState(context.Background()); err != nil {
 		globalSchedulerState.invalidate()
 	}
@@ -1213,6 +1233,9 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	}
 	if value, ok := configValue(values, "summary_precompute_active_window_ttl_seconds"); ok {
 		cfg.SummaryPrecomputeActiveWindowTTLSeconds = parseInt(value, cfg.SummaryPrecomputeActiveWindowTTLSeconds, 30, 86400)
+	}
+	if value, ok := configValue(values, "claude_quota_enabled", "开启 Claude 订阅额度估算"); ok {
+		cfg.ClaudeQuotaEnabled = parseBoolString(value, cfg.ClaudeQuotaEnabled)
 	}
 	return cfg
 }
@@ -2637,6 +2660,7 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) (writeErr erro
 	if err != nil {
 		return err
 	}
+	globalClaudeQuota.record(ctx, db, rec)
 	for _, effect := range []error{
 		releaseProtectionReservation(ctx, db, rec),
 		recordXAIStateIfNeeded(ctx, db, rec, status),

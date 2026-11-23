@@ -22,6 +22,7 @@ const dashboardBody = `</style>
     <div class="tab-strip" id="tab-strip">
       <button class="tab active" data-target="codex" role="tab" aria-selected="true">Codex 账号池<span class="tab-count" id="tab-codex-count">-</span></button>
       <button class="tab" data-target="xai" role="tab" aria-selected="false" hidden>xAI 账号池<span class="tab-count" id="tab-xai-count">-</span></button>
+      <button class="tab" data-target="claude" role="tab" aria-selected="false" hidden>Claude 账号池<span class="tab-count" id="tab-claude-count">-</span></button>
       <button class="tab" data-target="providers" role="tab" aria-selected="false">AI 总览<span class="tab-count" id="tab-provider-count">-</span></button>
       <span id="provider-tabs" class="tab-strip"></span>
     </div>
