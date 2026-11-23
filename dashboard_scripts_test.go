@@ -267,3 +267,15 @@ func TestEnglishLocaleTranslatesDynamicPhrasesBeforeUnits(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardReadsBothCPAPanelKeyFormats(t *testing.T) {
+	for _, marker := range []string{
+		"const cpaStoragePrefix='enc::v2::';",
+		"const cpaLegacyStoragePrefix='enc::v1::';",
+		"(prefix===cpaLegacyStoragePrefix?'|'+navigator.userAgent:'')",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard script missing CPA panel key format marker %q", marker)
+		}
+	}
+}
