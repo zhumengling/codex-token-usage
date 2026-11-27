@@ -150,3 +150,64 @@ func TestCacheRateBackendUsesReadOnlyAndProviderAwareInput(t *testing.T) {
 		t.Fatalf("Codex cache rate=%v, want 60", got)
 	}
 }
+
+func TestResolveModelPriceFallsBackToCanonicalProviderPrefixAndEffortSuffix(t *testing.T) {
+	prices := map[string]modelPrice{
+		"gemini/gemini-4-carbon":   {Prompt: 2, Completion: 10, CacheRead: 0.1, CacheReadSet: true},
+		"gemini/gemini-4-neon":     {Prompt: 3, Completion: 15, CacheRead: 0.15, CacheReadSet: true},
+		"vertex_ai/gemini-4-argon": {Prompt: 2, Completion: 10, CacheRead: 0.1, CacheReadSet: true},
+		"anthropic/claude-test":    {Prompt: 3, Completion: 15},
+	}
+
+	t.Run("non-gemini provider resolves gemini prefix via alias", func(t *testing.T) {
+		got, ok := resolveModelPrice(costTokenRow{
+			Provider: "antigravity",
+			Model:    "gemini-4-carbon-high",
+			Alias:    "gemini-4-carbon",
+		}, prices)
+		if !ok || got.Prompt != 2 || got.Completion != 10 {
+			t.Fatalf("resolveModelPrice()=(%+v, %v), want prompt=2 completion=10", got, ok)
+		}
+	})
+
+	t.Run("effort suffix stripped without alias", func(t *testing.T) {
+		got, ok := resolveModelPrice(costTokenRow{
+			Provider: "antigravity",
+			Model:    "gemini-4-neon-xhigh",
+		}, prices)
+		if !ok || got.Prompt != 3 || got.Completion != 15 {
+			t.Fatalf("resolveModelPrice()=(%+v, %v), want prompt=3 completion=15", got, ok)
+		}
+	})
+
+	t.Run("explicit provider still wins over canonical fallback", func(t *testing.T) {
+		withOverride := map[string]modelPrice{
+			"gemini/gemini-4-carbon":    {Prompt: 2, Completion: 10},
+			"vertex_ai/gemini-4-carbon": {Prompt: 2.5, Completion: 12.5},
+		}
+		got, ok := resolveModelPrice(costTokenRow{
+			Provider: "vertex_ai",
+			Model:    "gemini-4-carbon",
+		}, withOverride)
+		if !ok || got.Prompt != 2.5 {
+			t.Fatalf("resolveModelPrice()=(%+v, %v), want vertex_ai prompt=2.5", got, ok)
+		}
+	})
+
+	t.Run("vertex_ai fallback and anthropic date suffix", func(t *testing.T) {
+		got, ok := resolveModelPrice(costTokenRow{
+			Provider: "antigravity",
+			Model:    "gemini-4-argon-medium",
+		}, prices)
+		if !ok || got.Prompt != 2 {
+			t.Fatalf("vertex_ai fallback=(%+v, %v), want prompt=2", got, ok)
+		}
+		got, ok = resolveModelPrice(costTokenRow{
+			Provider: "custom-proxy",
+			Model:    "claude-test-20250929-high",
+		}, prices)
+		if !ok || got.Prompt != 3 {
+			t.Fatalf("anthropic fallback=(%+v, %v), want prompt=3", got, ok)
+		}
+	})
+}
