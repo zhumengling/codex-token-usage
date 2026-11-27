@@ -422,6 +422,15 @@ func resolveModelPrice(row costTokenRow, prices map[string]modelPrice) (modelPri
 			}
 		}
 	}
+	for _, name := range []string{row.Model, row.Alias} {
+		for _, candidate := range priceNameCandidates(name) {
+			for _, provider := range inferredPriceProviders(candidate) {
+				if price, ok := prices[provider+"/"+candidate]; ok {
+					return price, true
+				}
+			}
+		}
+	}
 	return modelPrice{}, false
 }
 
@@ -458,6 +467,11 @@ func priceNameCandidates(value string) []string {
 		add(parts[len(parts)-1])
 	}
 	for _, candidate := range append([]string(nil), out...) {
+		for _, stripped := range stripEffortSuffixCandidates(candidate) {
+			add(stripped)
+		}
+	}
+	for _, candidate := range append([]string(nil), out...) {
 		for _, stripped := range stripDateSuffixCandidates(candidate) {
 			add(stripped)
 		}
@@ -466,6 +480,45 @@ func priceNameCandidates(value string) []string {
 		add(key[:i])
 	}
 	return out
+}
+
+func stripEffortSuffixCandidates(value string) []string {
+	var out []string
+	current := value
+	for {
+		trimmed := false
+		for _, suffix := range []string{"-minimal", "-low", "-medium", "-high", "-xhigh"} {
+			if strings.HasSuffix(current, suffix) && len(current) > len(suffix) {
+				current = strings.TrimSuffix(current, suffix)
+				out = append(out, current)
+				trimmed = true
+				break
+			}
+		}
+		if !trimmed {
+			return out
+		}
+	}
+}
+
+func inferredPriceProviders(model string) []string {
+	if strings.Contains(model, "/") {
+		return nil
+	}
+	switch {
+	case strings.HasPrefix(model, "gemini-"):
+		return []string{"gemini", "vertex_ai"}
+	case strings.HasPrefix(model, "claude-"):
+		return []string{"anthropic"}
+	case strings.HasPrefix(model, "grok-"):
+		return []string{"xai"}
+	case strings.HasPrefix(model, "deepseek-"):
+		return []string{"deepseek"}
+	case strings.HasPrefix(model, "mistral-"), strings.HasPrefix(model, "codestral-"):
+		return []string{"mistral"}
+	default:
+		return nil
+	}
 }
 
 func stripDateSuffixCandidates(value string) []string {
